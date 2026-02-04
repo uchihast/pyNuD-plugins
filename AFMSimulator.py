@@ -19,12 +19,20 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QSplitter, QFrame, QCheckBox, QScrollArea,
                             QColorDialog, QTabWidget, QProgressBar, QInputDialog, QAction,
                             QTreeWidget, QTextBrowser, QTreeWidgetItem, QSpacerItem, QSizePolicy, QLineEdit, QDialog)
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QTime, QSettings, QEventLoop
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QTime, QSettings, QEventLoop, QEvent
 from PyQt5.QtGui import QFont, QColor, QPixmap
 from PyQt5.QtCore import QThread, pyqtSignal
 
 import vtk
-import globalvals as gv
+
+# Support standalone launch: use globalvals when run from pyNuD, else minimal stub
+try:
+    import globalvals as gv
+except ModuleNotFoundError:
+    class _GlobalValsStub:
+        standardFont = "Helvetica"
+        main_window = None
+    gv = _GlobalValsStub()
 
 # VTK 9.x compatibility: Try different import methods for Qt integration
 try:
@@ -78,16 +86,18 @@ HELP_HTML_EN = """
 </ul>
 <h2>Importing Structure Files</h2>
 <div class="feature-box">
-    <h3>PDB / CIF</h3>
+    <h3>Supported Formats</h3>
     <ul>
-        <li><strong>PDB:</strong> Standard PDB files are supported.</li>
-        <li><strong>mmCIF:</strong> You can import <code>.cif</code>/<code>.mmcif</code> files using the <strong>Import CIF File</strong> button.</li>
+        <li><strong>PDB:</strong> Standard PDB files (<code>.pdb</code>) are supported.</li>
+        <li><strong>mmCIF:</strong> mmCIF format files (<code>.cif</code>, <code>.mmcif</code>) are supported.</li>
+        <li><strong>MRC:</strong> MRC (Medical Research Council) volume data files (<code>.mrc</code>) are supported.</li>
     </ul>
 </div>
-<h2>mmCIF Import</h2>
-<div class="step"><strong>Step 1:</strong> Click <strong>Import CIF File</strong>.</div>
-<div class="step"><strong>Step 2:</strong> Select a <code>.cif</code>/<code>.mmcif</code> file.</div>
+<h2>File Import</h2>
+<div class="step"><strong>Step 1:</strong> Click <strong>Import File...</strong> button.</div>
+<div class="step"><strong>Step 2:</strong> Select a structure file (<code>.pdb</code>, <code>.cif</code>, <code>.mmcif</code>, or <code>.mrc</code>).</div>
 <div class="step"><strong>Step 3:</strong> Confirm that the loaded file name is displayed in the simulator window.</div>
+<div class="step">You can also drag and drop a file onto the file name line below the Import File button.</div>
 <h2>Display style: Ribbon and secondary structure</h2>
 <p>The AFM Simulator supports PyMOL-style ribbon visualization (Catmull-Rom spline interpolation) based on secondary structure detection. Select <strong>Ribbon (PyMOL-style)</strong> in the display style to show the protein backbone as a ribbon. You can also change the display style from the context menu by right-clicking on the molecule view.</p>
 """
@@ -102,16 +112,18 @@ HELP_HTML_JA = """
 </ul>
 <h2>構造ファイルのインポート</h2>
 <div class="feature-box">
-    <h3>PDB / CIF</h3>
+    <h3>対応形式</h3>
     <ul>
-        <li><strong>PDB:</strong> 標準のPDBファイルに対応しています。</li>
-        <li><strong>mmCIF:</strong> <strong>Import CIF File</strong> ボタンで <code>.cif</code>/<code>.mmcif</code> をインポートできます。</li>
+        <li><strong>PDB:</strong> 標準のPDBファイル（<code>.pdb</code>）に対応しています。</li>
+        <li><strong>mmCIF:</strong> mmCIF形式ファイル（<code>.cif</code>、<code>.mmcif</code>）に対応しています。</li>
+        <li><strong>MRC:</strong> MRC（Medical Research Council）ボリュームデータファイル（<code>.mrc</code>）に対応しています。</li>
     </ul>
 </div>
-<h2>mmCIFインポート</h2>
-<div class="step"><strong>Step 1:</strong> <strong>Import CIF File</strong> をクリック。</div>
-<div class="step"><strong>Step 2:</strong> <code>.cif</code>/<code>.mmcif</code> ファイルを選択。</div>
+<h2>ファイルインポート</h2>
+<div class="step"><strong>Step 1:</strong> <strong>Import File...</strong> ボタンをクリック。</div>
+<div class="step"><strong>Step 2:</strong> 構造ファイル（<code>.pdb</code>、<code>.cif</code>、<code>.mmcif</code>、または <code>.mrc</code>）を選択。</div>
 <div class="step"><strong>Step 3:</strong> シミュレータウィンドウに読み込んだファイル名が表示されることを確認。</div>
+<div class="step">Import File ボタン下のファイル名の行にドラッグ＆ドロップすることもできます。</div>
 <h2>表示スタイル: リボンと二次構造</h2>
 <p>AFMシミュレータでは二次構造の検出に基づき、PyMOL風のリボン可視化（Catmull-Romスプライン補間）が利用できます。表示スタイルで <strong>Ribbon (PyMOL-style)</strong> を選択すると、タンパク質の主鎖がリボンとして表示されます。分子表示上で右クリックするコンテキストメニューからも表示スタイルを変更できます。</p>
 """
@@ -309,16 +321,15 @@ class HelpContentManager:
             """,
             "file_loading": """
             <h2>File Loading</h2>
-            <h3>PDB Files</h3>
+            <h3>File Import</h3>
             <ul>
-                <li><strong>Import PDB File:</strong> Loads protein structure data from PDB format files.</li>
-                <li><strong>Import CIF File:</strong> Loads protein structure data from PDB-derived mmCIF format files.</li>
+                <li><strong>Import File:</strong> Loads structure data from PDB (<code>.pdb</code>), mmCIF (<code>.cif</code>, <code>.mmcif</code>), or MRC (<code>.mrc</code>) format files.</li>
                 <li><strong>Automatic Tip Positioning:</strong> The tip is automatically positioned 2nm above the highest point of the loaded structure.</li>
                 <li><strong>Rotation Controls:</strong> X, Y, Z rotation controls are automatically enabled after loading.</li>
             </ul>
             <h3>MRC Files</h3>
             <ul>
-                <li><strong>Import MRC File:</strong> Loads volume data from MRC (Medical Research Council) format files.</li>
+                <li><strong>MRC Format:</strong> MRC (Medical Research Council) format files (<code>.mrc</code>) are supported for volume data.</li>
                 <li><strong>Density Threshold:</strong> Adjusts the isosurface threshold for volume rendering.</li>
                 <li><strong>Flip Z-axis:</strong> Automatically flips the Z-axis orientation by default for proper display.</li>
                 <li><strong>Voxel Size:</strong> Displays the physical size of each voxel in the volume data.</li>
@@ -401,16 +412,19 @@ class HelpContentManager:
             """,
             "file_loading": """
             <h2>File Loading / ファイル読み込み</h2>
-            <h3>PDB Files / PDBファイル</h3>
+            <h3>File Import / ファイルインポート</h3>
             <ul>
-                <li><strong>Import PDB File:</strong> PDB形式ファイルからタンパク質構造データを読み込みます。</li>
-                <li><strong>Import CIF File:</strong> PDB由来のmmCIF形式ファイルからタンパク質構造データを読み込みます。</li>
-                <li><strong>Automatic Tip Positioning:</strong> 読み込んだ構造の最高点から2nm上に探針を自動配置します。</li>
-                <li><strong>Rotation Controls:</strong> 読み込み後にX、Y、Z回転コントロールが自動的に有効になります。</li>
+                <li><strong>Import File:</strong> Loads structure data from PDB (<code>.pdb</code>), mmCIF (<code>.cif</code>, <code>.mmcif</code>), or MRC (<code>.mrc</code>) format files.</li>
+                <li><strong>Import File / ファイルインポート:</strong> PDB（<code>.pdb</code>）、mmCIF（<code>.cif</code>、<code>.mmcif</code>）、またはMRC（<code>.mrc</code>）形式ファイルから構造データを読み込みます。</li>
+                <li><strong>Automatic Tip Positioning:</strong> Automatically positions the tip 2nm above the highest point of the loaded structure.</li>
+                <li><strong>Automatic Tip Positioning / 自動探針配置:</strong> 読み込んだ構造の最高点から2nm上に探針を自動配置します。</li>
+                <li><strong>Rotation Controls:</strong> Rotation controls (X, Y, Z) are automatically enabled after loading.</li>
+                <li><strong>Rotation Controls / 回転コントロール:</strong> 読み込み後にX、Y、Z回転コントロールが自動的に有効になります。</li>
             </ul>
             <h3>MRC Files / MRCファイル</h3>
             <ul>
-                <li><strong>Import MRC File:</strong> MRC（Medical Research Council）形式ファイルからボリュームデータを読み込みます。</li>
+                <li><strong>MRC Format:</strong> MRC (Medical Research Council) format files (<code>.mrc</code>) are supported for volume data.</li>
+                <li><strong>MRC形式:</strong> MRC（Medical Research Council）形式ファイル（<code>.mrc</code>）がボリュームデータとしてサポートされています。</li>
                 <li><strong>Density Threshold:</strong> ボリュームレンダリングの等値面閾値を調整します。</li>
                 <li><strong>Flip Z-axis:</strong> デフォルトでZ軸の向きを自動的にフリップして正しい表示にします。</li>
                 <li><strong>Voxel Size:</strong> ボリュームデータの各ボクセルの物理サイズを表示します。</li>
@@ -1476,13 +1490,13 @@ class AFMSimulator(QMainWindow):
             }
         """)
         
-        # PDBファイル読み込み
-        pdb_group = QGroupBox("PDB File Import")
-        pdb_layout = QVBoxLayout(pdb_group)
+        # File Import (統合: PDB/CIF/MRC)
+        file_import_group = QGroupBox("File Import")
+        file_import_layout = QVBoxLayout(file_import_group)
         
-        self.import_btn = QPushButton("Import PDB File...")
+        self.import_btn = QPushButton("Import File...")
         self.import_btn.setMinimumHeight(35)
-        self.import_btn.setToolTip("Load PDB structure file for AFM simulation\nAFMシミュレーション用のPDB構造ファイルを読み込み")
+        self.import_btn.setToolTip("Load structure file (PDB/CIF/MRC) for AFM simulation\nAFMシミュレーション用の構造ファイル（PDB/CIF/MRC）を読み込み")
         self.import_btn.setStyleSheet("""
             QPushButton {
                 background-color: #2196F3;
@@ -1495,71 +1509,20 @@ class AFMSimulator(QMainWindow):
                 background-color: #1976D2;
             }
         """)
-        self.import_btn.clicked.connect(self.import_pdb_file)
-        pdb_layout.addWidget(self.import_btn)
+        self.import_btn.clicked.connect(self.import_file)
+        file_import_layout.addWidget(self.import_btn)
 
-        # CIF (mmCIF) ファイルインポートボタンを追加
-        self.import_cif_btn = QPushButton("Import CIF File...")
-        self.import_cif_btn.setMinimumHeight(35)
-        self.import_cif_btn.setToolTip("Load mmCIF structure file for AFM simulation\nAFMシミュレーション用のmmCIF構造ファイルを読み込み")
-        self.import_cif_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #7E57C2;
-                color: white;
-                border: none;
-                border-radius: 5px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #673AB7;
-            }
-        """)
-        self.import_cif_btn.clicked.connect(self.import_cif_file)
-        pdb_layout.addWidget(self.import_cif_btn)
-        
-        # ここにMRCファイルインポートボタンを追加
-        self.import_mrc_btn = QPushButton("Import MRC File...")
-        self.import_mrc_btn.setMinimumHeight(35)
-        self.import_mrc_btn.setToolTip("Load MRC volume data file for AFM simulation\nAFMシミュレーション用のMRCボリュームデータファイルを読み込み")
-        self.import_mrc_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #FF9800;
-                color: white;
-                border: none;
-                border-radius: 5px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #F57C00;
-            }
-        """)
-        self.import_mrc_btn.clicked.connect(self.import_mrc_file)
-        pdb_layout.addWidget(self.import_mrc_btn)
-
-        self.pdb_label = QLabel("PDB Name: (none)")
-        self.pdb_label.setWordWrap(True)
-        self.pdb_label.setStyleSheet("color: #666; font-size: 12px;")
-        pdb_layout.addWidget(self.pdb_label)
-
-        # CIFファイル名表示ラベル
-        self.cif_label = QLabel("CIF Name: (none)")
-        self.cif_label.setWordWrap(True)
-        self.cif_label.setStyleSheet("color: #666; font-size: 12px;")
-        pdb_layout.addWidget(self.cif_label)
-        
-        # MRCファイル名表示ラベル
-        self.mrc_label = QLabel("MRC Name: (none)")
-        self.mrc_label.setWordWrap(True)
-        self.mrc_label.setStyleSheet("color: #666; font-size: 12px;")
-        pdb_layout.addWidget(self.mrc_label)
-     
+        # インポートされたファイル名の表示のみ（ドロップは PDB Structure 領域で受付）
+        self.file_label = QLabel("File Name: (none)")
+        self.file_label.setStyleSheet("color: #666; font-size: 12px;")
+        file_import_layout.addWidget(self.file_label)
         
         # プログレスバー
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
-        pdb_layout.addWidget(self.progress_bar)
-        
-        layout.addWidget(pdb_group)
+        file_import_layout.addWidget(self.progress_bar)
+
+        layout.addWidget(file_import_group)
         
         # ★★★ Density Thresholdセクションを追加 ★★★
         self.mrc_group = QGroupBox("Density Threshold")
@@ -2067,7 +2030,7 @@ class AFMSimulator(QMainWindow):
         structure_layout.setContentsMargins(2, 2, 2, 2)
         structure_layout.setSpacing(2)
         # if 
-        structure_label = QLabel("PDB Structure")
+        structure_label = QLabel("Drop PDB, CIF, MRC files here")
         structure_label.setStyleSheet("""
             QLabel {
                 font-weight: bold;
@@ -2100,6 +2063,8 @@ class AFMSimulator(QMainWindow):
         """)
         
         self.vtk_widget = QVTKRenderWindowInteractor(self.view_control_splitter)
+        self.vtk_widget.setAcceptDrops(True)
+        self.vtk_widget.installEventFilter(self)
         self.view_control_splitter.addWidget(self.vtk_widget)
 
         rotation_controls = self.create_rotation_controls()
@@ -3363,19 +3328,62 @@ Check console for detailed information."""
                                f"Tip position: ({center_x:.1f}, {center_y:.1f}, {recommended_tip_z:.1f})nm")
 
         
-    def import_pdb_file(self):
-        """PDBファイルの読み込み"""
-        # ★★★ 修正: 最後に使用したディレクトリを初期位置としてダイアログを開く ★★★
-        initial_dir = self.last_import_dir if self.last_import_dir else ""
+    def import_file(self):
+        """統合ファイルインポート（PDB/CIF/MRC）"""
+        initial_dir = self.last_import_dir if hasattr(self, 'last_import_dir') and self.last_import_dir else ""
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select PDB File", initial_dir, "PDB files (*.pdb);;All files (*)",
+            self, "Select Structure File", initial_dir,
+            "Structure Files (*.pdb *.cif *.mmcif *.mrc);;PDB files (*.pdb);;mmCIF files (*.cif *.mmcif);;MRC Files (*.mrc);;All Files (*)",
             options=QFileDialog.DontUseNativeDialog)
         
         if not file_path:
             return
-            
-        # ★★★ 追加: インポートしたファイルのディレクトリを保存する ★★★
+        
         self.last_import_dir = os.path.dirname(file_path)
+        ext = os.path.splitext(file_path)[1].lower()
+        
+        if ext == '.pdb':
+            self._import_pdb_internal(file_path)
+        elif ext in ['.cif', '.mmcif']:
+            self._import_cif_internal(file_path)
+        elif ext == '.mrc':
+            self._import_mrc_internal(file_path)
+        else:
+            QMessageBox.warning(self, "Unsupported Format", 
+                              f"File format '{ext}' is not supported.\nSupported formats: .pdb, .cif, .mmcif, .mrc")
+
+    def eventFilter(self, obj, event):
+        """Filter events for vtk_widget: accept drag & drop of PDB/CIF/MRC files on PDB Structure area."""
+        target = hasattr(self, 'vtk_widget') and obj is self.vtk_widget
+        if target:
+            if event.type() == QEvent.DragEnter:
+                if event.mimeData().hasUrls():
+                    urls = event.mimeData().urls()
+                    allowed = ('.pdb', '.cif', '.mmcif', '.mrc')
+                    if urls and urls[0].isLocalFile():
+                        path = urls[0].toLocalFile()
+                        if os.path.isfile(path) and os.path.splitext(path)[1].lower() in allowed:
+                            event.acceptProposedAction()
+                            return True
+            elif event.type() == QEvent.Drop:
+                urls = event.mimeData().urls()
+                if urls and urls[0].isLocalFile():
+                    path = urls[0].toLocalFile()
+                    if os.path.isfile(path):
+                        self.last_import_dir = os.path.dirname(path)
+                        ext = os.path.splitext(path)[1].lower()
+                        if ext == '.pdb':
+                            self._import_pdb_internal(path)
+                        elif ext in ['.cif', '.mmcif']:
+                            self._import_cif_internal(path)
+                        elif ext == '.mrc':
+                            self._import_mrc_internal(path)
+                        event.acceptProposedAction()
+                        return True
+        return super().eventFilter(obj, event)
+
+    def _import_pdb_internal(self, file_path):
+        """PDBファイルの読み込み（内部メソッド）"""
             
         try:
             # MRCデータをクリア（PDBファイルimport時）
@@ -3384,8 +3392,6 @@ Check console for detailed information."""
             if hasattr(self, 'cif_name'):
                 self.cif_name = None
                 self.cif_id = ""
-            if hasattr(self, 'cif_label'):
-                self.cif_label.setText("CIF Name: (none)")
 
             if hasattr(self, 'rotation_widgets'):
                 self.reset_structure_rotation()
@@ -3432,7 +3438,7 @@ Check console for detailed information."""
             # ファイル名表示
             self.pdb_name = os.path.basename(file_path) 
             self.pdb_id = os.path.splitext(self.pdb_name)[0]
-            self.pdb_label.setText(f"PDB Name: {self.pdb_name}")
+            self.file_label.setText(f"File Name: {self.pdb_name} (PDB)")
             
             # シミュレーションボタンを有効化
             self.simulate_btn.setEnabled(True)
@@ -3455,18 +3461,8 @@ Check console for detailed information."""
             QMessageBox.critical(self, "Error", 
                             f"Failed to load PDB file:\n{str(e)}")
 
-    def import_cif_file(self):
-        """mmCIFファイルの読み込み（PDB由来の.cif/.mmcif）"""
-        initial_dir = self.last_import_dir if self.last_import_dir else ""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select mmCIF File", initial_dir, "mmCIF files (*.cif *.mmcif);;All files (*)",
-            options=QFileDialog.DontUseNativeDialog)
-
-        if not file_path:
-            return
-
-        self.last_import_dir = os.path.dirname(file_path)
-
+    def _import_cif_internal(self, file_path):
+        """mmCIFファイルの読み込み（内部メソッド）"""
         try:
             # MRCデータをクリア（CIFファイルimport時）
             self.clear_mrc_data()
@@ -3475,8 +3471,6 @@ Check console for detailed information."""
             if hasattr(self, 'pdb_name'):
                 self.pdb_name = None
                 self.pdb_id = ""
-            if hasattr(self, 'pdb_label'):
-                self.pdb_label.setText("PDB Name: (none)")
 
             if hasattr(self, 'rotation_widgets'):
                 self.reset_structure_rotation()
@@ -3514,8 +3508,7 @@ Check console for detailed information."""
             # ファイル名表示
             self.cif_name = os.path.basename(file_path)
             self.cif_id = os.path.splitext(self.cif_name)[0]
-            if hasattr(self, 'cif_label'):
-                self.cif_label.setText(f"CIF Name: {self.cif_name}")
+            self.file_label.setText(f"File Name: {self.cif_name} (CIF)")
 
             # シミュレーションボタンを有効化
             self.simulate_btn.setEnabled(True)
@@ -5893,8 +5886,8 @@ Check console for detailed information."""
             self.mrc_surface_coords = None
         
         # MRCラベルをリセット
-        if hasattr(self, 'mrc_label'):
-            self.mrc_label.setText("MRC Name: (none)")
+        if hasattr(self, 'file_label'):
+            self.file_label.setText("File Name: (none)")
         
         # MRCグループを無効化
         if hasattr(self, 'mrc_group'):
@@ -5932,10 +5925,8 @@ Check console for detailed information."""
             self.cif_id = ""
         
         # PDBラベルをリセット
-        if hasattr(self, 'pdb_label'):
-            self.pdb_label.setText("PDB Name: (none)")
-        if hasattr(self, 'cif_label'):
-            self.cif_label.setText("CIF Name: (none)")
+        if hasattr(self, 'file_label'):
+            self.file_label.setText("File Name: (none)")
         
         # 統計情報をリセット
         if hasattr(self, 'stats_label'):
@@ -7073,20 +7064,11 @@ Check console for detailed information."""
             # エラーが発生してもイベントは受け入れる
             event.accept()
 
-    def import_mrc_file(self):
+    def _import_mrc_internal(self, file_path):
+        """MRCファイルの読み込み（内部メソッド）"""
         # 必要なライブラリのインポート
         import mrcfile
         from vtk.util import numpy_support
-        from PyQt5.QtWidgets import QFileDialog
-
-        # 1. ファイル選択ダイアログ
-        initial_dir = self.last_import_dir if hasattr(self, 'last_import_dir') and self.last_import_dir else ""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select MRC File", initial_dir, "MRC Files (*.mrc);;All Files (*)",
-            options=QFileDialog.DontUseNativeDialog)
-        if not file_path:
-            return
-        self.last_import_dir = os.path.dirname(file_path)
         
         # PDBデータをクリア（MRCファイルimport時）
         self.clear_pdb_data()
@@ -7108,7 +7090,7 @@ Check console for detailed information."""
         self.mrc_name = os.path.basename(file_path)
         self.mrc_id = ""
         self.mrc_id = os.path.splitext(self.mrc_name)[0]
-        self.mrc_label.setText(f"MRC Name: {self.mrc_name}")
+        self.file_label.setText(f"File Name: {self.mrc_name} (MRC)")
         
         self.mrc_group.setEnabled(True)
         # Z flipの状態に応じてmrc_surface_coordsを初期化
