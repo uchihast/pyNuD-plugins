@@ -23,6 +23,176 @@ try:
 except ImportError:
     FigureCanvas = NavigationToolbar = Figure = cm = mcolors = Ellipse = None
 
+
+HELP_HTML_EN = """
+<h1>Particle Cluster Analysis</h1>
+<h2>Overview</h2>
+<p>This plugin detects particles in AFM images, computes the radial distribution function g(r), structural order parameters (Z, Psi6/Psi4/Psi2, Finger Tensor), segments clustered particles, and fits 2D ellipses. You can export and load results.</p>
+<p><strong>How to open:</strong> From the pyNuD menu bar: <strong>Plugin → Particle Cluster Analysis</strong>. Use it with an image already opened in the main window; the <strong>current frame</strong> is used as the analysis source.</p>
+
+<h2>Basic flow (flowchart)</h2>
+<div class="step"><strong>1.</strong> Open image in main window</div>
+<div class="step"><strong>2.</strong> P1: Click <strong>Detect Particles</strong></div>
+<div class="step"><strong>3.</strong> (Optional) P2: Click <strong>Calculate g(r)</strong>, then set R1/V1/V2 from the plot if you need structure analysis</div>
+<div class="step"><strong>4.</strong> P3–P5: Click <strong>Analyze Structure &amp; Tensor</strong></div>
+<div class="step"><strong>5.</strong> (Optional) P7: <strong>Segment Clustered Particles</strong>, then P8: <strong>Identify 2D Ellipses</strong></div>
+<div class="step"><strong>6.</strong> <strong>Export</strong> to save results</div>
+<p>If you only need particle positions and g(r), you can stop after step 2 or 3. If you need structural maps (Z, Psi6, etc.), do step 4. If you need ellipse fits per particle, do steps 5 and 6.</p>
+
+<h2>Parameters (detailed)</h2>
+<h3>P1: Particle Extraction</h3>
+<table class="param-table">
+<tr><th>Item</th><th>Description</th><th>Range / Default</th><th>Tip</th></tr>
+<tr><td>Est. Diameter (nm)</td><td>Estimated particle size used for detection (LoG filter scale).</td><td>1–500 nm, default 20</td><td>Set close to your actual particle diameter.</td></tr>
+<tr><td>Threshold</td><td>Sensitivity for picking local maxima (particle peaks). Higher = fewer, stronger peaks.</td><td>0–1000, default 100</td><td>Adjust if too many or too few particles are detected.</td></tr>
+<tr><td>Polarity</td><td>Bright: particles are higher (protrusions). Dark: particles are lower (depressions).</td><td>Bright / Dark</td><td>Match your image contrast.</td></tr>
+<tr><td>Detect Particles</td><td>Runs detection on the current frame.</td><td>—</td><td>Run after setting Est. Diameter and Threshold.</td></tr>
+<tr><td>Delete Edges</td><td>Removes particles near image edges (to avoid edge artifacts).</td><td>—</td><td>Use after detection if needed.</td></tr>
+<tr><td>Manual Edit</td><td>Toggle: add or remove particles by clicking on the main image.</td><td>—</td><td>Turn on to correct detection mistakes.</td></tr>
+<tr><td>Make Checkwave</td><td>Generates a checkwave from current particle list (for alignment checks).</td><td>—</td><td>Optional.</td></tr>
+</table>
+<h3>P2: g(r) Analysis</h3>
+<p><strong>g(r)</strong> = radial distribution function: how particle density varies with distance from a reference particle.</p>
+<table class="param-table">
+<tr><th>Item</th><th>Description</th><th>Range / Default</th><th>Tip</th></tr>
+<tr><td>dr (nm)</td><td>Bin width for g(r). Smaller = finer resolution, noisier.</td><td>1–50 nm, default 1</td><td>1–2 nm is often enough.</td></tr>
+<tr><td>Calculate g(r)</td><td>Computes g(r) from current particle positions.</td><td>—</td><td>Run after P1 detection.</td></tr>
+<tr><td>Pick None / R1 / V1 / V2</td><td>Click on g(r) plot to set R1 (first peak), V1, V2. These are used as cutoffs for structure analysis.</td><td>—</td><td>R1 = first neighbor shell; V1/V2 = distance range for Finger Tensor.</td></tr>
+<tr><td>R1, V1, V2</td><td>Distance values (nm). R1 from g(r) first peak; V1/V2 set analysis range.</td><td>Manual input</td><td>You can type values or pick from the plot.</td></tr>
+</table>
+<h3>P3–P5: Mapping</h3>
+<p><strong>Z</strong> = coordination number (number of neighbors). <strong>Psi6 / Psi4 / Psi2</strong> = bond-orientational order (hexagonal, rectangular, linear). <strong>Finger Tensor</strong> = local anisotropy (lambda1, lambda2, aspect).</p>
+<table class="param-table">
+<tr><th>Item</th><th>Description</th><th>Range / Default</th><th>Tip</th></tr>
+<tr><td>Analyze Structure &amp; Tensor</td><td>Computes Z, Psi6/Psi4/Psi2, Finger Tensor and updates the structural maps on the right panel.</td><td>—</td><td>Uses R1, V1, V2. Run after P2 if you use g(r) cutoffs.</td></tr>
+</table>
+<h3>P6: Particle Navigation</h3>
+<table class="param-table">
+<tr><th>Item</th><th>Description</th><th>Range / Default</th><th>Tip</th></tr>
+<tr><td>Particle ID</td><td>Select which particle to show in the zoom view.</td><td>0 to N−1</td><td>Change to inspect individual particles.</td></tr>
+<tr><td>Z Range (nm)</td><td>Height range (relative to particle peak) for the zoom view.</td><td>Low–High nm, default 2–20</td><td>Narrow range shows a slice; wide range shows full height.</td></tr>
+<tr><td>Z Tolerance (nm)</td><td>Slice thickness for height-based display.</td><td>1–50 nm, default 1</td><td>Smaller = thinner slice.</td></tr>
+</table>
+<h3>P7: Segmentation</h3>
+<table class="param-table">
+<tr><th>Item</th><th>Description</th><th>Range / Default</th><th>Tip</th></tr>
+<tr><td>Basic / Advanced</td><td>Basic: single Gating Thresh. Advanced: Alpha (distance) and Beta (curvature) for weighted watershed.</td><td>—</td><td>Try Basic first.</td></tr>
+<tr><td>Gating Thresh</td><td>Normalized curvature threshold (Basic mode). Higher = stricter, fewer regions.</td><td>0–1, default 0.2</td><td>Adjust if over/under-segmented.</td></tr>
+<tr><td>Alpha (Dist)</td><td>Distance weight in Advanced mode.</td><td>0.1–5, default 1</td><td>Used with Beta.</td></tr>
+<tr><td>Beta (Curv)</td><td>Curvature weight in Advanced mode.</td><td>0.1–20, default 5</td><td>Higher = more curvature-sensitive.</td></tr>
+<tr><td>Sigma (Blur)</td><td>Blur (nm) before segmentation. Denoise: optional smoothing.</td><td>0.1–5 nm, default 1.2</td><td>Reduces noise; too large blurs boundaries.</td></tr>
+<tr><td>Show Tags</td><td>Show segment IDs on the main image.</td><td>—</td><td>Turn on to check segmentation.</td></tr>
+<tr><td>Conf</td><td>Confidence threshold for displayed segments.</td><td>0–1, default 0.75</td><td>Higher = only high-confidence segments.</td></tr>
+<tr><td>Segment Clustered Particles</td><td>Runs segmentation and overlays labels on the image.</td><td>—</td><td>Run after P1 detection. Required before P8 ellipse fitting.</td></tr>
+</table>
+<h3>P8: Ellipse Fitting</h3>
+<table class="param-table">
+<tr><th>Item</th><th>Description</th><th>Range / Default</th><th>Tip</th></tr>
+<tr><td>Identify 2D Ellipses</td><td>Fits an ellipse to each segmented particle. Results appear in the table (Axis A, B, Angle, RMSE) and in Fit Aspect / Orientation maps.</td><td>—</td><td>Run after P7 segmentation.</td></tr>
+</table>
+<h3>Export / Load</h3>
+<table class="param-table">
+<tr><th>Item</th><th>Description</th><th>Range / Default</th><th>Tip</th></tr>
+<tr><td>Export</td><td>Saves particle list, g(r), structural results, and ellipse fits to a file.</td><td>—</td><td>Choose a path and filename.</td></tr>
+<tr><td>Load</td><td>Loads a previously exported result file.</td><td>—</td><td>Restores particles and results for that file.</td></tr>
+</table>
+
+<h2>Workflow (step by step)</h2>
+<div class="step"><strong>Step 1:</strong> Open your AFM image in the main window and go to the frame you want to analyze.</div>
+<div class="step"><strong>Step 2:</strong> Set <strong>Est. Diameter</strong> (nm) to your particle size, adjust <strong>Threshold</strong> if needed, then click <strong>Detect Particles</strong>.</div>
+<div class="step"><strong>Step 3:</strong> (Optional) Click <strong>Calculate g(r)</strong>. On the g(r) plot, choose <strong>R1</strong> (or V1/V2) and click to set the value, or type R1/V1/V2 manually.</div>
+<div class="step"><strong>Step 4:</strong> Click <strong>Analyze Structure &amp; Tensor</strong> to compute order parameters and view maps in the right panel.</div>
+<div class="step"><strong>Step 5:</strong> (Optional) Set P7 parameters and click <strong>Segment Clustered Particles</strong>, then click <strong>Identify 2D Ellipses</strong> in P8.</div>
+<div class="step"><strong>Step 6:</strong> Click <strong>Export</strong> to save results to a file.</div>
+
+<div class="note"><strong>Note:</strong> The analysis uses the <strong>current frame</strong> of the image in the main window. For 2ch data, make sure the correct channel is selected before running detection or analysis.</div>
+"""
+
+HELP_HTML_JA = """
+<h1>Particle Cluster Analysis（粒子クラスター解析）</h1>
+<h2>概要</h2>
+<p>本プラグインは、AFM画像から粒子を検出し、動径分布関数 g(r)、構造秩序パラメータ（Z, Psi6/Psi4/Psi2, Finger Tensor）、クラスター粒子のセグメンテーション、2D楕円フィットを行います。結果のエクスポート・読み込みが可能です。</p>
+<p><strong>起動方法:</strong> pyNuDメニュー <strong>Plugin → Particle Cluster Analysis</strong>。メインウィンドウで画像を開いた状態で使用し、<strong>現在のフレーム</strong>が解析対象になります。</p>
+
+<h2>基本の流れ（フローチャート）</h2>
+<div class="step"><strong>1.</strong> メインウィンドウで画像を開く</div>
+<div class="step"><strong>2.</strong> P1: <strong>Detect Particles</strong> をクリック</div>
+<div class="step"><strong>3.</strong>（任意）P2: <strong>Calculate g(r)</strong> をクリックし、必要ならプロットから R1/V1/V2 を設定</div>
+<div class="step"><strong>4.</strong> P3–P5: <strong>Analyze Structure &amp; Tensor</strong> をクリック</div>
+<div class="step"><strong>5.</strong>（任意）P7: <strong>Segment Clustered Particles</strong>、続けて P8: <strong>Identify 2D Ellipses</strong></div>
+<div class="step"><strong>6.</strong> <strong>Export</strong> で結果を保存</div>
+<p>粒子位置と g(r) だけ必要な場合は 2 または 3 で終了できます。構造マップ（Z, Psi6 など）が必要なら 4 を実行。粒子ごとの楕円フィットが必要なら 5 と 6 を実行してください。</p>
+
+<h2>パラメータ（詳しい説明）</h2>
+<h3>P1: Particle Extraction</h3>
+<table class="param-table">
+<tr><th>項目</th><th>説明</th><th>範囲・初期値</th><th>コツ</th></tr>
+<tr><td>Est. Diameter (nm)</td><td>検出に使う粒子径の目安（LoGフィルタのスケール）。</td><td>1–500 nm、初期値 20</td><td>実際の粒子径に近く設定。</td></tr>
+<tr><td>Threshold</td><td>局所極大（粒子ピーク）を選ぶ感度。大きいほど少なく・強いピークのみ。</td><td>0–1000、初期値 100</td><td>検出数が多すぎ・少なすぎなら調整。</td></tr>
+<tr><td>Polarity</td><td>Bright: 粒子が高い（突出）。Dark: 粒子が低い（窪み）。</td><td>Bright / Dark</td><td>画像のコントラストに合わせる。</td></tr>
+<tr><td>Detect Particles</td><td>現在フレームで検出を実行。</td><td>—</td><td>Est. Diameter と Threshold を設定してから実行。</td></tr>
+<tr><td>Delete Edges</td><td>画像端付近の粒子を除外（端の影響を避ける）。</td><td>—</td><td>必要なら検出後に実行。</td></tr>
+<tr><td>Manual Edit</td><td>オンにするとメイン画像をクリックして粒子を追加・削除できる。</td><td>—</td><td>検出ミスを直すときに使う。</td></tr>
+<tr><td>Make Checkwave</td><td>現在の粒子リストからチェック波を生成（位置合わせの確認用）。</td><td>—</td><td>任意。</td></tr>
+</table>
+<h3>P2: g(r) Analysis</h3>
+<p><strong>g(r)</strong> = 動径分布関数：基準粒子からの距離に対する粒子密度の変化。</p>
+<table class="param-table">
+<tr><th>項目</th><th>説明</th><th>範囲・初期値</th><th>コツ</th></tr>
+<tr><td>dr (nm)</td><td>g(r) のビン幅。小さくすると細かく、ノイズは増える。</td><td>1–50 nm、初期値 1</td><td>1–2 nm で十分なことが多い。</td></tr>
+<tr><td>Calculate g(r)</td><td>現在の粒子位置から g(r) を計算。</td><td>—</td><td>P1 検出後に実行。</td></tr>
+<tr><td>Pick None / R1 / V1 / V2</td><td>g(r) プロットをクリックして R1（第1ピーク）、V1、V2 を設定。構造解析の距離範囲に使う。</td><td>—</td><td>R1 = 第1隣接殻。V1/V2 = Finger Tensor の範囲。</td></tr>
+<tr><td>R1, V1, V2</td><td>距離（nm）。R1 は g(r) の第1ピーク。V1/V2 で解析範囲を指定。</td><td>手入力可</td><td>プロットでピックするか、数値入力。</td></tr>
+</table>
+<h3>P3–P5: Mapping</h3>
+<p><strong>Z</strong> = 配位数（隣接粒子の数）。<strong>Psi6 / Psi4 / Psi2</strong> = 結合配向秩序（六方・四角・直線）。<strong>Finger Tensor</strong> = 局所異方性（lambda1, lambda2, aspect）。</p>
+<table class="param-table">
+<tr><th>項目</th><th>説明</th><th>範囲・初期値</th><th>コツ</th></tr>
+<tr><td>Analyze Structure &amp; Tensor</td><td>Z, Psi6/Psi4/Psi2, Finger Tensor を計算し、右パネルの構造マップを更新。</td><td>—</td><td>R1, V1, V2 を使用。g(r) から決める場合は P2 の後に実行。</td></tr>
+</table>
+<h3>P6: Particle Navigation</h3>
+<table class="param-table">
+<tr><th>項目</th><th>説明</th><th>範囲・初期値</th><th>コツ</th></tr>
+<tr><td>Particle ID</td><td>拡大表示する粒子を選択。</td><td>0 ～ N−1</td><td>個々の粒子を確認するときに変更。</td></tr>
+<tr><td>Z Range (nm)</td><td>拡大ビューの高さ範囲（粒子ピークからの相対）。</td><td>Low–High nm、初期値 2–20</td><td>狭いとスライス、広いと全体の高さを表示。</td></tr>
+<tr><td>Z Tolerance (nm)</td><td>高さスライスの厚さ。</td><td>1–50 nm、初期値 1</td><td>小さくすると薄いスライス。</td></tr>
+</table>
+<h3>P7: Segmentation</h3>
+<table class="param-table">
+<tr><th>項目</th><th>説明</th><th>範囲・初期値</th><th>コツ</th></tr>
+<tr><td>Basic / Advanced</td><td>Basic: Gating Thresh のみ。Advanced: Alpha（距離）と Beta（曲率）で重み付き watershed。</td><td>—</td><td>まず Basic を試す。</td></tr>
+<tr><td>Gating Thresh</td><td>正規化曲率閾値（Basic）。大きいほど厳しく、領域は少なく。</td><td>0–1、初期値 0.2</td><td>過剰・不足セグメントなら調整。</td></tr>
+<tr><td>Alpha (Dist)</td><td>Advanced モードの距離の重み。</td><td>0.1–5、初期値 1</td><td>Beta と併用。</td></tr>
+<tr><td>Beta (Curv)</td><td>Advanced モードの曲率の重み。</td><td>0.1–20、初期値 5</td><td>大きくすると曲率に敏感。</td></tr>
+<tr><td>Sigma (Blur)</td><td>セグメンテーション前のぼかし（nm）。Denoise で平滑化オプション。</td><td>0.1–5 nm、初期値 1.2</td><td>ノイズ低減。大きすぎると境界がぼける。</td></tr>
+<tr><td>Show Tags</td><td>メイン画像にセグメントIDを表示。</td><td>—</td><td>セグメント結果の確認用。</td></tr>
+<tr><td>Conf</td><td>表示するセグメントの信頼度閾値。</td><td>0–1、初期値 0.75</td><td>大きくすると高信頼のみ表示。</td></tr>
+<tr><td>Segment Clustered Particles</td><td>セグメンテーションを実行し、画像にラベルを重ねる。</td><td>—</td><td>P1 検出後に実行。P8 楕円フィットの前に必要。</td></tr>
+</table>
+<h3>P8: Ellipse Fitting</h3>
+<table class="param-table">
+<tr><th>項目</th><th>説明</th><th>範囲・初期値</th><th>コツ</th></tr>
+<tr><td>Identify 2D Ellipses</td><td>各セグメント粒子に楕円をフィット。結果はテーブル（Axis A, B, Angle, RMSE）と Fit Aspect / Orientation マップに表示。</td><td>—</td><td>P7 セグメンテーションの後に実行。</td></tr>
+</table>
+<h3>Export / Load</h3>
+<table class="param-table">
+<tr><th>項目</th><th>説明</th><th>範囲・初期値</th><th>コツ</th></tr>
+<tr><td>Export</td><td>粒子リスト、g(r)、構造結果、楕円フィットをファイルに保存。</td><td>—</td><td>保存先とファイル名を指定。</td></tr>
+<tr><td>Load</td><td>以前エクスポートした結果ファイルを読み込む。</td><td>—</td><td>粒子と結果を復元。</td></tr>
+</table>
+
+<h2>ワークフロー（手順）</h2>
+<div class="step"><strong>ステップ 1:</strong> メインウィンドウでAFM画像を開き、解析したいフレームに移動する。</div>
+<div class="step"><strong>ステップ 2:</strong> <strong>Est. Diameter</strong> (nm) を粒子サイズに合わせ、必要なら <strong>Threshold</strong> を調整してから <strong>Detect Particles</strong> をクリック。</div>
+<div class="step"><strong>ステップ 3:</strong>（任意）<strong>Calculate g(r)</strong> をクリック。g(r) プロットで <strong>R1</strong>（または V1/V2）を選びクリックして値を設定するか、R1/V1/V2 を手入力。</div>
+<div class="step"><strong>ステップ 4:</strong> <strong>Analyze Structure &amp; Tensor</strong> をクリックして秩序パラメータを計算し、右パネルでマップを確認。</div>
+<div class="step"><strong>ステップ 5:</strong>（任意）P7 のパラメータを設定し <strong>Segment Clustered Particles</strong> をクリック、続けて P8 の <strong>Identify 2D Ellipses</strong> をクリック。</div>
+<div class="step"><strong>ステップ 6:</strong> <strong>Export</strong> をクリックして結果をファイルに保存。</div>
+
+<div class="note"><strong>注意:</strong> 解析対象はメインウィンドウで表示している<strong>現在フレーム</strong>の画像です。2chデータの場合は、検出・解析前に正しいチャネルが選択されているか確認してください。</div>
+"""
+
+
 class QRangeSlider(QtWidgets.QWidget):
     """
     A custom dual-handle range slider widget for selecting a Z-height range.
@@ -228,8 +398,9 @@ class ParticleClusterWindow(QtWidgets.QMainWindow):
         self.fitting_results = {} # Store ellipsoid params indexed by particle ID
         
         self.setupUI()
+        self._setup_menu_bar()
         self.restoreWindowSettings()
-        
+
         # Connect to main window frame change signal
         if self.parent and hasattr(self.parent, 'frameChanged'):
             self.parent.frameChanged.connect(self.on_frame_changed)
@@ -257,6 +428,113 @@ class ParticleClusterWindow(QtWidgets.QMainWindow):
         self._setup_third_panel()
 
         self.splitter.setStretchFactor(0, 0); self.splitter.setStretchFactor(1, 1); self.splitter.setStretchFactor(2, 2)
+
+    def _setup_menu_bar(self):
+        """Add Help menu with Manual and About."""
+        menubar = self.menuBar()
+        menubar.setVisible(True)
+        try:
+            menubar.setNativeMenuBar(False)  # Show menu bar inside window (e.g. on macOS)
+        except Exception:
+            pass
+        help_menu = menubar.addMenu("&Help")
+        manual_action = QtWidgets.QAction("&Manual", self)
+        manual_action.setShortcut("F1")
+        manual_action.triggered.connect(self._show_help)
+        help_menu.addAction(manual_action)
+        help_menu.addSeparator()
+        about_action = QtWidgets.QAction("&About Particle Cluster Analysis", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
+        menubar.update()
+
+    def _show_help(self):
+        """Help → Manual: show manual in QDialog (ja/English toggle), same style as Dwell Analysis."""
+        dialog = QtWidgets.QDialog(self)
+        dialog.setMinimumSize(500, 500)
+        dialog.resize(600, 650)
+        layout_dlg = QtWidgets.QVBoxLayout(dialog)
+        lang_row = QtWidgets.QHBoxLayout()
+        lang_row.addWidget(QtWidgets.QLabel("Language / 言語:"))
+        btn_ja = QtWidgets.QPushButton("日本語", dialog)
+        btn_en = QtWidgets.QPushButton("English", dialog)
+        btn_ja.setCheckable(True)
+        btn_en.setCheckable(True)
+        lang_grp = QtWidgets.QButtonGroup(dialog)
+        lang_grp.addButton(btn_ja)
+        lang_grp.addButton(btn_en)
+        lang_grp.setExclusive(True)
+        _BTN_SELECTED = "QPushButton { background-color: #007aff; color: white; font-weight: bold; }"
+        _BTN_NORMAL = "QPushButton { background-color: #e5e5e5; color: black; }"
+        lang_row.addWidget(btn_ja)
+        lang_row.addWidget(btn_en)
+        lang_row.addStretch()
+        layout_dlg.addLayout(lang_row)
+        browser = QtWidgets.QTextBrowser(dialog)
+        browser.setOpenExternalLinks(True)
+        css = """
+        body { font-size: 15px; line-height: 1.6; }
+        .step { margin: 8px 0; padding: 6px 0; font-size: 15px; }
+        .note { background-color: #fff3cd; border: 1px solid #ffeaa7; color: #856404; padding: 14px; border-radius: 4px; margin: 14px 0; font-size: 15px; }
+        h1 { font-size: 22px; color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }
+        h2 { font-size: 18px; color: #2c3e50; margin-top: 18px; }
+        ul { padding-left: 24px; font-size: 15px; }
+        table.param-table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14px; }
+        table.param-table th, table.param-table td { border: 1px solid #ddd; padding: 10px 12px; text-align: left; }
+        table.param-table th { background-color: #f8f9fa; font-weight: bold; }
+        """
+        browser.document().setDefaultStyleSheet(css)
+        close_btn = QtWidgets.QPushButton("Close", dialog)
+        close_btn.clicked.connect(dialog.accept)
+
+        def set_lang(use_ja):
+            btn_ja.setChecked(use_ja)
+            btn_en.setChecked(not use_ja)
+            btn_ja.setStyleSheet(_BTN_SELECTED if use_ja else _BTN_NORMAL)
+            btn_en.setStyleSheet(_BTN_SELECTED if not use_ja else _BTN_NORMAL)
+            if use_ja:
+                browser.setHtml("<html><body>" + HELP_HTML_JA.strip() + "</body></html>")
+                dialog.setWindowTitle("粒子クラスター解析 - マニュアル")
+                close_btn.setText("閉じる")
+            else:
+                browser.setHtml("<html><body>" + HELP_HTML_EN.strip() + "</body></html>")
+                dialog.setWindowTitle("Particle Cluster Analysis - Manual")
+                close_btn.setText("Close")
+
+        btn_ja.clicked.connect(lambda: set_lang(True))
+        btn_en.clicked.connect(lambda: set_lang(False))
+        layout_dlg.addWidget(browser)
+        layout_dlg.addWidget(close_btn)
+        set_lang(False)  # default: English
+        dialog.exec_()
+
+    def _show_about(self):
+        """Show About dialog."""
+        QtWidgets.QMessageBox.about(
+            self,
+            "About Particle Cluster Analysis",
+            "Particle Cluster Analysis / 粒子クラスター解析\n\n"
+            "AFM image particle detection, g(r), structural order parameters, "
+            "segmentation, and ellipse fitting.\n\n"
+            "pyNuD plugin."
+        )
+
+    def showEvent(self, event):
+        """Ensure menu bar is visible when window is shown (e.g. macOS)."""
+        super(ParticleClusterWindow, self).showEvent(event)
+        try:
+            menubar = self.menuBar()
+            if not menubar.isVisible() or not menubar.actions():
+                menubar.setVisible(True)
+                try:
+                    menubar.setNativeMenuBar(False)
+                except Exception:
+                    pass
+                if not menubar.actions():
+                    menubar.clear()
+                    self._setup_menu_bar()
+        except Exception:
+            pass
 
     def _setup_first_panel(self):
         """Setup the first panel (Controls) / 第1パネル（コントロール）のセットアップ"""
@@ -1904,6 +2182,7 @@ class ParticleClusterWindow(QtWidgets.QMainWindow):
             else:
                 for col in range(4, 8):
                     self.results_table.setItem(i, col, QtWidgets.QTableWidgetItem("-"))
+
 
 # =============================================================================
 # Plugin Factory Implementation
