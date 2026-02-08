@@ -14631,42 +14631,32 @@ class AFMSimulator(pyNuD_simulator):
         self._pynud_real_refresh_timer = None
         self._pynud_last_file_path = None
         self._pynud_trimmed_real_window_ref = None
-        self._pymol_unavailable_warned = False
-        self._pymol_unavailable_pending = False
         super().__init__()
         self.setWindowTitle(PLUGIN_NAME)
+        # Plugin default: start in VTK mode even if PyMOL is available.
+        self.user_render_backend_preference = "vtk"
+        try:
+            self._set_render_backend("vtk")
+            self._update_renderer_combo()
+        except Exception:
+            pass
         self._connect_main_window_signals()
         self._load_real_afm_from_pynud(frame_index=None, sync=False, show=False)
         if not bool(getattr(self, "pymol_available", False)):
-            self._pymol_unavailable_pending = True
-
-    def showEvent(self, event):  # type: ignore[override]
-        super().showEvent(event)
-        if self._pymol_unavailable_pending and not self._pymol_unavailable_warned:
-            self._pymol_unavailable_pending = False
-            QTimer.singleShot(0, self._warn_pymol_unavailable)
-
-    def _warn_pymol_unavailable(self):
-        if self._pymol_unavailable_warned:
-            return
-        self._pymol_unavailable_warned = True
-        QMessageBox.warning(
-            self,
-            "PyMOL Unavailable",
-            "PyMOL is not available in this environment.\n"
-            "PyMOL display modes are disabled.\n"
-            "AFMSimulator will run with VTK (interactive) only.",
-        )
+            self.on_pymol_unavailable(phase="startup")
 
     def on_pymol_unavailable(self, detail="", phase="runtime"):
-        """Hook called by core simulator when PyMOL is not usable."""
-        self._pymol_unavailable_pending = False
-        if self._pymol_unavailable_warned:
-            return
-        if self.isVisible():
-            QTimer.singleShot(0, self._warn_pymol_unavailable)
-        else:
-            self._pymol_unavailable_pending = True
+        """Hook called by core simulator when PyMOL is not usable.
+
+        Plugin policy: no popup warning, silently enforce VTK-only view.
+        """
+        try:
+            self.pymol_available = False
+            self.user_render_backend_preference = "vtk"
+            self._set_render_backend("vtk")
+            self._update_renderer_combo()
+        except Exception:
+            pass
 
     def _has_pynud_real_source(self):
         return bool(
