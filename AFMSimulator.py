@@ -2726,6 +2726,11 @@ class pyNuD_simulator(QMainWindow):
             self.pymol_available = True
         except Exception as e:
             print(f"PyMOL setup error: {e}")
+            try:
+                if hasattr(self, "on_pymol_unavailable"):
+                    self.on_pymol_unavailable(str(e), phase="startup")
+            except Exception:
+                pass
             self.render_backend = "vtk"
             if hasattr(self, 'esp_check'):
                 self.esp_check.setEnabled(False)
@@ -6935,6 +6940,18 @@ class pyNuD_simulator(QMainWindow):
                 self.pymol_cmd.orient(obj)
         except Exception as e:
             print(f"[WARNING] PyMOL load failed: {e}")
+            try:
+                # Disable PyMOL path after runtime failure and continue in VTK-only mode.
+                self.pymol_available = False
+                self._set_render_backend("vtk")
+                self._update_renderer_combo()
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "on_pymol_unavailable"):
+                    self.on_pymol_unavailable(str(e), phase="runtime")
+            except Exception:
+                pass
             return
 
         style = self.style_combo.currentText()
@@ -14615,11 +14632,18 @@ class AFMSimulator(pyNuD_simulator):
         self._pynud_last_file_path = None
         self._pynud_trimmed_real_window_ref = None
         self._pymol_unavailable_warned = False
+        self._pymol_unavailable_pending = False
         super().__init__()
         self.setWindowTitle(PLUGIN_NAME)
         self._connect_main_window_signals()
         self._load_real_afm_from_pynud(frame_index=None, sync=False, show=False)
         if not bool(getattr(self, "pymol_available", False)):
+            self._pymol_unavailable_pending = True
+
+    def showEvent(self, event):  # type: ignore[override]
+        super().showEvent(event)
+        if self._pymol_unavailable_pending and not self._pymol_unavailable_warned:
+            self._pymol_unavailable_pending = False
             QTimer.singleShot(0, self._warn_pymol_unavailable)
 
     def _warn_pymol_unavailable(self):
@@ -14633,6 +14657,16 @@ class AFMSimulator(pyNuD_simulator):
             "PyMOL display modes are disabled.\n"
             "AFMSimulator will run with VTK (interactive) only.",
         )
+
+    def on_pymol_unavailable(self, detail="", phase="runtime"):
+        """Hook called by core simulator when PyMOL is not usable."""
+        self._pymol_unavailable_pending = False
+        if self._pymol_unavailable_warned:
+            return
+        if self.isVisible():
+            QTimer.singleShot(0, self._warn_pymol_unavailable)
+        else:
+            self._pymol_unavailable_pending = True
 
     def _has_pynud_real_source(self):
         return bool(
