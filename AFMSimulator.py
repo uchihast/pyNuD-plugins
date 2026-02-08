@@ -2726,15 +2726,15 @@ class pyNuD_simulator(QMainWindow):
             self.pymol_available = True
         except Exception as e:
             print(f"PyMOL setup error: {e}")
+            self.render_backend = "vtk"
+            if hasattr(self, 'esp_check'):
+                self.esp_check.setEnabled(False)
+            self._setup_vtk_legacy()
             try:
                 if hasattr(self, "on_pymol_unavailable"):
                     self.on_pymol_unavailable(str(e), phase="startup")
             except Exception:
                 pass
-            self.render_backend = "vtk"
-            if hasattr(self, 'esp_check'):
-                self.esp_check.setEnabled(False)
-            self._setup_vtk_legacy()
             return
 
         # Qtウィジェットの初期化
@@ -8713,7 +8713,7 @@ class pyNuD_simulator(QMainWindow):
         return frame
     
     def reset_camera(self):
-        """カメラのリセット（デフォルトでYZ平面視点）"""
+        """カメラのリセット（デフォルトでXY平面視点）"""
         if self._is_pymol_active():
             try:
                 self.pymol_cmd.reset()
@@ -8725,9 +8725,9 @@ class pyNuD_simulator(QMainWindow):
         self.renderer.ResetCamera()
         camera = self.renderer.GetActiveCamera()
         
-        # デフォルトでYZ平面視点に設定
-        camera.SetViewUp(0, 0, 1)  # Z軸が上方向
-        camera.SetPosition(15, 0, 0)  # X軸の正方向から見る
+        # デフォルトでXY平面視点に設定
+        camera.SetViewUp(0, 1, 0)  # Y軸が上方向
+        camera.SetPosition(0, 0, 15)  # Z軸の正方向から見る
         camera.SetFocalPoint(0, 0, 0)  # 原点を焦点に
         
         self.renderer.ResetCameraClippingRange()
