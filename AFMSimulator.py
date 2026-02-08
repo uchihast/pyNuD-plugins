@@ -14614,10 +14614,25 @@ class AFMSimulator(pyNuD_simulator):
         self._pynud_real_refresh_timer = None
         self._pynud_last_file_path = None
         self._pynud_trimmed_real_window_ref = None
+        self._pymol_unavailable_warned = False
         super().__init__()
         self.setWindowTitle(PLUGIN_NAME)
         self._connect_main_window_signals()
         self._load_real_afm_from_pynud(frame_index=None, sync=False, show=False)
+        if not bool(getattr(self, "pymol_available", False)):
+            QTimer.singleShot(0, self._warn_pymol_unavailable)
+
+    def _warn_pymol_unavailable(self):
+        if self._pymol_unavailable_warned:
+            return
+        self._pymol_unavailable_warned = True
+        QMessageBox.warning(
+            self,
+            "PyMOL Unavailable",
+            "PyMOL is not available in this environment.\n"
+            "PyMOL display modes are disabled.\n"
+            "AFMSimulator will run with VTK (interactive) only.",
+        )
 
     def _has_pynud_real_source(self):
         return bool(
