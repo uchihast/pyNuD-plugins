@@ -32,10 +32,6 @@ These URLs always point to the latest GitHub Release assets.
 - [LAFMAnalysis.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/LAFMAnalysis.py)  
   Localizes intensity peaks in time-series AFM data and reconstructs super-resolution images.
 
-## Download All
-
-- [pyNuD-plugins-latest.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/pyNuD-plugins-latest.zip)
-
 ## Raw Main Links
 
 For development snapshots, use:
