@@ -5,6 +5,7 @@
 import sys
 import time
 import os # <<< osモジュールをインポート
+import json
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
 from scipy.ndimage import maximum_filter, gaussian_filter, zoom, rotate, shift
@@ -784,8 +785,10 @@ class LAFMPanelWindow(QtWidgets.QWidget):
         self.btn_prep2 = QtWidgets.QPushButton("2. Preprocessing 2")
         self.btn_make_img = QtWidgets.QPushButton("3. Make LAFM Image")
         self.btn_save = QtWidgets.QPushButton("Save")
+        self.btn_load = QtWidgets.QPushButton("Load")
         button_grid_layout.addWidget(self.btn_prep1, 0, 0); button_grid_layout.addWidget(self.btn_prep2, 0, 1)
         button_grid_layout.addWidget(self.btn_make_img, 1, 0); button_grid_layout.addWidget(self.btn_save, 1, 1)
+        button_grid_layout.addWidget(self.btn_load, 2, 0, 1, 2)
         control_layout.addLayout(button_grid_layout)
         
         self.btn_prep1.setEnabled(False)
@@ -794,6 +797,7 @@ class LAFMPanelWindow(QtWidgets.QWidget):
         self.btn_prep2.clicked.connect(self.run_preprocessing2)
         self.btn_make_img.clicked.connect(self.run_make_lafm_image)
         self.btn_save.clicked.connect(self._save_lafm_data)
+        self.btn_load.clicked.connect(self._load_lafm_params)
         
         mode_layout = QtWidgets.QHBoxLayout()
         self.mode_combo = QtWidgets.QComboBox(); self.mode_combo.addItems(["2D", "3D"])
@@ -829,6 +833,13 @@ class LAFMPanelWindow(QtWidgets.QWidget):
         self.drift_algorithm_combo = QtWidgets.QComboBox()
         self.drift_algorithm_combo.addItems(["Phase Correlation (Fast)", "Feature-based (Precise)"])
         drift_layout.addRow("Algorithm:", self.drift_algorithm_combo)
+
+        self.drift_subpixel_spin = QtWidgets.QSpinBox(value=10, minimum=1, maximum=100)
+        self.drift_subpixel_spin.setToolTip(
+            "Subpixel precision for phase-correlation fine alignment.\n"
+            "Higher values improve alignment precision but take longer."
+        )
+        drift_layout.addRow("Subpixel Precision:", self.drift_subpixel_spin)
         
         # 信頼度閾値
         self.drift_threshold_spin = QtWidgets.QDoubleSpinBox(value=0.1, minimum=0.0, maximum=1.0, singleStep=0.01, decimals=3)
@@ -846,6 +857,13 @@ class LAFMPanelWindow(QtWidgets.QWidget):
         self.std_dev_label = QtWidgets.QLabel("N factor:")
         self.std_dev_factor_spin = QtWidgets.QDoubleSpinBox(value=0.0, minimum=-5.0, maximum=20.0, singleStep=0.1)
         tol_layout.addRow(self.std_dev_label, self.std_dev_factor_spin)
+        self.imagej_compat_check = QtWidgets.QCheckBox("Enable ImageJ-compatible ROI mask")
+        self.imagej_compat_check.setToolTip(
+            "Apply per-frame Otsu ROI mask and use ImageJ-compatible tolerance/normalization.\n"
+            "フレームごとのOtsu ROIマスクを適用し、ImageJ互換の閾値/正規化を使用します。"
+        )
+        self.imagej_compat_check.toggled.connect(self._on_imagej_compat_changed)
+        tol_layout.addRow("", self.imagej_compat_check)
         
         # Z範囲の自動設定ボタン（他のコントロールと同じ左の位置に配置）
         auto_z_button = QtWidgets.QPushButton("Auto Z-Range")
@@ -893,9 +911,17 @@ class LAFMPanelWindow(QtWidgets.QWidget):
        
         self.subpix_group, subpix_layout = create_form_group_box("Subpixel Localization", checkable=True)
         self.subpix_scale_spin = QtWidgets.QSpinBox(value=10, minimum=2, maximum=20)
+        self.subpix_expand_spin = QtWidgets.QSpinBox(value=1, minimum=1, maximum=20)
+        self.subpix_expand_spin.setToolTip(
+            "Final reconstruction grid expansion factor.\n"
+            "1 keeps the current pixel count, 2 doubles width/height, etc."
+        )
         self.subpix_xy_res_spin = QtWidgets.QDoubleSpinBox(value=0.1, minimum=0.01, maximum=10.0, singleStep=0.01, suffix=" nm")
         self.subpix_z_res_spin = QtWidgets.QDoubleSpinBox(value=0.1, minimum=0.01, maximum=10.0, singleStep=0.01, suffix=" nm")
-        subpix_layout.addRow("Scale:", self.subpix_scale_spin); subpix_layout.addRow("XY Resolution:", self.subpix_xy_res_spin); subpix_layout.addRow("Z Resolution:", self.subpix_z_res_spin)
+        subpix_layout.addRow("Scale:", self.subpix_scale_spin)
+        subpix_layout.addRow("Expand:", self.subpix_expand_spin)
+        subpix_layout.addRow("XY Resolution:", self.subpix_xy_res_spin)
+        subpix_layout.addRow("Z Resolution:", self.subpix_z_res_spin)
         control_layout.addWidget(self.subpix_group)
 
         self.sym_group = QtWidgets.QGroupBox("Symmetric Averaging"); self.sym_group.setCheckable(True); self.sym_group.setChecked(False)
@@ -1065,6 +1091,7 @@ class LAFMPanelWindow(QtWidgets.QWidget):
             'mode': self.mode_combo.currentText(),
             'filter_mode': self.filter_mode_combo.currentText(),
             'std_dev_factor': self.std_dev_factor_spin.value(),
+            'imagej_compat_mode': self.imagej_compat_check.isChecked(),
             'z_min': self.z_min_spin.value(),
             'z_max': self.z_max_spin.value(),
             'crop_ratio': self.crop_ratio_spin.value(),
@@ -1072,6 +1099,7 @@ class LAFMPanelWindow(QtWidgets.QWidget):
             'connectivity': int(self.connectivity_combo.currentText()),
             'subpixel_on': self.subpix_group.isChecked(),
             'subpixel_scale': self.subpix_scale_spin.value(),
+            'subpixel_expand': self.subpix_expand_spin.value(),
             'subpixel_xy_res': self.subpix_xy_res_spin.value(),
             'subpixel_z_res': self.subpix_z_res_spin.value(),
             'sym_on': self.sym_group.isChecked(),
@@ -1082,11 +1110,102 @@ class LAFMPanelWindow(QtWidgets.QWidget):
             'blur_sigma_z': self.blur_sigma_z_spin.value(),
             'drift_correction': self.drift_group.isChecked(),
             'drift_algorithm': self.drift_algorithm_combo.currentText(),
+            'drift_subpixel_precision': self.drift_subpixel_spin.value(),
             'drift_threshold': self.drift_threshold_spin.value(),
 
             'vis_delay_spin': self.vis_delay_spin.value(),
         }
         return self.params
+
+    def _get_params_json_path(self, data_path):
+        root, _ext = os.path.splitext(data_path)
+        return root + "_params.json"
+
+    def _save_lafm_params_json(self, json_path):
+        self._collect_params()
+        payload = {
+            'plugin': PLUGIN_NAME,
+            'version': 1,
+            'params': self.params,
+        }
+        with open(json_path, 'w', encoding='utf-8') as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+
+    def _apply_loaded_params(self, params):
+        if not isinstance(params, dict):
+            raise ValueError("Invalid parameter file format.")
+
+        self.mode_combo.setCurrentText(str(params.get('mode', self.mode_combo.currentText())))
+        self.filter_mode_combo.setCurrentText(str(params.get('filter_mode', self.filter_mode_combo.currentText())))
+        self.std_dev_factor_spin.setValue(float(params.get('std_dev_factor', self.std_dev_factor_spin.value())))
+        self.imagej_compat_check.setChecked(bool(params.get('imagej_compat_mode', self.imagej_compat_check.isChecked())))
+        self.z_min_spin.setValue(float(params.get('z_min', self.z_min_spin.value())))
+        self.z_max_spin.setValue(float(params.get('z_max', self.z_max_spin.value())))
+        self.crop_ratio_spin.setValue(float(params.get('crop_ratio', self.crop_ratio_spin.value())))
+        self.search_size_spin.setValue(int(params.get('search_size', self.search_size_spin.value())))
+        self.connectivity_combo.setCurrentText(str(params.get('connectivity', self.connectivity_combo.currentText())))
+
+        self.subpix_group.setChecked(bool(params.get('subpixel_on', self.subpix_group.isChecked())))
+        self.subpix_scale_spin.setValue(int(params.get('subpixel_scale', self.subpix_scale_spin.value())))
+        self.subpix_expand_spin.setValue(int(params.get('subpixel_expand', self.subpix_expand_spin.value())))
+        self.subpix_xy_res_spin.setValue(float(params.get('subpixel_xy_res', self.subpix_xy_res_spin.value())))
+        self.subpix_z_res_spin.setValue(float(params.get('subpixel_z_res', self.subpix_z_res_spin.value())))
+
+        self.sym_group.setChecked(bool(params.get('sym_on', self.sym_group.isChecked())))
+        self.sym_prep2_check.setChecked(bool(params.get('sym_on_prep2', self.sym_prep2_check.isChecked())))
+        self.sym_final_check.setChecked(bool(params.get('sym_on_final', self.sym_final_check.isChecked())))
+        self.sym_order_spin.setValue(int(params.get('sym_order', self.sym_order_spin.value())))
+
+        self.blur_sigma_xy_spin.setValue(float(params.get('blur_sigma_xy', self.blur_sigma_xy_spin.value())))
+        self.blur_sigma_z_spin.setValue(float(params.get('blur_sigma_z', self.blur_sigma_z_spin.value())))
+
+        self.drift_group.setChecked(bool(params.get('drift_correction', self.drift_group.isChecked())))
+        self.drift_algorithm_combo.setCurrentText(str(params.get('drift_algorithm', self.drift_algorithm_combo.currentText())))
+        self.drift_subpixel_spin.setValue(int(params.get('drift_subpixel_precision', self.drift_subpixel_spin.value())))
+        self.drift_threshold_spin.setValue(float(params.get('drift_threshold', self.drift_threshold_spin.value())))
+
+        self.vis_delay_spin.setValue(int(params.get('vis_delay_spin', self.vis_delay_spin.value())))
+
+        self._on_mode_changed(self.mode_combo.currentIndex())
+        self._on_filter_mode_changed(self.filter_mode_combo.currentIndex())
+        self._on_imagej_compat_changed(self.imagej_compat_check.isChecked())
+        self._on_z_range_changed()
+        self._collect_params()
+
+    def _load_lafm_params(self):
+        dialog_options = QtWidgets.QFileDialog.Options()
+        if sys.platform != "darwin":
+            dialog_options |= QtWidgets.QFileDialog.DontUseNativeDialog
+
+        start_folder = getattr(gv, 'lastUsedSaveDir', '') or (
+            os.path.dirname(gv.files[gv.currentFileNum]) if hasattr(gv, 'files') and gv.files else ""
+        )
+        filepath, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load LAFM Parameters",
+            start_folder,
+            "JSON File (*.json)",
+            options=dialog_options
+        )
+
+        if not filepath:
+            return
+
+        try:
+            with open(filepath, 'r', encoding='utf-8') as fh:
+                payload = json.load(fh)
+
+            if isinstance(payload, dict) and 'params' in payload:
+                params = payload['params']
+            else:
+                params = payload
+
+            self._apply_loaded_params(params)
+            gv.lastUsedSaveDir = os.path.dirname(filepath)
+            self._update_status(f"Loaded parameters from {os.path.basename(filepath)}", color="green")
+            QtWidgets.QMessageBox.information(self, "Load Complete", f"L-AFM parameters loaded:\n{filepath}")
+        except Exception as e:
+            self._handle_error(f"Failed to load parameter file: {e}")
 
     # ▼▼▼【重要修正点】_save_lafm_data メソッドを全面的に書き換え ▼▼▼
     def _save_lafm_data(self):
@@ -1113,16 +1232,20 @@ class LAFMPanelWindow(QtWidgets.QWidget):
             start_folder = os.path.dirname(gv.files[gv.currentFileNum]) if hasattr(gv, 'files') and gv.files else ""
         
         default_save_path = os.path.join(start_folder, default_savename)
+        dialog_options = QtWidgets.QFileDialog.Options()
+        if sys.platform != "darwin":
+            dialog_options |= QtWidgets.QFileDialog.DontUseNativeDialog
         
         filepath, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Save LAFM Data", default_save_path, file_filter,
-            options=QtWidgets.QFileDialog.DontUseNativeDialog
+            options=dialog_options
         )
 
         if not filepath:
             return
 
         try:
+            params_json_path = self._get_params_json_path(filepath)
             self._update_status(f"Saving to {os.path.basename(filepath)}...", color="darkorange")
             
             if self.params['mode'] == '2D':
@@ -1154,9 +1277,15 @@ class LAFMPanelWindow(QtWidgets.QWidget):
             else:
                 tifffile.imsave(filepath, self.final_lafm_image, imagej=True)
 
+            self._save_lafm_params_json(params_json_path)
+
             gv.lastUsedSaveDir = os.path.dirname(filepath)
             self._update_status(f"Saved successfully!", color="green")
-            QtWidgets.QMessageBox.information(self, "Success", f"LAFMデータを保存しました:\n{filepath}")
+            QtWidgets.QMessageBox.information(
+                self,
+                "Success",
+                f"LAFMデータを保存しました:\n{filepath}\n\nParameters JSON:\n{params_json_path}"
+            )
 
             if self.main_window and hasattr(self.main_window, 'rescan_and_load'):
                 self._update_status(f"Reloading {os.path.basename(filepath)}...", color="info")
@@ -1915,7 +2044,28 @@ class LAFMPanelWindow(QtWidgets.QWidget):
         elif index == 1:
             self.std_dev_label.setVisible(True)
             self.std_dev_factor_spin.setVisible(True)
+            if self.imagej_compat_check.isChecked():
+                self.std_dev_label.setText("Noise Tolerance (%):")
+                self.std_dev_factor_spin.setRange(0.0, 100.0)
+                self.std_dev_factor_spin.setSingleStep(0.5)
+            else:
+                self.std_dev_label.setText("N factor:")
+                self.std_dev_factor_spin.setRange(-5.0, 20.0)
+                self.std_dev_factor_spin.setSingleStep(0.1)
             self.z_min_label.setText("Z_min (nm, optional):")
+
+    @QtCore.pyqtSlot(bool)
+    def _on_imagej_compat_changed(self, checked):
+        if checked and self.filter_mode_combo.currentIndex() == 1:
+            self.std_dev_label.setText("Noise Tolerance (%):")
+            self.std_dev_factor_spin.setRange(0.0, 100.0)
+            self.std_dev_factor_spin.setSingleStep(0.5)
+            if self.std_dev_factor_spin.value() < 0:
+                self.std_dev_factor_spin.setValue(5.0)
+        elif self.filter_mode_combo.currentIndex() == 1:
+            self.std_dev_label.setText("N factor:")
+            self.std_dev_factor_spin.setRange(-5.0, 20.0)
+            self.std_dev_factor_spin.setSingleStep(0.1)
     
     def _create_lafm_lut(self):
         color_stops = [(0, (0, 0, 0)), (85, (100, 0, 120)), (170, (255, 100, 0)), (220, (255, 255, 0)), (255, (255, 255, 255))]
@@ -2029,11 +2179,14 @@ class LAFMPanelWindow(QtWidgets.QWidget):
                     
                     is_rot = "Feature-based" in params['drift_algorithm']
                     conf_thresh = params['drift_threshold']
+                    subpixel_precision = max(1, int(params.get('drift_subpixel_precision', 10)))
                     
                     # ヘルパー関数を呼び出して変換行列を計算
                     matrices, confidences = calculate_drift_matrices(
                         resampled_stack, 
-                        is_rotation_enabled=is_rot
+                        is_rotation_enabled=is_rot,
+                        confidence_threshold=conf_thresh,
+                        phase_upsample_factor=subpixel_precision,
                     )
                     
                     # 信頼度フィルタリング
@@ -2084,7 +2237,7 @@ class LAFMPanelWindow(QtWidgets.QWidget):
             num_corrected_frames = corrected_stack.shape[2]
             all_detections = [] # 検出結果を初期化
 
-            for i in range(num_frames):
+            for i in range(num_corrected_frames):
                 if progress_signal:
                     progress_signal.emit(int(20 + 80 * i / num_corrected_frames), f"Detecting peaks in frame {i+1}/{num_corrected_frames}")
 
@@ -2102,7 +2255,10 @@ class LAFMPanelWindow(QtWidgets.QWidget):
                 # A, B, C: 高さ、局所最大値、空間フィルタリング
                 threshold = -np.inf
                 if params['filter_mode'] == 'Statistics (Mean + N x Std Dev)' and np.std(frame_rel) > 1e-9:
-                    threshold = np.mean(frame_rel) + (params['std_dev_factor'] * np.std(frame_rel))
+                    if params.get('imagej_compat_mode', False):
+                        threshold = np.mean(frame_rel) * params['std_dev_factor'] / 100.0
+                    else:
+                        threshold = np.mean(frame_rel) + (params['std_dev_factor'] * np.std(frame_rel))
     
                 
                 height_mask = (frame_rel >= threshold) & (frame_abs >= params['z_min']) & (frame_abs <= params['z_max'])
@@ -2116,7 +2272,15 @@ class LAFMPanelWindow(QtWidgets.QWidget):
     
 
 
-                footprint = np.ones((3, 3)) if params['connectivity'] == 8 else np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]])
+                search_size = max(3, int(params.get('search_size', 3)))
+                if search_size % 2 == 0:
+                    search_size += 1
+                if params['connectivity'] == 8:
+                    footprint = np.ones((search_size, search_size), dtype=bool)
+                else:
+                    radius = search_size // 2
+                    yy, xx = np.ogrid[-radius:radius+1, -radius:radius+1]
+                    footprint = (np.abs(xx) + np.abs(yy)) <= radius
                 maxima_mask = (frame_abs == maximum_filter(frame_abs, footprint=footprint, mode='constant', cval=0.0))
 
 
@@ -2125,9 +2289,15 @@ class LAFMPanelWindow(QtWidgets.QWidget):
                 y_coords, x_coords = np.ogrid[:height, :width]
                 spatial_mask = ((x_coords - center_x)**2 + (y_coords - center_y)**2) < crop_radius_sq
 
+                roi_mask = np.ones_like(frame_abs, dtype=bool)
+                if params.get('imagej_compat_mode', False):
+                    frame_8u = cv2.normalize(frame_rel, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                    _, roi_bin = cv2.threshold(frame_8u, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    roi_mask = roi_bin.astype(bool)
+
                 
                 # D: 最終的なピークマスクと座標
-                final_peaks_mask = height_mask & maxima_mask & spatial_mask
+                final_peaks_mask = height_mask & maxima_mask & spatial_mask & roi_mask
                 peak_coords_y, peak_coords_x = np.where(final_peaks_mask)
                 final_maxima_coords_int = list(zip(peak_coords_y, peak_coords_x))
                 
@@ -2184,7 +2354,7 @@ class LAFMPanelWindow(QtWidgets.QWidget):
             
             if progress_signal: progress_signal.emit(100, "Preprocessing 1 Finished.")
     
-            return detections, resampled_stack
+            return detections, corrected_stack
 
         except Exception as e:
             import traceback
@@ -2209,12 +2379,21 @@ class LAFMPanelWindow(QtWidgets.QWidget):
         scan_size_y = h_proc * self.scale_info['dy']
 
         # 新しいグリッドのピクセル数を計算
+        reconst_w, reconst_h = w_proc, h_proc
         if params['subpixel_on']:
             xy_res = params['subpixel_xy_res']
-            reconst_w = int(round(scan_size_x / xy_res)) if xy_res > 0 else w_proc
-            reconst_h = int(round(scan_size_y / xy_res)) if xy_res > 0 else h_proc
-        else:
-            reconst_w, reconst_h = w_proc, h_proc
+            expand = max(1, int(params.get('subpixel_expand', 1)))
+
+            if xy_res > 0:
+                reconst_w = max(reconst_w, int(round(scan_size_x / xy_res)))
+                reconst_h = max(reconst_h, int(round(scan_size_y / xy_res)))
+
+            if expand > 1:
+                reconst_w = max(reconst_w, int(round(w_proc * expand)))
+                reconst_h = max(reconst_h, int(round(h_proc * expand)))
+
+        reconst_w = max(1, int(reconst_w))
+        reconst_h = max(1, int(reconst_h))
 
         reconst_dx = scan_size_x / reconst_w
         reconst_dy = scan_size_y / reconst_h
@@ -2322,6 +2501,10 @@ class LAFMPanelWindow(QtWidgets.QWidget):
                 
                 if np.any(probability_wave):
                     blurred_prob = gaussian_filter(probability_wave, sigma=sigma)
+                    if params.get('imagej_compat_mode', False):
+                        # ImageJ macro compatibility:
+                        # Divide by 40.58, then multiply by sigma^2.
+                        blurred_prob = (blurred_prob / 40.58) * (sigma * sigma)
                     if plot_signal:
                         display_prob = blurred_prob / np.max(blurred_prob) if np.max(blurred_prob) > 0 else blurred_prob
                         plot_signal.emit(display_prob, 'top')
@@ -2483,7 +2666,7 @@ class LAFMPanelWindow(QtWidgets.QWidget):
             
             # 必須ヘッダー情報の存在をチェックし、なければデフォルト値を使用
             required_params = {
-                'FileType': 1, 'FrameHeaderSize': 64, 'TextEncoding': 0, 'DataType1ch': 1, 
+                'FileType': 1, 'FrameHeaderSize': 64, 'TextEncoding': 0, 'DataType1ch': 20564,
                 'DataType2ch': 0, 'ScanDirection': 0, 'ScanTryNum': 1, 'AveFlag': 0, 'AveNum': 1,
                 'XRound': 0, 'YRound': 0, 'FrameTime': 1000.0, 'Sensitivity': 1.0, 'PhaseSens': 1.0, 
                 'MachineNo': 0, 'ADRange': 0, 'ADResolution': 0, 'PiezoConstX': 1.0,
@@ -2492,6 +2675,24 @@ class LAFMPanelWindow(QtWidgets.QWidget):
             header_values = {}
             for param, default in required_params.items():
                 header_values[param] = getattr(gv, param, default)
+
+            # LAFM 2D保存は高さ[nm]として扱う（DataType1ch=20564）を強制する
+            header_values['DataType1ch'] = 20564
+            header_values['DataType2ch'] = 0
+
+            # LAFM画像のダイナミックレンジに合わせてZ感度を最適化し、
+            # 保存→再読込時に飽和で真っ黒化するのを防ぐ。
+            image_data_f64 = np.asarray(image_data, dtype=np.float64)
+            image_data_f64 = np.nan_to_num(image_data_f64, nan=0.0, posinf=0.0, neginf=0.0)
+            img_min = float(np.min(image_data_f64))
+            img_max = float(np.max(image_data_f64))
+            image_span = max(img_max - img_min, 0.0)
+
+            # raw = (5 - h/(PiezoConstZ*DriverGainZ)) * 4096/10
+            # h in [0, image_span] が raw in [2048, 0] に収まるように設定する。
+            effective_pcz = max(image_span / 5.0, 1e-6)
+            header_values['PiezoConstZ'] = effective_pcz
+            header_values['DriverGainZ'] = 1.0
 
         
             max_scan_size_x = getattr(gv, 'MaxScanSizeX', float(save_x_scan_size))
@@ -2567,28 +2768,20 @@ class LAFMPanelWindow(QtWidgets.QWidget):
                 f.write(struct.pack('<f', header_values['PiezoConstZ'])); f.write(struct.pack('<f', header_values['DriverGainZ']))
                 f.write(ope_name_bytes); f.write(comment_bytes)
 
-                # --- ▼▼▼【重要修正点】画像データの変換と書き込み ▼▼▼ ---
-                # Y軸反転を削除して、元の向きのまま保存
-                # 2. LAFM解析は凹凸データのみなので、nm → uint16の変換のみ
-                converted_data = (5.0 - image_data / header_values['PiezoConstZ'] / header_values['DriverGainZ']) * 4096.0 / 10.0
-                
-                # 3. データ範囲を0-65535に正規化
-                data_min = np.min(converted_data)
-                data_max = np.max(converted_data)
-                
-                if data_max > data_min:
-                    # オフセットを適用して負の値を避ける
-                    offset = max(0, -data_min)
-                    shifted_data = converted_data + offset
-                    
-                    # スケーリングを適用してuint16の範囲に収める
-                    scale_factor = 65535.0 / (data_max + offset)
-                    scaled_data = shifted_data * scale_factor
-                    
-                    # 最終的なuint16変換（丸め誤差を最小化）
-                    normalized_data = np.round(np.clip(scaled_data, 0, 65535)).astype(np.uint16)
-                else:
-                    normalized_data = np.zeros_like(converted_data, dtype=np.uint16)
+                # --- 画像データの変換と書き込み ---
+                # LAFM結果は nm データとして保存する。
+                # 読み込み時にDataType1ch=20564で最小値が0に正規化されるため、
+                # 保存側でも最小値基準（0スタート）で符号化する。
+                height_data = image_data_f64 - img_min
+                converted_data = (
+                    5.0 - height_data / header_values['PiezoConstZ'] / header_values['DriverGainZ']
+                ) * 4096.0 / 10.0
+
+                # 非数値を除去
+                converted_data = np.nan_to_num(converted_data, nan=0.0, posinf=65535.0, neginf=0.0)
+
+                # ASDの標準的な12bit範囲へクリップ
+                normalized_data = np.clip(np.round(converted_data), 0, 4095).astype(np.uint16)
 
                 min_data_int = int(np.min(normalized_data))
                 max_data_int = int(np.max(normalized_data))

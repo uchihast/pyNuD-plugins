@@ -609,7 +609,7 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 - AFM探針モデルを使った高さマップ生成
 - XY / YZ / ZX 像の比較
 - 実AFMデータとのサイズ同期・姿勢推定（Estimate Pose）
-- 実AFMに見た目を寄せる外観最適化（Auto-fit Appearance）
+- 実AFMに見た目を寄せる外観最適化（Auto-fit AFM Appearance）
 
 ---
 
@@ -692,9 +692,9 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 
 ### 5.4 AFM Tip Settings {#ja-sec5-4}
 - `Shape`: Cone / Sphere / Paraboloid
-- `Radius (nm)`: 0.5–30.0（デフォルト 0.5）
+- `Radius (nm)`: 0.1–30.0（デフォルト 0.5）
 - `Radius of Minitip (nm)`: 0.1–10.0（Sphere使用時）
-- `Angle (deg)`: 5–35（Cone/Sphere向け）
+- `Angle (deg)`: 1–35（Cone/Sphere向け）
 - `Tip Info`: 現在の形状情報表示
 
 ### 5.5 Tip Position Control {#ja-sec5-5}
@@ -832,10 +832,13 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
   - `Rctangle` がONでも、ASDが長方形なら自動でOFFに切替
 - `Estimate Pose`
   - Rotation XYZを変えながら反復シミュレーションで最適方位探索
+  - `Pose axes` の `X` / `Y` / `Z` チェックで、探索中に回転を許可する軸を限定可能
   - 推定後、Rotation XYZへ反映
   - Sim Aligned とメイン `Simulated AFM Images` のXY像が一致する運用
-- `Auto-fit Appearance`
-  - ノイズ/アーティファクト条件を探索してReal AFMへ見た目を寄せる
+- `Auto-fit AFM Appearance`
+  - 1段階目で探針 `Radius (nm)` / `Angle (deg)` とLow-pass `Cutoff Wavelength (nm)` を探索
+  - Auto-fit成功時は `Apply Low-pass Filter` をONにする
+  - ノイズ/アーティファクト条件は探索・変更しない
   - 反映結果は Sim Aligned 側にも適用
 
 ---
@@ -861,6 +864,8 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 3. 最良姿勢で再シミュレーション
 4. 残差平行移動（Dx, Dy）とスコア算出
 
+`Pose axes` でチェックを外した軸は、Estimate Pose中に現在のRotation値へ固定されます。例えば `Z` のみONにすると面内回転だけを探索し、`X` / `Y` の傾きは変えません。全軸OFFでは実行できません。
+
 ### 9.4 進捗表示 {#ja-sec9-4}
 - 推定中は `QProgressDialog` を表示
 - `Cancel` 可能
@@ -868,20 +873,22 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 
 ---
 
-## 10. Auto-fit Appearance の仕様 {#ja-sec10}
+## 10. Auto-fit AFM Appearance の仕様 {#ja-sec10}
 
-目的: 実AFM像に近い外観ノイズ条件を自動探索。
+目的: 実AFM像に近い探針条件・Low-pass条件を自動探索。
 
 主な特徴:
-- Real AFM と Simulated AFM が必要
-- 低域フィルタの `Cutoff Wavelength` は固定（Auto-fitで変更しない）
+- Real AFM と PDB/CIF 構造が必要
+- ASDの `Scan X/Y` と `Nx/Ny` に合わせて、PDBからXY像を再シミュレーションして評価
+- Stage 1: 探針 `Radius (nm)`、`Angle (deg)`、Low-pass `Cutoff Wavelength (nm)` を探索
+- `Apply Low-pass Filter` はAuto-fit成功時にONになり、`Cutoff Wavelength (nm)` をAuto-fitで変更可能
+- `Cutoff Wavelength (nm)` はLow-passの空間周波数カットオフに対応する波長パラメータ
 - `Scan Direction` は内部的に `L2R` 固定で評価
+- Noise/Drift/Feedbackなどのノイズ/走査アーティファクト条件はAuto-fitでは変更しない
 - 探索候補:
-  - Height noise
-  - Line noise
-  - Drift
-  - Feedback mode（linear_lag / tapping_parachute 系）
-- 最良候補を AFM Appearance UI に反映して再描画
+  - Tip radius / angle
+  - Low-pass cutoff wavelength
+- 最良候補をAFM Tip SettingsとLow-pass UIに反映して再描画
 
 ---
 
@@ -935,7 +942,7 @@ OFF時:
 4. 必要に応じROIで対象分子を中心化  
 5. `Get Simulated image` でスキャン条件一致シミュレーション  
 6. `Estimate Pose` で方位推定（精度選択）  
-7. `Auto-fit Appearance` でノイズ外観を調整  
+7. `Auto-fit AFM Appearance` で探針・Low-pass条件を調整
 8. メイン下段 `Simulated AFM Images` と `Sim Aligned` が一致することを確認  
 9. ASD/画像を保存
 
@@ -971,7 +978,7 @@ OFF時:
 - `Help` メニューは `View Help...` のみ
 - Real AFM と Sim Aligned は専用ウィンドウで管理
 - Estimate Pose は画像回転比較だけでなく、Rotation XYZを変えて再シミュレーションする方式
-- Auto-fit Appearance は Sim Aligned 側にも反映
+- Auto-fit AFM Appearance は Sim Aligned 側にも反映
 - Interactive Update はデフォルト ON
 - `Rctangle` はデフォルト ON（必要に応じ自動解除）
 """
@@ -1076,9 +1083,9 @@ When the main window closes, these child windows close automatically.
 
 ### 5.4 AFM Tip Settings {#en-sec5-4}
 - `Shape`: Cone / Sphere / Paraboloid
-- `Radius (nm)`: 0.5-30.0 (default 0.5)
+- `Radius (nm)`: 0.1-30.0 (default 0.5)
 - `Radius of Minitip (nm)`: 0.1-10.0 (Sphere mode)
-- `Angle (deg)`: 5-35 (Cone/Sphere)
+- `Angle (deg)`: 1-35 (Cone/Sphere)
 - `Tip Info`: current tip geometry summary
 
 ### 5.5 Tip Position Control {#en-sec5-5}
@@ -1210,10 +1217,13 @@ Image drawing areas are kept aligned in size.
   - auto-disables rectangle lock when ASD X/Y differ
 - `Estimate Pose`
   - performs iterative rotation search by re-simulating (Rotation XYZ optimization)
+  - `Pose axes` `X` / `Y` / `Z` checkboxes restrict which structure rotation axes may change during search
   - applies estimated rotation to controls
   - keeps Sim Aligned and main XY simulation consistent
-- `Auto-fit Appearance`
-  - searches noise/artifact parameters to visually match Real AFM
+- `Auto-fit AFM Appearance`
+  - first searches probe `Radius (nm)` / `Angle (deg)` and low-pass `Cutoff Wavelength (nm)`
+  - turns `Apply Low-pass Filter` on when Auto-fit succeeds
+  - does not search or change noise/artifact parameters
   - applies result to aligned preview as well
 
 ---
@@ -1238,6 +1248,8 @@ Higher precision increases search evaluations and runtime.
 3. final simulation at best orientation
 4. residual translation and final score calculation
 
+Axes disabled in `Pose axes` are fixed at their current Rotation values during Estimate Pose. For example, enabling only `Z` searches in-plane rotation while keeping X/Y tilt unchanged. Estimate Pose cannot run when all axes are disabled.
+
 ### 9.4 Progress UI {#en-sec9-4}
 - Uses `QProgressDialog`
 - Supports cancel
@@ -1245,20 +1257,22 @@ Higher precision increases search evaluations and runtime.
 
 ---
 
-## 10. Auto-fit Appearance Behavior {#en-sec10}
+## 10. Auto-fit AFM Appearance Behavior {#en-sec10}
 
-Purpose: fit simulated appearance to Real AFM look.
+Purpose: fit probe and low-pass appearance to the Real AFM look.
 
 Key points:
-- requires Real AFM and simulated XY image
-- keeps `Cutoff Wavelength` fixed (no auto-change of low-pass cutoff)
+- requires Real AFM and PDB/CIF structure
+- re-simulates XY from the structure using ASD `Scan X/Y` and `Nx/Ny`
+- Stage 1 fits probe `Radius (nm)`, `Angle (deg)`, and low-pass `Cutoff Wavelength (nm)`
+- `Apply Low-pass Filter` is turned on when Auto-fit succeeds, and Auto-fit changes `Cutoff Wavelength (nm)`
+- `Cutoff Wavelength (nm)` is the wavelength-form parameter corresponding to the low-pass spatial-frequency cutoff
 - uses fixed `Scan Direction = L2R` during search
+- noise/scan artifact controls such as Noise, Drift, and Feedback are not changed by Auto-fit
 - explores candidates over:
-  - height noise
-  - line noise
-  - drift
-  - feedback mode parameters
-- writes best candidate back to AFM Appearance controls
+  - tip radius / angle
+  - low-pass cutoff wavelength
+- writes best candidate back to AFM Tip Settings and low-pass controls
 
 ---
 
@@ -1305,7 +1319,7 @@ When OFF:
 4. Optionally define ROI around target molecule  
 5. Run `Get Simulated image`  
 6. Run `Estimate Pose` with selected precision  
-7. Run `Auto-fit Appearance`  
+7. Run `Auto-fit AFM Appearance`
 8. Confirm consistency between main XY and Sim Aligned  
 9. Save ASD/image outputs
 
@@ -1341,7 +1355,7 @@ When OFF:
 - `Help` menu has only `View Help...`
 - Real AFM and aligned preview are managed in a separate window
 - Estimate Pose optimizes Rotation XYZ with re-simulation
-- Auto-fit Appearance is applied to aligned preview as well
+- Auto-fit AFM Appearance is applied to aligned preview as well
 - Interactive Update default is ON
 - Rectangle lock default is ON and can auto-disable when needed
 """
@@ -2552,6 +2566,8 @@ class pyNuD_simulator(QMainWindow):
         self.real_afm_sim_info_label = None
         self._real_afm_pending_frame_index = None
         self._real_afm_frame_load_timer = None
+        self.pose_rotation_axes = {'X': True, 'Y': True, 'Z': True}
+        self.pose_axis_checks = {}
         self.afm_appearance_window = None
         self.afm_appearance_group = None
 
@@ -3764,7 +3780,7 @@ class pyNuD_simulator(QMainWindow):
         # Row 1: Radius (of cone part)
         tip_layout.addWidget(QLabel("Radius (nm):"), 1, 0)
         self.tip_radius_spin = QDoubleSpinBox()
-        self.tip_radius_spin.setRange(0.5, 30.0)
+        self.tip_radius_spin.setRange(0.1, 30.0)
         self.tip_radius_spin.setValue(0.5)
         self.tip_radius_spin.setSingleStep(0.1)
         self.tip_radius_spin.setDecimals(1)
@@ -3792,7 +3808,7 @@ class pyNuD_simulator(QMainWindow):
         self.tip_angle_label = QLabel("Angle (deg):")
         tip_layout.addWidget(self.tip_angle_label, 3, 0)
         self.tip_angle_spin = QDoubleSpinBox()
-        self.tip_angle_spin.setRange(5.0, 35.0)
+        self.tip_angle_spin.setRange(1.0, 35.0)
         self.tip_angle_spin.setValue(5)
         self.tip_angle_spin.setSingleStep(1.0)
         self.tip_angle_spin.valueChanged.connect(self.tip_angle_value_changed)
@@ -4577,10 +4593,13 @@ class pyNuD_simulator(QMainWindow):
     def on_load_real_asd(self):
         """Load Real AFM ASD via file dialog."""
         initial_dir = self.last_import_dir if hasattr(self, 'last_import_dir') and self.last_import_dir else ''
+        dialog_options = QFileDialog.Options()
+        if sys.platform != "darwin":
+            dialog_options |= QFileDialog.DontUseNativeDialog
         path, _ = QFileDialog.getOpenFileName(
             self, "Load Real AFM (ASD)", initial_dir,
             "ASD files (*.asd);;All Files (*)",
-            options=QFileDialog.DontUseNativeDialog
+            options=dialog_options
         )
         if not path:
             return
@@ -5123,10 +5142,11 @@ class pyNuD_simulator(QMainWindow):
                 except Exception:
                     pass
 
-    def _run_xy_simulation_blocking(self, coords, scan_x_nm, scan_y_nm, nx, ny):
+    def _run_xy_simulation_blocking(self, coords, scan_x_nm, scan_y_nm, nx, ny, tip_params=None):
         """Run one XY AFM simulation synchronously and return raw height map."""
         if coords is None:
             return None
+        tip_params = tip_params or {}
 
         panel = getattr(self, 'afm_x_frame', None) or getattr(self, 'real_afm_window_aligned_frame', None)
         if panel is None:
@@ -5140,10 +5160,10 @@ class pyNuD_simulator(QMainWindow):
             'ny': int(ny),
             'center_x': self.tip_x_slider.value() / 5.0,
             'center_y': self.tip_y_slider.value() / 5.0,
-            'tip_radius': self.tip_radius_spin.value(),
-            'minitip_radius': self.minitip_radius_spin.value(),
-            'tip_angle': self.tip_angle_spin.value(),
-            'tip_shape': self.tip_shape_combo.currentText().lower(),
+            'tip_radius': float(tip_params.get('tip_radius', self.tip_radius_spin.value())),
+            'minitip_radius': float(tip_params.get('minitip_radius', self.minitip_radius_spin.value())),
+            'tip_angle': float(tip_params.get('tip_angle', self.tip_angle_spin.value())),
+            'tip_shape': str(tip_params.get('tip_shape', self.tip_shape_combo.currentText().lower())).lower(),
             'use_vdw': self.use_vdw_check.isChecked(),
         }
         sim_params['scan_size'] = sim_params['scan_x_nm']
@@ -5323,6 +5343,13 @@ class pyNuD_simulator(QMainWindow):
             QMessageBox.warning(self, "Pose", "Rotation controls are unavailable.")
             return
 
+        allowed_axes = self._get_pose_rotation_axes()
+        refine_axes = [axis for axis in ('X', 'Y', 'Z') if allowed_axes.get(axis, True)]
+        if not refine_axes:
+            QMessageBox.warning(self, "Pose", "Select at least one rotation axis for Estimate Pose.")
+            return
+        axes_text = ", ".join(refine_axes)
+
         real_p = self.preprocess_pose_image(self.real_afm_nm)
         if real_p is None:
             QMessageBox.warning(self, "Pose", "Real AFM image is invalid for pose estimation.")
@@ -5371,11 +5398,14 @@ class pyNuD_simulator(QMainWindow):
         eval_count = 0
         best = {'rx': orig_rx, 'ry': orig_ry, 'rz': orig_rz, 'score': -1e9, 'dx': 0.0, 'dy': 0.0}
         cancel_requested = False
-        z_coarse = np.arange(-180.0, 180.0 + 1e-9, float(cfg["z_step"]))
+        if allowed_axes.get('Z', True):
+            z_coarse = np.arange(-180.0, 180.0 + 1e-9, float(cfg["z_step"]))
+        else:
+            z_coarse = np.array([orig_rz], dtype=float)
         max_eval_est = max(
             1,
             len(cfg["seed_offsets"]) * len(z_coarse)
-            + len(cfg["refine_steps"]) * int(cfg["max_refine_iter"]) * 6
+            + len(cfg["refine_steps"]) * int(cfg["max_refine_iter"]) * 2 * len(refine_axes)
             + 2,
         )
         progress = QProgressDialog("Estimating pose...", "Cancel", 0, int(max_eval_est), self)
@@ -5426,6 +5456,7 @@ class pyNuD_simulator(QMainWindow):
                 progress.setValue(min(eval_count, int(max_eval_est)))
                 progress.setLabelText(
                     f"Estimating pose ({selected_level})...\n"
+                    f"Rotation axes: {axes_text}\n"
                     f"Evaluations: {eval_count}\n"
                     f"Best score: {best['score']:.4f}"
                 )
@@ -5438,8 +5469,8 @@ class pyNuD_simulator(QMainWindow):
             for off_x, off_y in cfg["seed_offsets"]:
                 if cancel_requested:
                     break
-                sx = self.normalize_angle(orig_rx + off_x)
-                sy = self.normalize_angle(orig_ry + off_y)
+                sx = self.normalize_angle(orig_rx + off_x) if allowed_axes.get('X', True) else orig_rx
+                sy = self.normalize_angle(orig_ry + off_y) if allowed_axes.get('Y', True) else orig_ry
                 for zc in z_coarse:
                     if cancel_requested:
                         break
@@ -5457,14 +5488,22 @@ class pyNuD_simulator(QMainWindow):
                     if cancel_requested:
                         break
                     center = best
-                    candidates = [
-                        (center['rx'] + step, center['ry'], center['rz']),
-                        (center['rx'] - step, center['ry'], center['rz']),
-                        (center['rx'], center['ry'] + step, center['rz']),
-                        (center['rx'], center['ry'] - step, center['rz']),
-                        (center['rx'], center['ry'], center['rz'] + step),
-                        (center['rx'], center['ry'], center['rz'] - step),
-                    ]
+                    candidates = []
+                    if allowed_axes.get('X', True):
+                        candidates.extend([
+                            (center['rx'] + step, center['ry'], center['rz']),
+                            (center['rx'] - step, center['ry'], center['rz']),
+                        ])
+                    if allowed_axes.get('Y', True):
+                        candidates.extend([
+                            (center['rx'], center['ry'] + step, center['rz']),
+                            (center['rx'], center['ry'] - step, center['rz']),
+                        ])
+                    if allowed_axes.get('Z', True):
+                        candidates.extend([
+                            (center['rx'], center['ry'], center['rz'] + step),
+                            (center['rx'], center['ry'], center['rz'] - step),
+                        ])
                     improved = False
                     for crx, cry, crz in candidates:
                         if cancel_requested:
@@ -5514,6 +5553,7 @@ class pyNuD_simulator(QMainWindow):
                 'rot_x_deg': float(best['rx']),
                 'rot_y_deg': float(best['ry']),
                 'rot_z_deg': float(best['rz']),
+                'rotation_axes': dict(allowed_axes),
             }
 
             QMessageBox.information(
@@ -5525,6 +5565,7 @@ class pyNuD_simulator(QMainWindow):
                 f"Residual Dy: {final_dy:.2f} px\n"
                 f"Score: {final_score:.4f}\n"
                 f"Evaluations: {eval_count}\n"
+                f"Rotation axes: {axes_text}\n"
                 f"Precision: {selected_level}"
             )
         finally:
@@ -5546,6 +5587,30 @@ class pyNuD_simulator(QMainWindow):
         )
         if result is None:
             return
+
+    def _set_pose_rotation_axis(self, axis, checked):
+        """Store which Rotation XYZ axes Estimate Pose is allowed to change."""
+        if not hasattr(self, 'pose_rotation_axes') or not isinstance(self.pose_rotation_axes, dict):
+            self.pose_rotation_axes = {'X': True, 'Y': True, 'Z': True}
+        axis_key = str(axis).upper()
+        if axis_key in ('X', 'Y', 'Z'):
+            self.pose_rotation_axes[axis_key] = bool(checked)
+
+    def _get_pose_rotation_axes(self):
+        """Return allowed Estimate Pose axes from the Real AFM window checkboxes."""
+        axes = dict(getattr(self, 'pose_rotation_axes', {'X': True, 'Y': True, 'Z': True}) or {})
+        for axis in ('X', 'Y', 'Z'):
+            axes.setdefault(axis, True)
+        checks = getattr(self, 'pose_axis_checks', {}) or {}
+        for axis, check in checks.items():
+            try:
+                axis_key = str(axis).upper()
+                if axis_key in ('X', 'Y', 'Z'):
+                    axes[axis_key] = bool(check.isChecked())
+            except Exception:
+                pass
+        self.pose_rotation_axes = {axis: bool(axes.get(axis, True)) for axis in ('X', 'Y', 'Z')}
+        return dict(self.pose_rotation_axes)
 
     def _clear_afm_panel(self, target_panel):
         """Show placeholder and clear the image view for a panel created by create_afm_image_panel()."""
@@ -5601,10 +5666,23 @@ class pyNuD_simulator(QMainWindow):
         btn_get_sim = QPushButton("Get Simulated image")
         btn_get_sim.clicked.connect(self.get_simulated_image_for_real_afm)
         row.addWidget(btn_get_sim)
+        pose_axis_label = QLabel("Pose axes:")
+        pose_axis_label.setToolTip("Select structure rotation axes used by Estimate Pose.")
+        row.addWidget(pose_axis_label)
+        self.pose_axis_checks = {}
+        axes_state = getattr(self, 'pose_rotation_axes', {'X': True, 'Y': True, 'Z': True})
+        for axis in ("X", "Y", "Z"):
+            axis_check = QCheckBox(axis)
+            axis_check.setChecked(bool(axes_state.get(axis, True)))
+            axis_check.setToolTip(f"Allow Estimate Pose to rotate the structure around the {axis} axis.")
+            axis_check.toggled.connect(lambda checked, ax=axis: self._set_pose_rotation_axis(ax, checked))
+            self.pose_axis_checks[axis] = axis_check
+            row.addWidget(axis_check)
         btn_pose = QPushButton("🧭 Estimate Pose")
         btn_pose.clicked.connect(self.estimate_pose_from_real)
         row.addWidget(btn_pose)
-        btn_auto_fit = QPushButton("Auto-fit Appearance")
+        btn_auto_fit = QPushButton("Auto-fit AFM Appearance")
+        btn_auto_fit.setToolTip("Fit probe radius/angle and low-pass cutoff. Noise/artifacts are not changed.")
         btn_auto_fit.clicked.connect(self.auto_fit_appearance)
         row.addWidget(btn_auto_fit)
         outer.addLayout(row)
@@ -5713,6 +5791,7 @@ class pyNuD_simulator(QMainWindow):
             self.real_afm_window_real_frame = None
             self.real_afm_window_aligned_frame = None
             self.real_afm_sim_info_label = None
+            self.pose_axis_checks = {}
 
         try:
             win.destroyed.connect(_on_destroyed)
@@ -5748,7 +5827,7 @@ class pyNuD_simulator(QMainWindow):
             win.activateWindow()
 
     def apply_noise_artifacts_with_params(self, height_nm, pixel_x_nm, pixel_y_nm, params):
-        """Apply noise/artifacts using explicit parameters (for auto-fit)."""
+        """Apply noise/artifacts using explicit parameters without changing UI controls."""
         height = np.array(height_nm, dtype=float, copy=True)
         rng = np.random.default_rng(params.get('seed', 0))
 
@@ -5774,6 +5853,10 @@ class pyNuD_simulator(QMainWindow):
                 shifted[y] = line
             height = shifted
 
+        feedback_mode = str(params.get('feedback_mode', 'none'))
+        if feedback_mode not in ("linear_lag", "tapping_parachute"):
+            return height
+
         scan_dir = str(params.get('scan_direction', 'L2R'))
         reverse = (scan_dir == "R2L" or scan_dir == "Right -> Left")
 
@@ -5788,7 +5871,7 @@ class pyNuD_simulator(QMainWindow):
                 out = out[::-1]
             return out
 
-        if params.get('feedback_mode') == "tapping_parachute":
+        if feedback_mode == "tapping_parachute":
             drop_th = params.get('tap_drop_threshold_nm', 1.0)
             tau_track = params.get('tap_tau_track_lines', 2.0)
             tau_para = params.get('tap_tau_parachute_lines', 15.0)
@@ -5815,7 +5898,7 @@ class pyNuD_simulator(QMainWindow):
 
             for y in range(height.shape[0]):
                 height[y] = apply_tapping(height[y], reverse=reverse)
-        else:
+        elif feedback_mode == "linear_lag":
             tau = float(params.get('lag_tau_lines', 2.0))
             alpha = math.exp(-1.0 / max(tau, 1e-6))
             for y in range(height.shape[0]):
@@ -5824,95 +5907,233 @@ class pyNuD_simulator(QMainWindow):
         return height
 
     def auto_fit_appearance(self):
-        """Auto-fit AFM appearance parameters to Real AFM (coarse grid)."""
+        """Auto-fit probe radius/angle and low-pass cutoff to the Real AFM appearance."""
         if self.real_afm_nm is None:
             QMessageBox.information(self, "Auto-fit", "Real AFM is not loaded.")
             return
-        sim_clean = self._get_simulated_xy_image(use_processed=False)
-        if sim_clean is None:
-            QMessageBox.information(self, "Auto-fit", "Simulated AFM not available.")
+        if self.atoms_data is None:
+            QMessageBox.warning(self, "Auto-fit", "PDB is not loaded.")
             return
 
-        # Apply pose if available for comparison
+        if self.is_worker_running(getattr(self, 'sim_worker', None), attr_name='sim_worker') or \
+           self.is_worker_running(getattr(self, 'sim_worker_high_res', None), attr_name='sim_worker_high_res'):
+            QMessageBox.information(self, "Auto-fit", "Another simulation is running. Please wait.")
+            return
+        if self.is_worker_running(getattr(self, 'sim_worker_silent', None), attr_name='sim_worker_silent'):
+            self.stop_worker(self.sim_worker_silent, timeout_ms=300, allow_terminate=True, worker_name="sim_worker_silent")
+            if self.is_worker_running(getattr(self, 'sim_worker_silent', None), attr_name='sim_worker_silent'):
+                QMessageBox.information(self, "Auto-fit", "Another simulation is running. Please wait.")
+                return
+
+        meta = self._get_real_afm_simulation_meta()
+        if meta is None:
+            QMessageBox.warning(self, "Auto-fit", "Real AFM metadata is incomplete.")
+            return
+        scan_x, scan_y, nx, ny = meta
+        self._apply_real_afm_scan_to_controls(scan_x, scan_y, nx, ny)
+
+        coords = self.get_rotated_atom_coords()
+        if coords is None:
+            QMessageBox.warning(self, "Auto-fit", "Failed to get rotated PDB coordinates.")
+            return
+
         pose = getattr(self, 'pose', None) or {'theta_deg': 0.0, 'dx_px': 0.0, 'dy_px': 0.0}
-        
-        scan_x = self.spinScanXNm.value()
-        scan_y = self.spinScanYNm.value()
-        ny, nx = sim_clean.shape
-        pixel_x_nm = scan_x / nx
-        pixel_y_nm = scan_y / ny
 
-        best = {'score': -1e9, 'params': None}
-        fixed_scan_direction = "L2R"
+        def _unique_candidates(values, min_value, max_value, decimals=2):
+            unique = []
+            for value in values:
+                try:
+                    v = float(value)
+                except Exception:
+                    continue
+                if not np.isfinite(v):
+                    continue
+                v = max(float(min_value), min(float(max_value), v))
+                key = round(v, int(decimals))
+                if not any(abs(key - old) < 10 ** (-int(decimals)) for old in unique):
+                    unique.append(key)
+            return unique
 
-        # Keep Low-pass filter settings fixed to current UI state (do not auto-fit cutoff).
-        if self.apply_filter_check.isChecked():
-            base = apply_low_pass_filter(sim_clean, scan_x, scan_y, self.filter_cutoff_spin.value())
+        current_radius = float(self.tip_radius_spin.value())
+        current_minitip = float(self.minitip_radius_spin.value())
+        current_angle = float(self.tip_angle_spin.value())
+        current_cutoff = float(self.filter_cutoff_spin.value())
+        tip_shape = self.tip_shape_combo.currentText().lower()
+
+        radius_values = _unique_candidates(
+            [0.1, 0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 30.0, current_radius * 0.7, current_radius, current_radius * 1.4],
+            self.tip_radius_spin.minimum(),
+            self.tip_radius_spin.maximum(),
+            decimals=2,
+        )
+        if tip_shape in ("cone", "sphere"):
+            angle_values = _unique_candidates(
+                [1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, current_angle - 5.0, current_angle, current_angle + 5.0],
+                self.tip_angle_spin.minimum(),
+                self.tip_angle_spin.maximum(),
+                decimals=2,
+            )
         else:
-            base = sim_clean
+            angle_values = [round(current_angle, 2)]
+        cutoff_values = _unique_candidates(
+            [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 10.0, 16.0, 20.0, current_cutoff],
+            self.filter_cutoff_spin.minimum(),
+            self.filter_cutoff_spin.maximum(),
+            decimals=2,
+        )
 
-        height_sigma = [0.0, 0.05, 0.1, 0.2]
-        line_sigma = [0.0, 0.05, 0.1]
-        drift_vx = [0.0, 0.05, 0.1]
-        tap_drop = [0.0, 0.6, 1.0]
-        tap_tau_para = [5.0, 10.0, 20.0]
+        total_probe = len(radius_values) * len(angle_values) * len(cutoff_values)
+        total_steps = max(1, total_probe + 1)
+        progress = QProgressDialog("Auto-fitting AFM appearance...", "Cancel", 0, total_steps, self)
+        progress.setWindowTitle("Auto-fit AFM Appearance")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
 
-        for hs in height_sigma:
-            for ls in line_sigma:
-                for dvx in drift_vx:
-                    for td in tap_drop:
-                        for tp in tap_tau_para:
-                            params = {
-                                'seed': 0,
-                                'height_sigma_nm': hs,
-                                'line_sigma_nm': ls,
-                                'drift_vx_nm_per_line': dvx,
-                                'feedback_mode': "tapping_parachute" if td > 0 else "linear_lag",
-                                'scan_direction': fixed_scan_direction,
-                                'lag_tau_lines': float(self.spinLagTauLines.value()) if hasattr(self, 'spinLagTauLines') else 2.0,
-                                'tap_drop_threshold_nm': max(td, 0.3),
-                                'tap_tau_track_lines': 2.0,
-                                'tap_tau_parachute_lines': tp,
-                                'tap_release_threshold_nm': 0.3,
-                            }
-                            sim_candidate = self.apply_noise_artifacts_with_params(base, pixel_x_nm, pixel_y_nm, params)
-                            sim_candidate = self.apply_pose_to_image(sim_candidate, pose)
-                            score = self.score_zncc(self.real_afm_nm, sim_candidate)
-                            if score > best['score']:
-                                best = {'score': score, 'params': params}
+        best_probe = {'score': -1e9, 'params': None, 'base': None}
+        step = 0
 
-        if best['params'] is None:
-            QMessageBox.information(self, "Auto-fit", "No valid candidates.")
-            return
-
-        params = best['params']
-
-        self.chkNoiseEnable.setChecked(True)
-        self.chkHeightNoise.setChecked(params['height_sigma_nm'] > 0)
-        self.spinHeightNoiseSigmaNm.setValue(float(params['height_sigma_nm']))
-        self.chkLineNoise.setChecked(params['line_sigma_nm'] > 0)
-        self.spinLineNoiseSigmaNm.setValue(float(params['line_sigma_nm']))
-        self.chkDrift.setChecked(params['drift_vx_nm_per_line'] > 0)
-        self.spinDriftVxNmPerLine.setValue(float(params['drift_vx_nm_per_line']))
-
-        if params['feedback_mode'] == "tapping_parachute":
-            self.chkFeedbackLag.setChecked(True)
-            self.comboFeedbackMode.setCurrentText("tapping_parachute")
-            self.spinTapDropThresholdNm.setValue(float(params['tap_drop_threshold_nm']))
-            self.spinTapTauParachuteLines.setValue(float(params['tap_tau_parachute_lines']))
-        else:
-            self.chkFeedbackLag.setChecked(False)
-        if hasattr(self, 'comboScanDirection'):
-            idx = self.comboScanDirection.findData(fixed_scan_direction)
-            if idx >= 0:
-                self.comboScanDirection.setCurrentIndex(idx)
-
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            self._update_noise_ui_states()
-        except Exception:
-            pass
+            for radius in radius_values:
+                for angle in angle_values:
+                    tip_params = {
+                        'tip_shape': tip_shape,
+                        'tip_radius': radius,
+                        'minitip_radius': current_minitip,
+                        'tip_angle': angle,
+                    }
+                    raw_xy = self._run_xy_simulation_blocking(coords, scan_x, scan_y, nx, ny, tip_params=tip_params)
+                    if raw_xy is None:
+                        step += len(cutoff_values)
+                        progress.setValue(step)
+                        QApplication.processEvents()
+                        continue
 
-        self.process_and_display_all_images()
+                    for cutoff in cutoff_values:
+                        if progress.wasCanceled():
+                            return
+                        base = apply_low_pass_filter(raw_xy, scan_x, scan_y, cutoff)
+                        lowpass_enabled = True
+                        cutoff_nm = float(cutoff)
+
+                        sim_candidate = self.apply_pose_to_image(base, pose)
+                        score = self.score_zncc(self.real_afm_nm, sim_candidate)
+                        if score > best_probe['score']:
+                            best_probe = {
+                                'score': float(score),
+                                'params': {
+                                    'tip_shape': tip_shape,
+                                    'tip_radius': float(radius),
+                                    'minitip_radius': current_minitip,
+                                    'tip_angle': float(angle),
+                                    'lowpass_enabled': bool(lowpass_enabled),
+                                    'lowpass_cutoff_nm': float(cutoff_nm),
+                                },
+                                'base': np.array(base, dtype=float, copy=True),
+                            }
+
+                        step += 1
+                        if best_probe['params'] is not None:
+                            best_stage1_text = (
+                                f"Best: R={best_probe['params']['tip_radius']:.2f} nm, "
+                                f"Angle={best_probe['params']['tip_angle']:.2f} deg, "
+                                f"Cutoff={best_probe['params']['lowpass_cutoff_nm']:.2f} nm, "
+                                f"score={best_probe['score']:.4f}"
+                            )
+                        else:
+                            best_stage1_text = "Best: n/a"
+                        progress.setLabelText(
+                            "Fitting probe radius/angle and low-pass cutoff\n"
+                            f"Now: R={radius:.2f} nm, Angle={angle:.2f} deg, Cutoff={cutoff_nm:.2f} nm\n"
+                            f"{best_stage1_text}"
+                        )
+                        progress.setValue(step)
+                        QApplication.processEvents()
+
+            if progress.wasCanceled():
+                return
+            if best_probe['params'] is None or best_probe['base'] is None:
+                QMessageBox.information(self, "Auto-fit", "No valid probe/low-pass candidates.")
+                return
+
+            probe_params = best_probe['params']
+            widgets_to_block = [
+                self.tip_radius_spin,
+                self.minitip_radius_spin,
+                self.tip_angle_spin,
+                self.apply_filter_check,
+                self.filter_cutoff_spin,
+            ]
+
+            for widget in widgets_to_block:
+                try:
+                    widget.blockSignals(True)
+                except Exception:
+                    pass
+            try:
+                self.tip_radius_spin.setValue(float(probe_params['tip_radius']))
+                self.minitip_radius_spin.setValue(float(probe_params['minitip_radius']))
+                if tip_shape in ("cone", "sphere"):
+                    self.tip_angle_spin.setValue(float(probe_params['tip_angle']))
+                self.apply_filter_check.setChecked(True)
+                self.filter_cutoff_spin.setValue(float(probe_params['lowpass_cutoff_nm']))
+            finally:
+                for widget in widgets_to_block:
+                    try:
+                        widget.blockSignals(False)
+                    except Exception:
+                        pass
+
+            self.filter_cutoff_spin.setEnabled(self.apply_filter_check.isChecked())
+            self.create_tip()
+            self.update_tip_info()
+            self.afm_params.update({
+                'tip_radius': self.tip_radius_spin.value(),
+                'tip_shape': self.tip_shape_combo.currentText().lower(),
+                'tip_angle': self.tip_angle_spin.value(),
+            })
+
+            final_pack = self._simulate_xy_for_real_afm(
+                update_panels=True,
+                store_results=True,
+                check_busy=False,
+                show_messages=False,
+            )
+            progress.setValue(total_steps)
+
+            if final_pack is None:
+                QMessageBox.warning(self, "Auto-fit", "Auto-fit parameters were applied, but final simulation failed.")
+                return
+
+            lowpass_text = f"{probe_params['lowpass_cutoff_nm']:.2f} nm"
+            result_message = (
+                "Applied best AFM appearance parameters:\n"
+                f"Radius: {probe_params['tip_radius']:.2f} nm\n"
+                f"Angle: {probe_params['tip_angle']:.2f} deg"
+                f"{' (Cone/Sphere only)' if tip_shape not in ('cone', 'sphere') else ''}\n"
+                f"Low-pass: ON, Cutoff Wavelength: {lowpass_text}\n"
+                f"Score: {best_probe['score']:.4f}\n"
+                "Noise/artifact controls were not changed."
+            )
+            if hasattr(self, 'status_label'):
+                self.status_label.setText(
+                    "Auto-fit AFM Appearance: "
+                    f"R={probe_params['tip_radius']:.2f} nm, "
+                    f"Angle={probe_params['tip_angle']:.2f} deg, "
+                    f"Low-pass={lowpass_text}, "
+                    f"Score={best_probe['score']:.4f}"
+                )
+        finally:
+            try:
+                progress.close()
+            except Exception:
+                pass
+            try:
+                QApplication.restoreOverrideCursor()
+            except Exception:
+                pass
+        if 'result_message' in locals() and result_message:
+            QMessageBox.information(self, "Auto-fit AFM Appearance", result_message)
 
     # 既存の create_vtk_panel メソッドを、以下の完全なコードで置き換えてください。
 
@@ -9030,10 +9251,13 @@ Check console for detailed information."""
     def import_file(self):
         """統合ファイルインポート（PDB/CIF/MRC）"""
         initial_dir = self.last_import_dir if hasattr(self, 'last_import_dir') and self.last_import_dir else ""
+        dialog_options = QFileDialog.Options()
+        if sys.platform != "darwin":
+            dialog_options |= QFileDialog.DontUseNativeDialog
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Select Structure File", initial_dir,
             "Structure Files (*.pdb *.cif *.mmcif *.mrc);;PDB files (*.pdb);;mmCIF files (*.cif *.mmcif);;MRC Files (*.mrc);;All Files (*)",
-            options=QFileDialog.DontUseNativeDialog)
+            options=dialog_options)
         
         if not file_path:
             return
@@ -12604,6 +12828,8 @@ Check console for detailed information."""
                 pass
         if rot:
             params['rotation'] = rot
+        if hasattr(self, 'pose_rotation_axes') or hasattr(self, 'pose_axis_checks'):
+            params['pose_rotation_axes'] = self._get_pose_rotation_axes()
 
         # Find initial plane params
         fip = {}
@@ -12891,6 +13117,18 @@ Check console for detailed information."""
                 self.rotation_widgets['Y']['slider'].blockSignals(False)
                 self.rotation_widgets['Z']['slider'].blockSignals(False)
 
+        pose_axes = params.get('pose_rotation_axes', {})
+        if isinstance(pose_axes, dict):
+            for axis in ('X', 'Y', 'Z'):
+                if axis in pose_axes:
+                    self._set_pose_rotation_axis(axis, bool(pose_axes[axis]))
+                    try:
+                        checks = getattr(self, 'pose_axis_checks', {}) or {}
+                        if axis in checks:
+                            checks[axis].setChecked(bool(pose_axes[axis]))
+                    except Exception:
+                        pass
+
         # Find initial plane
         fip = params.get('find_initial_plane', {})
         if fip and hasattr(self, 'find_plane_params'):
@@ -13047,6 +13285,7 @@ Check console for detailed information."""
                 'dx_px': float(self.pose.get('dx_px', 0.0)) if isinstance(self.pose, dict) else 0.0,
                 'dy_px': float(self.pose.get('dy_px', 0.0)) if isinstance(self.pose, dict) else 0.0,
                 'mirror_mode': str(self.pose.get('mirror_mode', 'none')) if isinstance(self.pose, dict) else 'none',
+                'rotation_axes': self._get_pose_rotation_axes(),
             },
         }
         with open(json_path, 'w') as f:
@@ -13098,10 +13337,13 @@ Check console for detailed information."""
                 if not loaded:
                     # prompt user
                     initial_dir = os.path.dirname(json_path)
+                    dialog_options = QFileDialog.Options()
+                    if sys.platform != "darwin":
+                        dialog_options |= QFileDialog.DontUseNativeDialog
                     file_path, _ = QFileDialog.getOpenFileName(
                         self, 'Select Structure File', initial_dir,
                         'Structure Files (*.pdb *.cif *.mmcif);;All Files (*)',
-                        options=QFileDialog.DontUseNativeDialog
+                        options=dialog_options
                     )
                     if file_path:
                         loaded = self._load_structure_file(file_path)
@@ -13123,6 +13365,11 @@ Check console for detailed information."""
                     'mirror_mode': str(pose_doc.get('mirror_mode', 'none')),
                     'score': None,
                 }
+                pose_axes = pose_doc.get('rotation_axes', None)
+                if isinstance(pose_axes, dict):
+                    for axis in ('X', 'Y', 'Z'):
+                        if axis in pose_axes:
+                            self._set_pose_rotation_axis(axis, bool(pose_axes[axis]))
             except Exception:
                 pass
 
@@ -13135,10 +13382,13 @@ Check console for detailed information."""
         default_id = self.get_active_dataset_id() if hasattr(self, 'get_active_dataset_id') else 'session'
         default_name = f"{default_id}.json"
         default_path = os.path.join(initial_dir, default_name) if initial_dir else default_name
+        dialog_options = QFileDialog.Options()
+        if sys.platform != "darwin":
+            dialog_options |= QFileDialog.DontUseNativeDialog
         save_path, _ = QFileDialog.getSaveFileName(
             self, 'Save Params as JSON', default_path,
             'JSON files (*.json);;All Files (*)',
-            options=QFileDialog.DontUseNativeDialog
+            options=dialog_options
         )
         if not save_path:
             return
@@ -13151,10 +13401,13 @@ Check console for detailed information."""
     def handle_load_params_json(self):
         """Load params from JSON via dialog."""
         initial_dir = self.last_import_dir if hasattr(self, 'last_import_dir') and self.last_import_dir else ''
+        dialog_options = QFileDialog.Options()
+        if sys.platform != "darwin":
+            dialog_options |= QFileDialog.DontUseNativeDialog
         load_path, _ = QFileDialog.getOpenFileName(
             self, 'Load Params from JSON', initial_dir,
             'JSON files (*.json);;All Files (*)',
-            options=QFileDialog.DontUseNativeDialog
+            options=dialog_options
         )
         if not load_path:
             return
@@ -13259,10 +13512,13 @@ Check console for detailed information."""
         
         # ファイル名と安全なディレクトリを結合して、最終的なデフォルトパスを作成
         default_save_path = os.path.join(directory, default_filename)
+        dialog_options = QFileDialog.Options()
+        if sys.platform != "darwin":
+            dialog_options |= QFileDialog.DontUseNativeDialog
 
         save_path, _ = QFileDialog.getSaveFileName(
             self, "Save Simulation as ASD", default_save_path, "ASD files (*.asd)",
-            options=QFileDialog.DontUseNativeDialog
+            options=dialog_options
         )
 
         if not save_path:
@@ -13462,9 +13718,12 @@ Check console for detailed information."""
         
         # ユーザーにファイル名と保存形式を選択させる
         filters = "PNG Image (*.png);;TIFF Image (*.tif)"
+        dialog_options = QFileDialog.Options()
+        if sys.platform != "darwin":
+            dialog_options |= QFileDialog.DontUseNativeDialog
         save_path, selected_filter = QFileDialog.getSaveFileName(
             self, "Save 3D View As...", default_save_path, filters,
-            options=QFileDialog.DontUseNativeDialog
+            options=dialog_options
         )
 
         if not save_path:
