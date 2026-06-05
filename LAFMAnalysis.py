@@ -41,6 +41,7 @@ HELP_HTML_EN = """
 
 <h2>Overview</h2>
 <p>Localization Atomic Force Microscopy (L-AFM) analysis is a technique to construct a "super-resolution image" that surpasses the resolution of the original image. It works by detecting the precise locations of numerous individual molecules' or structures' brightness peaks over time from an AFM time-series image (movie) and reconstructing them onto a high-resolution grid. This panel allows you to perform the series of processes from peak detection to image reconstruction step-by-step.</p>
+<p><strong>Algorithm basis:</strong> This plugin uses an L-AFM-style peak-localization and reconstruction workflow based on the Localization atomic force microscopy algorithm reported by Heath, Scheuring, and colleagues (<i>Nature</i> 594, 385–390, 2021; DOI: 10.1038/s41586-021-03551-x).</p>
 
 <h2>Access</h2>
 <ul>
@@ -223,6 +224,7 @@ HELP_HTML_JA = """
 
 <h2>概要</h2>
 <p>L-AFM (Localization Atomic Force Microscopy) 解析は、AFMの時系列画像（動画）から個々の分子や構造物の輝度ピークを高精度に検出し、その位置情報を多数集めて再構成することで、元の画像の解像度を超える「超解像画像」を構築する技術です。このパネルでは、ピーク検出から画像再構成までの一連の処理を、ステップ・バイ・ステップで実行できます。</p>
+<p><strong>アルゴリズムの出典:</strong> 本プラグインは、Heath、Scheuringらが報告したLocalization atomic force microscopy (L-AFM) アルゴリズム（<i>Nature</i> 594, 385–390, 2021; DOI: 10.1038/s41586-021-03551-x）に基づくピークローカリゼーション・再構成処理を利用しています。</p>
 
 <h2>アクセス方法</h2>
 <ul>

@@ -30,7 +30,7 @@ These URLs always point to the latest GitHub Release assets.
 ### L-AFM Analysis
 
 - [LAFMAnalysis.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/LAFMAnalysis.py)  
-  Localizes intensity peaks in time-series AFM data and reconstructs super-resolution images.
+  Localizes intensity peaks in time-series AFM data and reconstructs super-resolution images using an L-AFM-style workflow based on the algorithm reported by Heath, Scheuring, and colleagues (Nature 594, 385-390, 2021; DOI: 10.1038/s41586-021-03551-x).
 
 ### Particle / Peak Analysis
 
