@@ -521,9 +521,12 @@ class NMA_Window(QMainWindow):
 
     def import_pdb_file(self):
         initial_dir = self.last_import_dir if self.last_import_dir else ""
+        dialog_options = QFileDialog.Options()
+        if sys.platform != "darwin":
+            dialog_options |= QFileDialog.DontUseNativeDialog
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Select PDB File", initial_dir, "PDB files (*.pdb);;All files (*)",
-            options=QFileDialog.DontUseNativeDialog)
+            options=dialog_options)
         if file_path:
             self.last_import_dir = os.path.dirname(file_path)
             self.current_pdb_path = file_path
@@ -1038,10 +1041,13 @@ class NMA_Window(QMainWindow):
             suggested_name = f"{base_name}_{amplitude_str}_mode{mode_num}.pdb"
             
             # ファイル保存ダイアログ
+            dialog_options = QFileDialog.Options()
+            if sys.platform != "darwin":
+                dialog_options |= QFileDialog.DontUseNativeDialog
             file_path, _ = QFileDialog.getSaveFileName(
                 self, "Save Deformed Structure", suggested_name, 
                 "PDB files (*.pdb);;All files (*)",
-                options=QFileDialog.DontUseNativeDialog)
+                options=dialog_options)
             
             if file_path:
                 # PDBファイルを書き込み
