@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy import ndimage
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, linear_sum_assignment
 from skimage import feature, filters, morphology, segmentation, measure
 from PyQt5 import QtCore, QtWidgets, QtGui
 import matplotlib.pyplot as plt
@@ -56,6 +56,7 @@ class ModelSelectionResult:
     aic: float
     bic: float
     residual_std: float
+    fit_applied: bool
     init_peaks: List[PeakStat]
     peaks: List[PeakStat]
 
@@ -120,6 +121,7 @@ class SpotAnalysis:
         snap_radius: int = 2,
         snap_refit_enabled: bool = False,
         refit_max_shift_px: int = 3,
+        fit_enabled: bool = True,
         sigma_bounds: Tuple[float, float] = (0.1, 4.0),
         initial_sigma: float = 0.2,
         snr_threshold: float = 1.0,
@@ -163,6 +165,7 @@ class SpotAnalysis:
         self.snap_radius = max(0, int(snap_radius))
         self.snap_refit_enabled = bool(snap_refit_enabled)
         self.refit_max_shift_px = max(0, int(refit_max_shift_px))
+        self.fit_enabled = bool(fit_enabled)
         self.sigma_bounds = (max(1e-3, sigma_bounds[0]), max(sigma_bounds[0] + 1e-3, sigma_bounds[1]))
         self.initial_sigma = float(initial_sigma)
         self.snr_threshold = float(snr_threshold)
@@ -689,8 +692,11 @@ class SpotAnalysis:
             k = id(pk)
             ent = rejected_map.get(k)
             if ent is None:
-                ent = {"peak": pk, "reasons": []}
+                idx = getattr(pk, "_prefilter_index", None)
+                ent = {"peak": pk, "reasons": [], "prefilter_index": idx}
                 rejected_map[k] = ent
+            elif ent.get("prefilter_index") is None:
+                ent["prefilter_index"] = getattr(pk, "_prefilter_index", None)
             ent["reasons"].append(reason)
 
         try:
@@ -740,6 +746,108 @@ class SpotAnalysis:
             return kept_in_original, list(rejected_map.values())
         return kept_in_original
 
+    def _ensure_min_peak_count(
+        self,
+        kept_peaks: List[PeakStat],
+        original_peaks: List[PeakStat],
+        min_keep: int,
+        rejected_infos: Optional[List[Dict[str, Any]]] = None,
+    ) -> Any:
+        """
+        Guarantee that at least ``min_keep`` peaks remain in the final output.
+
+        If post-filters reduce the count below the requested minimum, restore
+        peaks from the selected model's original peak list in descending
+        priority (higher S/N, then higher amplitude). Restored peaks are
+        inserted back in the original model order.
+        """
+        try:
+            target = int(min_keep)
+        except Exception:
+            target = 0
+        target = max(0, int(target))
+
+        kept = list(kept_peaks or [])
+        original = list(original_peaks or [])
+        if target <= 0 or len(kept) >= target or not original:
+            if rejected_infos is None:
+                return kept
+            return kept, list(rejected_infos)
+
+        kept_ids = {id(pk) for pk in kept}
+        candidates = [pk for pk in original if id(pk) not in kept_ids]
+        candidates.sort(
+            key=lambda p: (float(getattr(p, "snr", 0.0)), float(getattr(p, "amplitude", 0.0))),
+            reverse=True,
+        )
+
+        needed = max(0, int(target - len(kept)))
+        restored = candidates[:needed]
+        if not restored:
+            if rejected_infos is None:
+                return kept
+            return kept, list(rejected_infos)
+
+        restored_ids = {id(pk) for pk in restored}
+        merged_ids = kept_ids | restored_ids
+        merged = [pk for pk in original if id(pk) in merged_ids]
+
+        if rejected_infos is None:
+            return merged
+
+        kept_rejections: List[Dict[str, Any]] = []
+        for ent in list(rejected_infos):
+            try:
+                pk = ent.get("peak")
+            except Exception:
+                pk = None
+            if pk is None or id(pk) in restored_ids:
+                continue
+            kept_rejections.append(ent)
+        return merged, kept_rejections
+
+    def _force_min_peak_count_on_model(self, model: ModelSelectionResult, min_keep: int) -> None:
+        """
+        Hard safety net for the final selected model.
+
+        If the model still has fewer than ``min_keep`` peaks at the end of
+        post-processing, restore peaks from the pre-filter list (preferred) or
+        from init_peaks as a fallback.
+        """
+        try:
+            target = max(0, int(min_keep))
+        except Exception:
+            target = 0
+        if target <= 0 or model is None:
+            return
+
+        current = list(getattr(model, "peaks", []) or [])
+        if len(current) >= target:
+            return
+
+        original = list(getattr(model, "prefilter_peaks", []) or [])
+        if not original:
+            original = list(getattr(model, "init_peaks", []) or [])
+        if not original:
+            return
+
+        try:
+            restored_peaks, kept_rejections = self._ensure_min_peak_count(
+                current,
+                original,
+                target,
+                rejected_infos=list(getattr(model, "excluded_infos", []) or []),
+            )
+        except Exception:
+            restored_peaks = current
+            kept_rejections = list(getattr(model, "excluded_infos", []) or [])
+
+        model.peaks = list(restored_peaks or [])
+        try:
+            model.excluded_infos = list(kept_rejections or [])
+        except Exception:
+            pass
+
     def _filter_peaks(
         self,
         peaks: List[PeakStat],
@@ -764,8 +872,11 @@ class SpotAnalysis:
             k = id(pk)
             ent = rejected_map.get(k)
             if ent is None:
-                ent = {"peak": pk, "reasons": []}
+                idx = getattr(pk, "_prefilter_index", None)
+                ent = {"peak": pk, "reasons": [], "prefilter_index": idx}
                 rejected_map[k] = ent
+            elif ent.get("prefilter_index") is None:
+                ent["prefilter_index"] = getattr(pk, "_prefilter_index", None)
             ent["reasons"].append(reason)
 
         filtered: List[PeakStat] = []
@@ -1148,9 +1259,15 @@ class SpotAnalysis:
             # This avoids any proximity-based matching in the UI.
             try:
                 prefilter_peaks = list(best_model.peaks)
+                for i, pk in enumerate(prefilter_peaks):
+                    try:
+                        setattr(pk, "_prefilter_index", int(i))
+                    except Exception:
+                        pass
                 best_model.prefilter_index_by_id = {id(pk): i for i, pk in enumerate(prefilter_peaks)}
+                best_model.prefilter_peaks = list(prefilter_peaks)
             except Exception:
-                pass
+                prefilter_peaks = list(best_model.peaks)
             filtered_peaks, rejected_infos = self._filter_peaks(
                 best_model.peaks,
                 origin,
@@ -1159,13 +1276,23 @@ class SpotAnalysis:
                 roi_mask=roi_mask,
                 return_rejections=True,
             )
+            # Enforce minimum peak distance before snapping so snap itself does not
+            # reduce the visible peak count by making peaks newly collide.
+            if filtered_peaks:
+                filtered_peaks, dist_rejected = self._enforce_min_peak_distance(
+                    filtered_peaks, return_rejections=True
+                )
+                try:
+                    rejected_infos.extend(list(dist_rejected))
+                except Exception:
+                    pass
             # Optionally snap best peaks to local maxima on the detection image (ROI-local).
-            if self.snap_enabled and filtered_peaks:
+            if self.fit_enabled and self.snap_enabled and filtered_peaks:
                 filtered_peaks = self._snap_peaks_to_local_maxima(filtered_peaks, roi_det, origin, roi_mask=roi_mask)
 
             # Optional: re-fit once using snapped peak seeds, then filter/snap again.
             # This is OFF by default because it can change AIC/BIC and runtime.
-            if self.snap_refit_enabled and best is not None and filtered_peaks:
+            if self.fit_enabled and self.snap_refit_enabled and best is not None and filtered_peaks:
                 try:
                     seeds_local = [(float(pk.x) - float(origin[0]), float(pk.y) - float(origin[1])) for pk in filtered_peaks]
                 except Exception:
@@ -1186,7 +1313,13 @@ class SpotAnalysis:
                     # Rebuild identity map for refit peaks (pre-filter).
                     try:
                         prefilter_peaks = list(best_model.peaks)
+                        for i, pk in enumerate(prefilter_peaks):
+                            try:
+                                setattr(pk, "_prefilter_index", int(i))
+                            except Exception:
+                                pass
                         best_model.prefilter_index_by_id = {id(pk): i for i, pk in enumerate(prefilter_peaks)}
+                        best_model.prefilter_peaks = list(prefilter_peaks)
                     except Exception:
                         pass
                     filtered_peaks, rejected_infos = self._filter_peaks(
@@ -1197,18 +1330,23 @@ class SpotAnalysis:
                         roi_mask=roi_mask,
                         return_rejections=True,
                     )
+                    if filtered_peaks:
+                        filtered_peaks, dist_rejected = self._enforce_min_peak_distance(
+                            filtered_peaks, return_rejections=True
+                        )
+                        try:
+                            rejected_infos.extend(list(dist_rejected))
+                        except Exception:
+                            pass
                     if self.snap_enabled and filtered_peaks:
                         filtered_peaks = self._snap_peaks_to_local_maxima(filtered_peaks, roi_det, origin, roi_mask=roi_mask)
 
-            # Enforce minimum peak distance on final peaks (may reduce count).
-            if filtered_peaks:
-                filtered_peaks, dist_rejected = self._enforce_min_peak_distance(
-                    filtered_peaks, return_rejections=True
-                )
-                try:
-                    rejected_infos.extend(list(dist_rejected))
-                except Exception:
-                    pass
+            filtered_peaks, rejected_infos = self._ensure_min_peak_count(
+                filtered_peaks,
+                prefilter_peaks,
+                min_keep=min(min_peaks, best),
+                rejected_infos=rejected_infos,
+            )
 
             # Update the peaks in the best model result.
             # Note: We do not update best_n_peaks selection itself here.
@@ -1217,6 +1355,7 @@ class SpotAnalysis:
                 best_model.excluded_infos = rejected_infos
             except Exception:
                 pass
+            self._force_min_peak_count_on_model(best_model, min_keep=min(min_peaks, best))
 
         return FrameAnalysis(
             best_n_peaks=best,
@@ -2400,26 +2539,30 @@ class SpotAnalysis:
                     )
                 )
 
-        try:
-            if roi_mask is not None:
-                mask = roi_mask.astype(bool)
-                x_fit = x[mask].ravel()
-                y_fit = y[mask].ravel()
-                z_fit = roi[mask].ravel()
-            else:
-                x_fit = x.ravel()
-                y_fit = y.ravel()
-                z_fit = roi.ravel()
-            popt, _ = curve_fit(
-                self._multi_gaussian,
-                (x_fit, y_fit),
-                z_fit,
-                p0=p0,
-                bounds=bounds,
-                maxfev=self.max_iterations,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Gaussian fit failed (n=%s): %s", n_peaks, exc)
+        fit_applied = bool(getattr(self, "fit_enabled", True))
+        if fit_applied:
+            try:
+                if roi_mask is not None:
+                    mask = roi_mask.astype(bool)
+                    x_fit = x[mask].ravel()
+                    y_fit = y[mask].ravel()
+                    z_fit = roi[mask].ravel()
+                else:
+                    x_fit = x.ravel()
+                    y_fit = y.ravel()
+                    z_fit = roi.ravel()
+                popt, _ = curve_fit(
+                    self._multi_gaussian,
+                    (x_fit, y_fit),
+                    z_fit,
+                    p0=p0,
+                    bounds=bounds,
+                    maxfev=self.max_iterations,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Gaussian fit failed (n=%s): %s", n_peaks, exc)
+                popt = np.asarray(p0, dtype=np.float64)
+        else:
             popt = np.asarray(p0, dtype=np.float64)
 
         model = self._multi_gaussian((x, y), *popt).reshape(roi.shape)
@@ -2461,6 +2604,7 @@ class SpotAnalysis:
             aic=float(aic),
             bic=float(bic),
             residual_std=residual_std,
+            fit_applied=fit_applied,
             init_peaks=init_peaks,
             peaks=peaks,
         )
@@ -2507,6 +2651,7 @@ class SpotVisualizationWindow(QtWidgets.QMainWindow):
         """ROI画像とフィッティング結果を描画"""
         self.ax.clear()
         self._safe_remove_colorbar()
+        self.figure.subplots_adjust(right=0.80)
         # 背景画像
         im = self.ax.imshow(roi, cmap='viridis', origin='lower')
         self.cbar = self.figure.colorbar(im, ax=self.ax, label='Height (nm)')
@@ -2523,14 +2668,18 @@ class SpotVisualizationWindow(QtWidgets.QMainWindow):
             label = f"P{i+1}: S/N={pk.snr:.1f}"
             
             self.ax.plot(rx, ry, 'x', color=colors[i % len(colors)], markersize=10, markeredgewidth=2, label=label)
-            self.ax.text(rx + 1, ry + 1, f"P{i+1}", color='white', fontsize=10, fontweight='bold')
 
         # 2ピークモデルと3ピークモデルの両方を比較したい場合のために、
         # 補助的に他のモデルの点も点線などで出すことも検討できますが、
         # まずは「採用されたモデル」を表示します。
         
         self.ax.set_title(f"Model: {result.best_n_peaks} peaks ({result.criterion.upper()})")
-        self.ax.legend(loc='upper right', fontsize=8)
+        self.ax.legend(
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            borderaxespad=0.0,
+            fontsize=8,
+        )
         self.ax.set_xlabel("X (pixel)")
         self.ax.set_ylabel("Y (pixel)")
         # Z Scale Barは表示しない
@@ -2684,6 +2833,7 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
         # NOTE: Avoid UnboundLocalError if 'np' becomes a local binding unexpectedly.
         import numpy as np
 
+        self.figure.subplots_adjust(right=0.82)
         self.ax_afm.clear()
         self.ax_roi_pre.clear()
         self.ax_roi_det.clear()
@@ -2732,7 +2882,6 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
                 label = f"P{i+1}: S/N={pk.get('snr', 0.0):.1f}"
                 # top: absolute
                 self.ax_afm.plot(pk["x"], pk["y"], "x", color=colors[i % len(colors)], markersize=10, markeredgewidth=2, label=label)
-                self.ax_afm.text(pk["x"] + 1, pk["y"] + 1, f"P{i+1}", color="white", fontsize=10, fontweight="bold")
                 if spot_radius_px is not None and spot_radius_px > 0:
                     try:
                         self.ax_afm.add_patch(
@@ -2745,10 +2894,15 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
                                 linestyle="-",
                                 alpha=0.9,
                             )
-                        )
+                            )
                     except Exception:
                         pass
-            self.ax_afm.legend(loc="upper right", fontsize=8)
+            self.ax_afm.legend(
+                loc="upper left",
+                bbox_to_anchor=(1.02, 1.0),
+                borderaxespad=0.0,
+                fontsize=8,
+            )
 
         if roi_overlay:
             # top: ROI outline in absolute coords
@@ -2912,9 +3066,6 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
                                 self.ax_roi_pre.plot(
                                     rx, ry, "x", color=colors[i % len(colors)], markersize=9, markeredgewidth=2
                                 )
-                                self.ax_roi_pre.text(
-                                    rx + 0.8, ry + 0.8, f"P{i+1}", color="white", fontsize=9, fontweight="bold"
-                                )
                                 if spot_radius_px is not None and spot_radius_px > 0:
                                     self.ax_roi_pre.add_patch(
                                         Circle(
@@ -2951,9 +3102,6 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
                                         continue  # マージン範囲内なのでスキップ
                                 self.ax_roi_det.plot(
                                     rx, ry, "x", color=colors[i % len(colors)], markersize=9, markeredgewidth=2
-                                )
-                                self.ax_roi_det.text(
-                                    rx + 0.8, ry + 0.8, f"P{i+1}", color="white", fontsize=9, fontweight="bold"
                                 )
                                 if spot_radius_px is not None and spot_radius_px > 0:
                                     self.ax_roi_det.add_patch(
@@ -3059,7 +3207,9 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.manual_roi = None  # dict: {"shape": str, "x0":..., "y0":..., "w":..., "h":..., "cx":..., "cy":..., "rx":..., "ry":...}
         self.roi_by_frame: Dict[int, Dict[str, float]] = {}
         self.spots_by_frame: Dict[int, List[Dict[str, float]]] = {}
+        self.centroid_reference_by_frame: Dict[int, List[Dict[str, float]]] = {}
         self.initial_spots_by_frame: Dict[int, List[Dict[str, float]]] = {}
+        self.preserve_existing_spots_on_auto = False
         self.export_dir = None
         self._dragging = False
         self._drag_index = None
@@ -3111,16 +3261,15 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.run_btn.clicked.connect(self.run_analysis)
         self.run_btn.setEnabled(False)
 
-        self.refit_manual_btn = QtWidgets.QPushButton("手動スポットで再フィット")
-        self.refit_manual_btn.setToolTip("手動で調整したspot数/座標を初期値にして、±r(px)以内の制約付きで再フィットします（現在フレームのみ）。")
+        self.refit_manual_btn = QtWidgets.QPushButton("スポットをSpot径の重心に設定")
+        self.refit_manual_btn.setToolTip("各スポットを、Spot半径で描かれる円内の強度重心位置へ移動します（現在フレームのみ）。")
         self.refit_manual_btn.clicked.connect(self.refit_from_manual_spots)
         self.refit_manual_btn.setEnabled(False)
-
-        self.refit_shift_spin = QtWidgets.QSpinBox()
-        self.refit_shift_spin.setRange(0, 50)
-        self.refit_shift_spin.setValue(3)
-        self.refit_shift_spin.setMaximumWidth(70)
-        self.refit_shift_spin.setToolTip("手動spotからの許容移動量（±r px）。0なら制約なし。")
+        self.auto_centroid_check = QtWidgets.QCheckBox("自動適用")
+        self.auto_centroid_check.setChecked(False)
+        self.auto_centroid_check.setToolTip(
+            "ONにすると、解析直後に各スポットを Spot 半径内の強度重心位置へ自動移動します。"
+        )
 
         self.run_all_btn = QtWidgets.QPushButton("全フレーム解析")
         self.run_all_btn.clicked.connect(self.run_analysis_all_frames)
@@ -3145,11 +3294,10 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         top_row.addStretch(1)
         outer_layout.addLayout(top_row)
 
-        # --- 2nd row: Manual spot reanalysis + tolerance ---
+        # --- 2nd row: Manual spot centroid placement ---
         refit_row = QtWidgets.QHBoxLayout()
         refit_row.addWidget(self.refit_manual_btn)
-        refit_row.addWidget(QtWidgets.QLabel("許容移動(px)"))
-        refit_row.addWidget(self.refit_shift_spin)
+        refit_row.addWidget(self.auto_centroid_check)
         refit_row.addStretch(1)
         outer_layout.addLayout(refit_row)
 
@@ -3545,6 +3693,16 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         _setup_grid(fit_model_grid)
         r = 0
 
+        self.fit_enabled_check = QtWidgets.QCheckBox("ガウスフィットを行う")
+        self.fit_enabled_check.setChecked(bool(getattr(self.spot_analyzer, "fit_enabled", True)))
+        self.fit_enabled_check.setToolTip(
+            "OFFにすると、初期位置検索で得たピーク座標をそのまま最終結果として採用します。\n"
+            "このとき座標最適化は行わず、AIC/BICは初期モデルのまま評価します。"
+        )
+        self.fit_enabled_check.toggled.connect(self._update_fit_ui_enabled)
+        fit_model_grid.addWidget(self.fit_enabled_check, r, 0, 1, 3, alignment=QtCore.Qt.AlignLeft)
+        r += 1
+
         self.initial_sigma_spin = QtWidgets.QDoubleSpinBox()
         self.initial_sigma_spin.setRange(0.1, 20.0)
         self.initial_sigma_spin.setSingleStep(0.1)
@@ -3808,6 +3966,22 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             pass
         form_layout.addWidget(self.output)
 
+        height_export_row = QtWidgets.QHBoxLayout()
+        height_export_label = QtWidgets.QLabel("高さ保存値")
+        height_export_label.setToolTip(
+            "CSVへ保存する高さの主値を選択します。\n"
+            "・Spot位置: スポット座標での高さ\n"
+            "・Spot径内平均: Spot半径の円内平均高さ"
+        )
+        height_export_row.addWidget(height_export_label)
+        self.height_export_mode_combo = QtWidgets.QComboBox()
+        self.height_export_mode_combo.addItems(["Spot位置", "Spot径内平均"])
+        self.height_export_mode_combo.setCurrentText("Spot径内平均")
+        self.height_export_mode_combo.setToolTip("CSVの高さ主値として保存する方式を選択します。")
+        height_export_row.addWidget(self.height_export_mode_combo)
+        height_export_row.addStretch(1)
+        form_layout.addLayout(height_export_row)
+
         self.export_btn = QtWidgets.QPushButton("CSVエクスポート")
         self.export_btn.clicked.connect(self.export_spots_csv)
         self.export_btn.setEnabled(False)
@@ -3837,7 +4011,6 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         # Any UI changes should redraw immediately; analysis-impacting widgets also trigger debounced reanalysis.
         for w in (
             # analysis-impacting controls
-            self.refit_shift_spin,
             self.median_check,
             self.open_check,
             self.detection_mode_combo,
@@ -3867,6 +4040,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             self.blob_doh_threshold_rel_spin,
             self.dbscan_enabled_check,
             self.dbscan_eps_spin,
+            self.fit_enabled_check,
+            self.auto_centroid_check,
             self.initial_sigma_spin,
             self.sigma_min_spin,
             self.sigma_max_spin,
@@ -3886,6 +4061,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
         self._update_detection_ui_enabled()
         self._update_init_mode_ui_enabled()
+        self._update_fit_ui_enabled()
         self._sync_run_buttons_enabled()
 
     def _update_detection_ui_enabled(self, *_args) -> None:
@@ -3939,6 +4115,34 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def _update_fit_ui_enabled(self, *_args) -> None:
+        fit_enabled = bool(getattr(self, "fit_enabled_check", None) and self.fit_enabled_check.isChecked())
+        try:
+            if getattr(self, "snap_enabled_check", None) is not None:
+                self.snap_enabled_check.setEnabled(fit_enabled)
+                if not fit_enabled:
+                    self.snap_enabled_check.setToolTip(
+                        "フィットOFF時は、初期位置検索で得た座標をそのまま使うためスナップしません。"
+                    )
+                else:
+                    self.snap_enabled_check.setToolTip(
+                        "最終結果のピーク座標を、検出画像（LoG/DoG）上の局所最大へ寄せます。"
+                    )
+            if getattr(self, "snap_radius_spin", None) is not None:
+                self.snap_radius_spin.setEnabled(fit_enabled)
+            if getattr(self, "snap_refit_check", None) is not None:
+                self.snap_refit_check.setEnabled(fit_enabled)
+                if not fit_enabled:
+                    self.snap_refit_check.setToolTip(
+                        "ガウスフィットをOFFにしている間は再フィットできません。"
+                    )
+                else:
+                    self.snap_refit_check.setToolTip(
+                        "スナップ位置を初期値にして、同じピーク数で1回だけ再フィットします（遅くなることがあります）。"
+                    )
+        except Exception:
+            pass
+
     def _sync_run_buttons_enabled(self) -> None:
         has_roi = self.manual_roi is not None
         try:
@@ -3986,6 +4190,18 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             self._reanalysis_timer.start(250)
         except Exception:
             pass
+
+    def _should_skip_auto_analysis_for_frame(self, frame_index: int) -> bool:
+        """
+        When CSV-restored spots are being reviewed, keep existing per-frame spots
+        unless the user explicitly runs analysis.
+        """
+        if not bool(getattr(self, "preserve_existing_spots_on_auto", False)):
+            return False
+        try:
+            return bool(self.spots_by_frame.get(int(frame_index)))
+        except Exception:
+            return False
 
     def _analysis_signature(self, frame_index: int, roi_info: Optional[Dict[str, float]]) -> Tuple:
         def _rf(v: float) -> float:
@@ -4048,6 +4264,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             _rf(self.localmax_snr_spin.value()),
             int(self.precheck_radius_spin.value()),
             _rf(self.precheck_kmad_spin.value()),
+            bool(self.fit_enabled_check.isChecked()),
+            bool(self.auto_centroid_check.isChecked()),
             _rf(self.initial_sigma_spin.value()),
             (_rf(self.sigma_min_spin.value()), _rf(self.sigma_max_spin.value())),
             _rf(self.snr_spin.value()),
@@ -4059,8 +4277,6 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             bool(self.snap_enabled_check.isChecked()),
             int(self.snap_radius_spin.value()),
             bool(self.snap_refit_check.isChecked()),
-            # constrained manual refit
-            int(getattr(self, "refit_shift_spin", None).value()) if getattr(self, "refit_shift_spin", None) is not None else 3,
         )
         return (int(frame_index), roi_sig, params_sig)
 
@@ -4078,6 +4294,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             return
 
         frame_index = self._get_current_frame_index()
+        if self._should_skip_auto_analysis_for_frame(frame_index):
+            return
         roi_info = self._current_roi_overlay()
         sig = self._analysis_signature(frame_index, roi_info)
         if self._analysis_signature_by_frame.get(frame_index) == sig:
@@ -4174,6 +4392,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             self.spot_analyzer.precheck_kmad = float(self.precheck_kmad_spin.value())
         except Exception:
             self.spot_analyzer.precheck_kmad = float(getattr(self.spot_analyzer, "precheck_kmad", 1.0))
+        self.spot_analyzer.fit_enabled = bool(self.fit_enabled_check.isChecked())
         self.spot_analyzer.initial_sigma = float(self.initial_sigma_spin.value())
         sigma_min = float(self.sigma_min_spin.value())
         sigma_max = float(self.sigma_max_spin.value())
@@ -4193,10 +4412,6 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.spot_analyzer.snap_enabled = bool(self.snap_enabled_check.isChecked())
         self.spot_analyzer.snap_radius = max(0, int(self.snap_radius_spin.value()))
         self.spot_analyzer.snap_refit_enabled = bool(self.snap_refit_check.isChecked())
-        try:
-            self.spot_analyzer.refit_max_shift_px = max(0, int(self.refit_shift_spin.value()))
-        except Exception:
-            self.spot_analyzer.refit_max_shift_px = max(0, int(getattr(self.spot_analyzer, "refit_max_shift_px", 3)))
 
         return True
 
@@ -4431,9 +4646,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
     def refit_from_manual_spots(self) -> None:
         """
-        Constrained re-fit using current frame's manually edited spots as seeds.
-        - Spot count is fixed to the number of manual spots.
-        - Each spot's (x,y) is constrained within ±r(px) from the seed (r from UI).
+        Move current manual spots to the intensity centroid inside the
+        Spot-radius circle drawn for each spot.
         """
         if self.manual_roi is None:
             QtWidgets.QMessageBox.information(self, "ROI Required", "ROIを選択してください。")
@@ -4447,110 +4661,15 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             return
 
         frame_index = self._get_current_frame_index()
-        spots = list(self.spots_by_frame.get(frame_index) or [])
-        if not spots:
-            QtWidgets.QMessageBox.information(self, "No Spots", "手動スポットがありません（追加/移動してから再フィットしてください）。")
+        if not self._apply_spot_centroid_to_frame(
+            frame_index,
+            frame=frame,
+            result=self.last_result,
+            show_messages=True,
+            refresh_display=True,
+        ):
             return
 
-        # seeds in absolute pixel coords
-        seeds_abs: List[Tuple[float, float]] = []
-        for pk in spots:
-            try:
-                x = float(pk.get("x", float("nan")))
-                y = float(pk.get("y", float("nan")))
-            except Exception:
-                continue
-            if not np.isfinite(x) or not np.isfinite(y):
-                continue
-            seeds_abs.append((x, y))
-        if not seeds_abs:
-            QtWidgets.QMessageBox.warning(self, "Invalid Spots", "手動スポット座標が不正です。")
-            return
-
-        # Apply constrained shift radius to analyzer
-        try:
-            self.spot_analyzer.refit_max_shift_px = max(0, int(self.refit_shift_spin.value()))
-        except Exception:
-            self.spot_analyzer.refit_max_shift_px = 3
-
-        # ROI context
-        center_override, roi_size_override, roi_mask, roi_bounds = self._roi_overrides(frame.shape)
-        frame_f = np.asarray(frame, dtype=np.float64)
-        if roi_bounds is not None:
-            roi_raw, origin = self.spot_analyzer._crop_rect(frame_f, roi_bounds)
-        else:
-            center = center_override if center_override is not None else (frame_f.shape[1] / 2.0, frame_f.shape[0] / 2.0)
-            use_roi_size = roi_size_override if roi_size_override is not None else self.spot_analyzer.roi_size
-            roi_raw, origin = self.spot_analyzer._crop_square(frame_f, center, use_roi_size)
-        roi_pre = self.spot_analyzer._apply_roi_preprocess(roi_raw)
-        roi_det = self.spot_analyzer._apply_detection(roi_pre)
-        h_roi, w_roi = roi_pre.shape
-
-        # Validate all seeds are inside ROI bounds/mask (keep spot count fixed)
-        initial_local: List[Tuple[float, float]] = []
-        for x_abs, y_abs in seeds_abs:
-            lx = float(x_abs) - float(origin[0])
-            ly = float(y_abs) - float(origin[1])
-            if not (0.0 <= lx < float(w_roi) and 0.0 <= ly < float(h_roi)):
-                QtWidgets.QMessageBox.warning(self, "Spot Outside ROI", "手動スポットがROIの外にあります。ROI内へ移動してから再フィットしてください。")
-                return
-            if roi_mask is not None:
-                try:
-                    ix = int(round(lx))
-                    iy = int(round(ly))
-                    if ix < 0 or iy < 0 or ix >= w_roi or iy >= h_roi or not bool(roi_mask.astype(bool)[iy, ix]):
-                        QtWidgets.QMessageBox.warning(self, "Spot Outside ROI Mask", "手動スポットがROIマスク（楕円など）の外にあります。マスク内へ移動してから再フィットしてください。")
-                        return
-                except Exception:
-                    pass
-            initial_local.append((lx, ly))
-
-        n = int(len(initial_local))
-        if n <= 0:
-            QtWidgets.QMessageBox.warning(self, "No Valid Spots", "再フィットに使えるスポットがありません。")
-            return
-
-        # Fit exactly n peaks (fixed count)
-        noise_sigma = self.spot_analyzer._estimate_noise_sigma(roi_pre, roi_mask)
-        det_noise_sigma = self.spot_analyzer._estimate_noise_sigma(roi_det, roi_mask)
-        try:
-            model = self.spot_analyzer._fit_model(
-                roi_pre,
-                origin,
-                n,
-                noise_sigma,
-                roi_mask,
-                initial_xy_local=initial_local,
-                init_image=roi_det,
-                init_noise_sigma=det_noise_sigma,
-            )
-        except Exception as exc:  # noqa: BLE001
-            QtWidgets.QMessageBox.critical(self, "Refit Error", f"再フィットに失敗しました:\n{exc}")
-            return
-
-        # Optional snap (keeps near local maxima) without dropping peak count.
-        if bool(getattr(self.spot_analyzer, "snap_enabled", False)):
-            try:
-                model.peaks = self.spot_analyzer._snap_peaks_to_local_maxima(model.peaks, roi_det, origin, roi_mask=roi_mask)
-            except Exception:
-                pass
-
-        criterion = self.criterion_combo.currentText().lower()
-        result = FrameAnalysis(
-            best_n_peaks=n,
-            criterion="bic" if criterion.lower() == "bic" else "aic",
-            noise_sigma=noise_sigma,
-            snr_threshold=self.spot_analyzer.snr_threshold,
-            models={n: model},
-            roi=roi_pre,
-            origin=origin,
-            roi_mask=roi_mask,
-        )
-        self.last_frame = frame
-        self.last_result = result
-        self._display_result(result)
-        # Manual refit: keep the auto-detected initial peaks for the overlay.
-        self._store_spots_for_frame(frame_index, result, frame=frame, update_initial=False)
         self._refresh_overlay()
         self.export_btn.setEnabled(True)
 
@@ -4560,17 +4679,144 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def _apply_spot_centroid_to_frame(
+        self,
+        frame_index: int,
+        frame: Optional[np.ndarray] = None,
+        result: Optional[FrameAnalysis] = None,
+        show_messages: bool = False,
+        refresh_display: bool = False,
+    ) -> bool:
+        spots = list(self.spots_by_frame.get(frame_index) or [])
+        if not spots:
+            if show_messages:
+                QtWidgets.QMessageBox.information(self, "No Spots", "手動スポットがありません（追加/移動してから再フィットしてください）。")
+            return False
+
+        use_frame = frame if frame is not None else self.last_frame
+        if use_frame is None:
+            if show_messages:
+                QtWidgets.QMessageBox.warning(self, "No Data", "画像データが利用できません。")
+            return False
+
+        reference_spots = list(self.centroid_reference_by_frame.get(frame_index) or [])
+        if len(reference_spots) != len(spots):
+            reference_spots = [dict(pk) for pk in spots]
+            self.centroid_reference_by_frame[frame_index] = [dict(pk) for pk in reference_spots]
+
+        seeds_abs: List[Tuple[float, float]] = []
+        for pk in reference_spots:
+            try:
+                x = float(pk.get("x", float("nan")))
+                y = float(pk.get("y", float("nan")))
+            except Exception:
+                continue
+            if not np.isfinite(x) or not np.isfinite(y):
+                continue
+            seeds_abs.append((x, y))
+        if not seeds_abs:
+            if show_messages:
+                QtWidgets.QMessageBox.warning(self, "Invalid Spots", "手動スポット座標が不正です。")
+            return False
+
+        center_override, roi_size_override, roi_mask, roi_bounds = self._roi_overrides(use_frame.shape)
+        frame_f = np.asarray(use_frame, dtype=np.float64)
+        if roi_bounds is not None:
+            roi_raw, origin = self.spot_analyzer._crop_rect(frame_f, roi_bounds)
+        else:
+            center = center_override if center_override is not None else (frame_f.shape[1] / 2.0, frame_f.shape[0] / 2.0)
+            use_roi_size = roi_size_override if roi_size_override is not None else self.spot_analyzer.roi_size
+            roi_raw, origin = self.spot_analyzer._crop_square(frame_f, center, use_roi_size)
+        h_roi, w_roi = roi_raw.shape
+        centroid_radius = max(1, int(self._get_spot_radius_px()))
+
+        initial_local: List[Tuple[float, float]] = []
+        roi_mask_bool = None
+        if roi_mask is not None:
+            try:
+                roi_mask_bool = roi_mask.astype(bool)
+            except Exception:
+                roi_mask_bool = None
+
+        for x_abs, y_abs in seeds_abs:
+            lx = float(x_abs) - float(origin[0])
+            ly = float(y_abs) - float(origin[1])
+            if not (0.0 <= lx < float(w_roi) and 0.0 <= ly < float(h_roi)):
+                if show_messages:
+                    QtWidgets.QMessageBox.warning(self, "Spot Outside ROI", "手動スポットがROIの外にあります。ROI内へ移動してから再フィットしてください。")
+                return False
+            if roi_mask_bool is not None:
+                try:
+                    ix = int(round(lx))
+                    iy = int(round(ly))
+                    if ix < 0 or iy < 0 or ix >= w_roi or iy >= h_roi or not bool(roi_mask_bool[iy, ix]):
+                        if show_messages:
+                            QtWidgets.QMessageBox.warning(self, "Spot Outside ROI Mask", "手動スポットがROIマスク（楕円など）の外にあります。マスク内へ移動してから再フィットしてください。")
+                        return False
+                except Exception:
+                    pass
+            initial_local.append((lx, ly))
+
+        if not initial_local:
+            if show_messages:
+                QtWidgets.QMessageBox.warning(self, "No Valid Spots", "再フィットに使えるスポットがありません。")
+            return False
+
+        self.last_frame = use_frame
+        moved_spots: List[Dict[str, float]] = []
+        for src, (lx, ly) in zip(spots, initial_local):
+            centroid = self._compute_circle_centroid_in_roi(
+                roi_raw,
+                float(lx),
+                float(ly),
+                radius_px=float(centroid_radius),
+                roi_mask=roi_mask,
+            )
+            if centroid is None:
+                cx, cy = float(lx), float(ly)
+            else:
+                cx, cy = centroid
+            moved = dict(src)
+            moved["x"] = float(origin[0] + cx)
+            moved["y"] = float(origin[1] + cy)
+            moved_spots.append(moved)
+
+        self.spots_by_frame[frame_index] = moved_spots
+        self._recompute_spot_heights_for_frame(frame_index, frame=use_frame)
+
+        target_result = result
+        if target_result is None and self.last_result is not None:
+            target_result = self.last_result
+        if target_result is not None and target_result.best_n_peaks in target_result.models:
+            try:
+                best_model = target_result.models[target_result.best_n_peaks]
+                if len(best_model.peaks) == len(moved_spots):
+                    for pk, moved in zip(best_model.peaks, moved_spots):
+                        pk.x = float(moved["x"])
+                        pk.y = float(moved["y"])
+                    if refresh_display:
+                        self._display_result(target_result)
+            except Exception:
+                pass
+
+        return True
+
     def _display_result(self, result: FrameAnalysis) -> None:
         def esc(s: str) -> str:
             return html.escape(s, quote=False)
 
         html_lines: List[str] = []
-        html_lines.append(esc(f"判定モデル: {result.best_n_peaks} peaks ({result.criterion.upper()})"))
+        best_model = result.models.get(result.best_n_peaks) if result.best_n_peaks in result.models else None
+        fit_suffix = ""
+        if best_model is not None and not bool(getattr(best_model, "fit_applied", True)):
+            fit_suffix = ", No Fit"
+        html_lines.append(esc(f"判定モデル: {result.best_n_peaks} peaks ({result.criterion.upper()}{fit_suffix})"))
         for n_peaks in sorted(result.models.keys()):
             model = result.models[n_peaks]
+            mode_label = "Fit" if bool(getattr(model, "fit_applied", True)) else "NoFit"
             html_lines.append(
                 esc(
-                    f"[{n_peaks} peaks] AIC={model.aic:.2f}, BIC={model.bic:.2f}, rss={model.rss:.4g}, loglike={model.loglike:.4g}, residual_std={model.residual_std:.4g}"
+                    f"[{n_peaks} peaks, {mode_label}] AIC={model.aic:.2f}, BIC={model.bic:.2f}, rss={model.rss:.4g}, loglike={model.loglike:.4g}, residual_std={model.residual_std:.4g}"
                 )
             )
             for idx, pk in enumerate(model.peaks, start=1):
@@ -4589,7 +4835,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             # 2px近傍マッチを廃止し、解析側で確定収集した excluded_infos（真に落としたピーク）から表示する。
             # P番号はフィルタ前ピークのインデックス（= init_peaks順）をIDマップで引く。
             idx_map = getattr(best_model, "prefilter_index_by_id", None)
-            excluded_rows: List[Tuple[int, Dict[str, Any]]] = []
+            excluded_rows: List[Tuple[Any, Dict[str, Any]]] = []
             for ent in excluded_infos:
                 try:
                     pk = ent.get("peak")
@@ -4599,20 +4845,27 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                     continue
                 idx = None
                 try:
-                    if isinstance(idx_map, dict):
-                        idx = idx_map.get(id(pk))
+                    idx = ent.get("prefilter_index")
                 except Exception:
                     idx = None
                 if idx is None:
-                    # No proximity matching here (explicitly disabled)
-                    continue
+                    try:
+                        idx = getattr(pk, "_prefilter_index", None)
+                    except Exception:
+                        idx = None
                 try:
-                    excluded_rows.append((int(idx), ent))
+                    if isinstance(idx_map, dict):
+                        idx = idx if idx is not None else idx_map.get(id(pk))
                 except Exception:
-                    continue
+                    idx = None
+                try:
+                    key = int(idx) if idx is not None else float("inf")
+                    excluded_rows.append((key, ent))
+                except Exception:
+                    excluded_rows.append((float("inf"), ent))
 
             if excluded_rows:
-                excluded_rows.sort(key=lambda t: t[0])
+                excluded_rows.sort(key=lambda t: (t[0], str(t[1].get("reasons", ""))))
                 html_lines.append("")
                 html_lines.append(esc("--- 除外されたピーク ---"))
                 for idx0, ent in excluded_rows:
@@ -4624,8 +4877,9 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                     if not reasons:
                         reasons = ["理由取得失敗"]
                     reason_str = ", ".join(reasons)
+                    peak_label = f"P{idx0 + 1}" if np.isfinite(idx0) else "P?"
                     prefix = (
-                        f"  [除外] P{idx0 + 1}: amp={pk.amplitude:.3g}, sigma={pk.sigma:.3g}, "
+                        f"  [除外] {peak_label}: amp={pk.amplitude:.3g}, sigma={pk.sigma:.3g}, "
                         f"(x,y)=({pk.x:.2f},{pk.y:.2f}), S/N={pk.snr:.2f}  ★理由: "
                     )
                     html_lines.append(
@@ -4724,6 +4978,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         """解析結果（spots/ROI/UI/表示）を一括でクリアする。"""
         # データをクリア
         self.spots_by_frame = {}
+        self.centroid_reference_by_frame = {}
         self.initial_spots_by_frame = {}
         self.roi_by_frame = {}
         self.manual_roi = None
@@ -4815,6 +5070,149 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
     def _current_roi_overlay(self) -> Optional[Dict[str, float]]:
         return self.roi_by_frame.get(self._get_current_frame_index(), self.manual_roi)
 
+    def _compute_circle_centroid_in_roi(
+        self,
+        roi_img: np.ndarray,
+        x_local: float,
+        y_local: float,
+        radius_px: float,
+        roi_mask: Optional[np.ndarray] = None,
+    ) -> Optional[Tuple[float, float]]:
+        """
+        Compute an intensity-weighted centroid inside a circular neighborhood.
+
+        Weights are built from image values shifted by the local minimum so the
+        centroid stays stable even when the image contains negative values.
+        """
+        img = np.asarray(roi_img, dtype=np.float64)
+        if img.ndim != 2:
+            return None
+        h, w = img.shape
+        try:
+            cx = float(x_local)
+            cy = float(y_local)
+            r = float(radius_px)
+        except Exception:
+            return None
+        if not np.isfinite(cx) or not np.isfinite(cy):
+            return None
+        if not np.isfinite(r) or r <= 0:
+            return float(cx), float(cy)
+
+        x_min = max(0, int(np.floor(cx - r)))
+        x_max = min(w - 1, int(np.ceil(cx + r)))
+        y_min = max(0, int(np.floor(cy - r)))
+        y_max = min(h - 1, int(np.ceil(cy + r)))
+        if x_min > x_max or y_min > y_max:
+            return float(cx), float(cy)
+
+        yy, xx = np.mgrid[y_min : y_max + 1, x_min : x_max + 1]
+        circle = (xx - cx) ** 2 + (yy - cy) ** 2 <= float(r) ** 2
+        if roi_mask is not None:
+            try:
+                local_mask = roi_mask[y_min : y_max + 1, x_min : x_max + 1].astype(bool)
+                circle &= local_mask
+            except Exception:
+                pass
+        if not np.any(circle):
+            return float(cx), float(cy)
+
+        values = np.asarray(img[y_min : y_max + 1, x_min : x_max + 1], dtype=np.float64)
+        finite_circle = circle & np.isfinite(values)
+        if not np.any(finite_circle):
+            return float(cx), float(cy)
+
+        vals = values[finite_circle]
+        floor_v = float(np.min(vals))
+        weights = np.where(finite_circle, values - floor_v, 0.0)
+        weights = np.where(np.isfinite(weights), weights, 0.0)
+        total = float(np.sum(weights))
+        if not np.isfinite(total) or total <= 0.0:
+            return float(cx), float(cy)
+
+        x_cent = float(np.sum(xx * weights) / total)
+        y_cent = float(np.sum(yy * weights) / total)
+        return x_cent, y_cent
+
+    def _relabel_result_peaks_by_previous_frame(self, frame_index: int, result: Optional[FrameAnalysis]) -> None:
+        """
+        Reorder the selected model's final peaks so their labels follow the nearest
+        peaks from the immediately previous analyzed frame.
+
+        - If frame_index-1 has no stored peaks, keep the current order.
+        - Matched peaks inherit the previous frame's label order.
+        - Newly appearing peaks are appended in their original order.
+        """
+        if result is None or result.best_n_peaks is None:
+            return
+        try:
+            best_model = result.models[result.best_n_peaks]
+        except Exception:
+            return
+
+        prev_spots = list(self.spots_by_frame.get(int(frame_index) - 1) or [])
+        curr_peaks = list(getattr(best_model, "peaks", []) or [])
+        if not prev_spots or len(curr_peaks) <= 1:
+            return
+
+        prev_xy: List[Tuple[float, float]] = []
+        for pk in prev_spots:
+            try:
+                prev_xy.append((float(pk.get("x", float("nan"))), float(pk.get("y", float("nan")))))
+            except Exception:
+                prev_xy.append((float("nan"), float("nan")))
+        if not prev_xy or not any(np.isfinite(x) and np.isfinite(y) for x, y in prev_xy):
+            return
+
+        curr_xy = np.array([[float(pk.x), float(pk.y)] for pk in curr_peaks], dtype=np.float64)
+        prev_xy_arr = np.array(prev_xy, dtype=np.float64)
+        if curr_xy.ndim != 2 or prev_xy_arr.ndim != 2:
+            return
+
+        dist = np.linalg.norm(prev_xy_arr[:, None, :] - curr_xy[None, :, :], axis=2)
+        if not np.all(np.isfinite(dist)):
+            dist = np.where(np.isfinite(dist), dist, 1e9)
+
+        matched_curr_by_prev: Dict[int, int] = {}
+        try:
+            row_ind, col_ind = linear_sum_assignment(dist)
+            pairs = sorted(zip(row_ind.tolist(), col_ind.tolist()), key=lambda t: t[0])
+            for prev_i, curr_i in pairs:
+                if 0 <= prev_i < len(prev_spots) and 0 <= curr_i < len(curr_peaks):
+                    matched_curr_by_prev[int(prev_i)] = int(curr_i)
+        except Exception:
+            used_curr: set[int] = set()
+            for prev_i in range(len(prev_spots)):
+                best_j = None
+                best_d = None
+                for curr_i in range(len(curr_peaks)):
+                    if curr_i in used_curr:
+                        continue
+                    d = float(dist[prev_i, curr_i])
+                    if best_d is None or d < best_d:
+                        best_d = d
+                        best_j = curr_i
+                if best_j is not None:
+                    matched_curr_by_prev[int(prev_i)] = int(best_j)
+                    used_curr.add(int(best_j))
+
+        ordered_indices: List[int] = []
+        used_indices: set[int] = set()
+        for prev_i in range(len(prev_spots)):
+            curr_i = matched_curr_by_prev.get(int(prev_i))
+            if curr_i is None or curr_i in used_indices:
+                continue
+            ordered_indices.append(int(curr_i))
+            used_indices.add(int(curr_i))
+        for curr_i in range(len(curr_peaks)):
+            if curr_i not in used_indices:
+                ordered_indices.append(int(curr_i))
+
+        if len(ordered_indices) != len(curr_peaks):
+            return
+
+        best_model.peaks = [curr_peaks[i] for i in ordered_indices]
+
     def _store_spots_for_frame(
         self,
         frame_index: int,
@@ -4827,6 +5225,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             {"x": float(pk.x), "y": float(pk.y), "snr": float(pk.snr)}
             for pk in best.peaks
         ]
+        self._sync_centroid_reference_for_frame(frame_index)
         if update_initial:
             # Display initial positions as detection seeds (independent of best_n_peaks / initial_sigma)
             # Fallback to legacy init_peaks if seeds are not available.
@@ -4844,6 +5243,14 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         use_frame = frame if frame is not None else self.last_frame
         if use_frame is not None:
             self._recompute_spot_heights_for_frame(frame_index, frame=use_frame)
+
+    def _sync_centroid_reference_for_frame(
+        self,
+        frame_index: int,
+        spots: Optional[Sequence[Dict[str, float]]] = None,
+    ) -> None:
+        src = list(spots) if spots is not None else list(self.spots_by_frame.get(frame_index) or [])
+        self.centroid_reference_by_frame[frame_index] = [dict(pk) for pk in src]
 
     def _refresh_overlay(self) -> None:
         if not self.full_viz_window or not self._is_window_live(self.full_viz_window):
@@ -4899,6 +5306,48 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             return None
         return float(np.mean(data))
 
+    def _compute_spot_point_height_nm(self, frame: np.ndarray, x: float, y: float) -> Optional[float]:
+        img = np.asarray(frame, dtype=np.float64)
+        if img.ndim != 2:
+            return None
+        h, w = img.shape
+        try:
+            xf = float(x)
+            yf = float(y)
+        except Exception:
+            return None
+        if not np.isfinite(xf) or not np.isfinite(yf):
+            return None
+        if xf < 0.0 or yf < 0.0 or xf > float(w - 1) or yf > float(h - 1):
+            return None
+
+        x0 = int(np.floor(xf))
+        y0 = int(np.floor(yf))
+        x1 = min(x0 + 1, w - 1)
+        y1 = min(y0 + 1, h - 1)
+        dx = float(xf - x0)
+        dy = float(yf - y0)
+
+        v00 = float(img[y0, x0])
+        v10 = float(img[y0, x1])
+        v01 = float(img[y1, x0])
+        v11 = float(img[y1, x1])
+        if not np.all(np.isfinite([v00, v10, v01, v11])):
+            return None
+
+        v0 = v00 * (1.0 - dx) + v10 * dx
+        v1 = v01 * (1.0 - dx) + v11 * dx
+        return float(v0 * (1.0 - dy) + v1 * dy)
+
+    def _selected_height_export_mode(self) -> str:
+        try:
+            text = str(self.height_export_mode_combo.currentText() or "").strip()
+        except Exception:
+            text = ""
+        if text == "Spot位置":
+            return "point"
+        return "mean"
+
     def _compute_background_median_nm(
         self,
         frame: np.ndarray,
@@ -4907,59 +5356,17 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         spots: Sequence[Dict[str, float]],
     ) -> float:
         """
-        背景=ROI内の画素から、spot半径r円を全て除外した残りの中央値。
-        画素が空になる場合はROI中央値→フレーム中央値へフォールバック。
+        背景=フレーム全体の中央値。
+
+        互換のため引数は残しているが、現在は ROI / spot 配置には依存しない。
         """
-        roi_info = self._get_roi_info_for_frame(frame_index)
-        h, w = frame.shape
-
-        if roi_info is None:
-            roi_x0, roi_y0, roi_w, roi_h = 0, 0, w, h
-            roi_mask = np.ones((h, w), dtype=bool)
-            roi_crop = frame
-            crop_x0, crop_y0 = 0, 0
-        else:
-            roi_x0 = int(round(float(roi_info.get("x0", 0.0))))
-            roi_y0 = int(round(float(roi_info.get("y0", 0.0))))
-            roi_w = int(round(float(roi_info.get("w", 0.0))))
-            roi_h = int(round(float(roi_info.get("h", 0.0))))
-            crop_x0 = max(0, roi_x0)
-            crop_y0 = max(0, roi_y0)
-            crop_x1 = min(w, roi_x0 + max(0, roi_w))
-            crop_y1 = min(h, roi_y0 + max(0, roi_h))
-            if crop_x1 <= crop_x0 or crop_y1 <= crop_y0:
-                return float(np.median(frame))
-            roi_crop = frame[crop_y0:crop_y1, crop_x0:crop_x1]
-            roi_mask = np.ones_like(roi_crop, dtype=bool)
-            if roi_info.get("shape") == "Ellipse":
-                cx = float(roi_info["cx"])
-                cy = float(roi_info["cy"])
-                rx = float(roi_info["rx"])
-                ry = float(roi_info["ry"])
-                yy, xx = np.mgrid[crop_y0:crop_y1, crop_x0:crop_x1]
-                roi_mask = ((xx - cx) ** 2) / (rx ** 2 + 1e-12) + ((yy - cy) ** 2) / (ry ** 2 + 1e-12) <= 1.0
-
-        # spot円の除外マスク（ROIクロップ座標）
-        exclude = np.zeros_like(roi_mask, dtype=bool)
-        if r_px > 0 and spots:
-            yy, xx = np.mgrid[0:roi_crop.shape[0], 0:roi_crop.shape[1]]
-            abs_x = xx + crop_x0
-            abs_y = yy + crop_y0
-            r2 = float(r_px) ** 2
-            for pk in spots:
-                sx = float(pk.get("x", 0.0))
-                sy = float(pk.get("y", 0.0))
-                exclude |= (abs_x - sx) ** 2 + (abs_y - sy) ** 2 <= r2
-
-        bg_mask = roi_mask & (~exclude)
-        data_bg = roi_crop[bg_mask]
-        if data_bg.size > 0:
-            return float(np.median(data_bg))
-        # fallback: ROI中央値
-        data_roi = roi_crop[roi_mask] if roi_mask is not None else roi_crop.ravel()
-        if data_roi.size > 0:
-            return float(np.median(data_roi))
-        return float(np.median(frame))
+        img = np.asarray(frame, dtype=np.float64)
+        if img.size == 0:
+            return 0.0
+        finite = img[np.isfinite(img)]
+        if finite.size == 0:
+            return 0.0
+        return float(np.median(finite))
 
     def _recompute_spot_heights_for_frame(self, frame_index: int, frame: Optional[np.ndarray] = None) -> None:
         spots = self.spots_by_frame.get(frame_index)
@@ -4971,12 +5378,52 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         r_px = self._get_spot_radius_px()
         bg_nm = self._compute_background_median_nm(use_frame, frame_index, r_px, spots)
         for pk in spots:
+            point_nm = self._compute_spot_point_height_nm(use_frame, float(pk["x"]), float(pk["y"]))
             mean_nm = self._compute_spot_circle_mean_nm(use_frame, float(pk["x"]), float(pk["y"]), r_px)
-            if mean_nm is None:
+            if point_nm is None and mean_nm is None:
                 continue
-            pk["height_mean_nm"] = float(mean_nm)
             pk["height_bg_nm"] = float(bg_nm)
-            pk["height_bgsub_nm"] = float(mean_nm - bg_nm)
+            if point_nm is not None:
+                pk["height_point_nm"] = float(point_nm)
+                pk["height_point_bgsub_nm"] = float(point_nm - bg_nm)
+            if mean_nm is not None:
+                pk["height_mean_nm"] = float(mean_nm)
+                pk["height_mean_bgsub_nm"] = float(mean_nm - bg_nm)
+
+            # Backward-compatible primary fields. Keep them aligned to the
+            # currently selected export mode so old consumers continue to work.
+            mode = self._selected_height_export_mode()
+            if mode == "point" and point_nm is not None:
+                pk["height_bgsub_nm"] = float(point_nm - bg_nm)
+            elif mean_nm is not None:
+                pk["height_bgsub_nm"] = float(mean_nm - bg_nm)
+            elif point_nm is not None:
+                pk["height_bgsub_nm"] = float(point_nm - bg_nm)
+
+    def _recompute_spot_heights_for_all_frames(self) -> None:
+        if not self.spots_by_frame:
+            return
+        if not self._ensure_selection_loaded():
+            return
+
+        original_index = int(getattr(gv, "index", 0))
+        try:
+            for frame_index in sorted(self.spots_by_frame.keys()):
+                spots = self.spots_by_frame.get(frame_index)
+                if not spots:
+                    continue
+                gv.index = int(frame_index)
+                frame = self._prepare_frame()
+                if frame is None:
+                    continue
+                self.last_frame = frame
+                self._recompute_spot_heights_for_frame(int(frame_index), frame=frame)
+        finally:
+            gv.index = original_index
+            frame = self._prepare_frame()
+            if frame is not None:
+                self.last_frame = frame
+            self._refresh_overlay()
 
     def _handle_edit_event(self, event, phase: str) -> None:
         if event.inaxes is None or event.xdata is None or event.ydata is None:
@@ -5007,6 +5454,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         if phase == "press":
             if is_shift:
                 spots.append({"x": float(event.xdata), "y": float(event.ydata), "snr": 0.0})
+                self._sync_centroid_reference_for_frame(frame_index, spots)
                 self.export_btn.setEnabled(True)
                 self._recompute_spot_heights_for_frame(frame_index)
                 self._refresh_overlay()
@@ -5015,6 +5463,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                 idx = self._find_nearest_spot(spots, event.xdata, event.ydata)
                 if idx is not None:
                     spots.pop(idx)
+                    self._sync_centroid_reference_for_frame(frame_index, spots)
                     self.export_btn.setEnabled(True)
                     self._recompute_spot_heights_for_frame(frame_index)
                     self._refresh_overlay()
@@ -5030,12 +5479,14 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             if self._dragging and self._drag_index is not None:
                 spots[self._drag_index]["x"] = float(event.xdata)
                 spots[self._drag_index]["y"] = float(event.ydata)
+                self._sync_centroid_reference_for_frame(frame_index, spots)
                 self._recompute_spot_heights_for_frame(frame_index)
                 self._refresh_overlay()
         elif phase == "release":
             if self._dragging:
                 self._dragging = False
                 self._drag_index = None
+                self._sync_centroid_reference_for_frame(frame_index, spots)
                 self.export_btn.setEnabled(True)
                 self._recompute_spot_heights_for_frame(frame_index)
 
@@ -5076,6 +5527,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             return
         original_index = int(getattr(gv, "index", 0))
         self.spots_by_frame = {}
+        self.centroid_reference_by_frame = {}
         self.initial_spots_by_frame = {}
         self._analysis_signature_by_frame = {}
         for idx in range(int(gv.FrameNum)):
@@ -5099,8 +5551,11 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                 )
             except Exception:
                 continue
+            self._relabel_result_peaks_by_previous_frame(idx, result)
             self.last_result = result
             self._store_spots_for_frame(idx, result, frame=frame)
+            if getattr(self, "auto_centroid_check", None) is not None and self.auto_centroid_check.isChecked():
+                self._apply_spot_centroid_to_frame(idx, frame=frame, result=result, show_messages=False, refresh_display=False)
             # 署名を記録（同じ条件の再解析をスキップ）
             try:
                 roi_info = self.roi_by_frame.get(idx, self.manual_roi)
@@ -5144,12 +5599,22 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             return
 
         self.last_frame = frame
+        self._relabel_result_peaks_by_previous_frame(self._get_current_frame_index(), result)
         self.last_result = result
+        frame_index = self._get_current_frame_index()
+        self._store_spots_for_frame(frame_index, result, frame=frame)
+        if getattr(self, "auto_centroid_check", None) is not None and self.auto_centroid_check.isChecked():
+            self._apply_spot_centroid_to_frame(
+                frame_index,
+                frame=frame,
+                result=result,
+                show_messages=False,
+                refresh_display=False,
+            )
         self._display_result(result)
-        self._store_spots_for_frame(self._get_current_frame_index(), result, frame=frame)
         # 署名を記録（同じ条件なら再解析をスキップできる）
         try:
-            fi = self._get_current_frame_index()
+            fi = frame_index
             self._analysis_signature_by_frame[fi] = self._analysis_signature(fi, self._current_roi_overlay())
         except Exception:
             pass
@@ -5165,6 +5630,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         if self.manual_roi is None:
             return
         if not self._apply_ui_to_analyzer(show_errors=False):
+            return
+        if self._should_skip_auto_analysis_for_frame(frame_index):
             return
 
         roi_info = self._current_roi_overlay()
@@ -5229,6 +5696,11 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         export_dir = os.path.dirname(selected_path)
         base_stub = os.path.splitext(os.path.basename(selected_path))[0] or base_name
         self.export_dir = export_dir
+        export_height_mode = self._selected_height_export_mode()
+
+        # Export always refreshes heights from the current spot positions so
+        # CSV-restored spot coordinates can be reused to regenerate heights.
+        self._recompute_spot_heights_for_all_frames()
 
         # save meta.json alongside CSVs
         try:
@@ -5285,23 +5757,40 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
                 # 高さCSV
                 with open(out_h_path, "w", encoding="utf-8") as f_h:
-                    f_h.write("frame_index,height_mean_nm,height_bg_nm,height_bgsub_nm\n")
+                    f_h.write(
+                        "frame_index,height_value_nm,height_bg_nm,height_bgsub_nm,height_mode,"
+                        "height_point_nm,height_point_bgsub_nm,height_mean_nm,height_mean_bgsub_nm\n"
+                    )
                     for frame_idx in sorted(self.spots_by_frame.keys()):
                         spots = self.spots_by_frame[frame_idx]
                         if spot_index >= len(spots):
                             continue
                         # 高さが未計算なら、現在のフレームデータで計算（可能な範囲で）
                         if (
-                            "height_mean_nm" not in spots[spot_index]
+                            "height_point_nm" not in spots[spot_index]
+                            or "height_mean_nm" not in spots[spot_index]
                             or "height_bgsub_nm" not in spots[spot_index]
                             or "height_bg_nm" not in spots[spot_index]
                         ):
                             if self.last_frame is not None and frame_idx == self._get_current_frame_index():
                                 self._recompute_spot_heights_for_frame(frame_idx, frame=self.last_frame)
+                        h_point = float(spots[spot_index].get("height_point_nm", float("nan")))
+                        h_point_bgsub = float(spots[spot_index].get("height_point_bgsub_nm", float("nan")))
                         h_mean = float(spots[spot_index].get("height_mean_nm", float("nan")))
+                        h_mean_bgsub = float(spots[spot_index].get("height_mean_bgsub_nm", float("nan")))
                         h_bg = float(spots[spot_index].get("height_bg_nm", float("nan")))
-                        h_bgsub = float(spots[spot_index].get("height_bgsub_nm", float("nan")))
-                        f_h.write(f"{frame_idx},{h_mean:.6f},{h_bg:.6f},{h_bgsub:.6f}\n")
+                        if export_height_mode == "point":
+                            h_value = h_point
+                            h_bgsub = h_point_bgsub
+                            h_mode = "point"
+                        else:
+                            h_value = h_mean
+                            h_bgsub = h_mean_bgsub
+                            h_mode = "mean"
+                        f_h.write(
+                            f"{frame_idx},{h_value:.6f},{h_bg:.6f},{h_bgsub:.6f},{h_mode},"
+                            f"{h_point:.6f},{h_point_bgsub:.6f},{h_mean:.6f},{h_mean_bgsub:.6f}\n"
+                        )
             except Exception:
                 continue
 
@@ -5380,6 +5869,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             "localmax_threshold_snr": _try_get(lambda: float(self.localmax_snr_spin.value()), 0.0),
             "precheck_radius_px": _try_get(lambda: int(self.precheck_radius_spin.value()), 2),
             "precheck_kmad": _try_get(lambda: float(self.precheck_kmad_spin.value()), 1.0),
+            "fit_enabled": _try_get(lambda: bool(self.fit_enabled_check.isChecked()), True),
+            "auto_centroid": _try_get(lambda: bool(self.auto_centroid_check.isChecked()), False),
             "initial_sigma": _try_get(lambda: float(self.initial_sigma_spin.value()), 2.0),
             "sigma_min": _try_get(lambda: float(self.sigma_min_spin.value()), 0.6),
             "sigma_max": _try_get(lambda: float(self.sigma_max_spin.value()), 8.0),
@@ -5389,7 +5880,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             "snap_enabled": _try_get(lambda: bool(self.snap_enabled_check.isChecked()), False),
             "snap_radius": _try_get(lambda: int(self.snap_radius_spin.value()), 2),
             "snap_refit_enabled": _try_get(lambda: bool(self.snap_refit_check.isChecked()), False),
-            "refit_max_shift_px": _try_get(lambda: int(self.refit_shift_spin.value()), 3),
+            "height_export_mode": _try_get(self._selected_height_export_mode, "mean"),
         }
 
     def _apply_ui_params(self, params: Dict[str, object]) -> None:
@@ -5427,6 +5918,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             getattr(self, "localmax_snr_spin", None),
             getattr(self, "precheck_radius_spin", None),
             getattr(self, "precheck_kmad_spin", None),
+            getattr(self, "fit_enabled_check", None),
+            getattr(self, "auto_centroid_check", None),
             getattr(self, "initial_sigma_spin", None),
             getattr(self, "sigma_min_spin", None),
             getattr(self, "sigma_max_spin", None),
@@ -5436,7 +5929,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             getattr(self, "snap_enabled_check", None),
             getattr(self, "snap_radius_spin", None),
             getattr(self, "snap_refit_check", None),
-            getattr(self, "refit_shift_spin", None),
+            getattr(self, "height_export_mode_combo", None),
         ):
             try:
                 if w is not None:
@@ -5518,6 +6011,10 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                 self.precheck_radius_spin.setValue(int(params["precheck_radius_px"]))
             if "precheck_kmad" in params:
                 self.precheck_kmad_spin.setValue(float(params["precheck_kmad"]))
+            if "fit_enabled" in params:
+                self.fit_enabled_check.setChecked(bool(params["fit_enabled"]))
+            if "auto_centroid" in params:
+                self.auto_centroid_check.setChecked(bool(params["auto_centroid"]))
             if "initial_sigma" in params:
                 self.initial_sigma_spin.setValue(float(params["initial_sigma"]))
             if "sigma_min" in params:
@@ -5536,13 +6033,18 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                 self.snap_radius_spin.setValue(int(params["snap_radius"]))
             if "snap_refit_enabled" in params:
                 self.snap_refit_check.setChecked(bool(params["snap_refit_enabled"]))
-            if "refit_max_shift_px" in params:
-                self.refit_shift_spin.setValue(int(params["refit_max_shift_px"]))
+            if "height_export_mode" in params:
+                mode = str(params["height_export_mode"]).strip().lower()
+                if mode == "point":
+                    self.height_export_mode_combo.setCurrentText("Spot位置")
+                else:
+                    self.height_export_mode_combo.setCurrentText("Spot径内平均")
         finally:
             blockers.clear()
 
         self._update_detection_ui_enabled()
         self._update_init_mode_ui_enabled()
+        self._update_fit_ui_enabled()
 
     def import_csv_restore(self) -> None:
         """
@@ -5594,6 +6096,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
         # restore in-memory state (display)
         self.spots_by_frame = restored
+        self.centroid_reference_by_frame = {int(fi): [dict(pk) for pk in spots] for fi, spots in restored.items()}
+        self.preserve_existing_spots_on_auto = True
         self.export_btn.setEnabled(True)
         self.export_dir = export_dir
 
@@ -5658,6 +6162,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         """
         Load <base>_pN.csv and optionally <base>_pN_h.csv.
         Returns frame_index -> list of spot dicts (absolute px).
+        The restored list order is guaranteed to follow file labels:
+        p1 -> index 0, p2 -> index 1, ...
         """
         # Choose best candidate per pN: prefer no suffix, then lowest suffix
         pos_paths = glob.glob(os.path.join(export_dir, f"{base_stub}_p*.csv"))
@@ -5678,9 +6184,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
         best_pos_by_p: Dict[int, str] = {p: sorted(lst, key=lambda t: t[0])[0][1] for p, lst in by_p.items()}
 
-        seed: Dict[int, List[Dict[str, float]]] = {}
+        seed_by_frame_and_p: Dict[int, Dict[int, Dict[str, float]]] = {}
         for p_idx, pos_path in best_pos_by_p.items():
-            frame_to_spot_idx: Dict[int, int] = {}
             try:
                 with open(pos_path, "r", encoding="utf-8") as f:
                     reader = csv.DictReader(f)
@@ -5695,9 +6200,12 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                             continue
                         x_px = x_nm / float(nm_per_pixel_x)
                         y_px = y_nm / float(nm_per_pixel_y)
-                        lst = seed.setdefault(frame_i, [])
-                        lst.append({"x": float(x_px), "y": float(y_px), "snr": 0.0})
-                        frame_to_spot_idx[frame_i] = len(lst) - 1
+                        frame_map = seed_by_frame_and_p.setdefault(frame_i, {})
+                        frame_map[int(p_idx)] = {
+                            "x": float(x_px),
+                            "y": float(y_px),
+                            "snr": 0.0,
+                        }
             except Exception:
                 continue
 
@@ -5724,26 +6232,56 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                                 frame_i = int(float(row.get("frame_index", "nan")))
                             except Exception:
                                 continue
-                            # find the p_idx-th spot in this frame if exists
-                            spots = seed.get(frame_i)
-                            if not spots:
+                            frame_map = seed_by_frame_and_p.get(frame_i)
+                            if not frame_map:
                                 continue
-                            spot_pos = frame_to_spot_idx.get(frame_i)
-                            if spot_pos is None:
+                            spot = frame_map.get(int(p_idx))
+                            if spot is None:
                                 continue
                             try:
+                                h_value = float(row.get("height_value_nm", "nan"))
+                                h_mode = str(row.get("height_mode", "") or "").strip().lower()
+                                h_point = float(row.get("height_point_nm", "nan"))
+                                h_point_bgsub = float(row.get("height_point_bgsub_nm", "nan"))
                                 h_mean = float(row.get("height_mean_nm", "nan"))
+                                h_mean_bgsub = float(row.get("height_mean_bgsub_nm", "nan"))
                                 h_bg = float(row.get("height_bg_nm", "nan"))
                                 h_bgsub = float(row.get("height_bgsub_nm", "nan"))
                             except Exception:
                                 continue
-                            spots[spot_pos]["height_mean_nm"] = h_mean
-                            spots[spot_pos]["height_bg_nm"] = h_bg
-                            spots[spot_pos]["height_bgsub_nm"] = h_bgsub
+                            if not np.isfinite(h_point) and h_mode == "point" and np.isfinite(h_value):
+                                h_point = h_value
+                            if not np.isfinite(h_point_bgsub) and h_mode == "point" and np.isfinite(h_bgsub):
+                                h_point_bgsub = h_bgsub
+                            if not np.isfinite(h_mean) and (h_mode == "mean" or not h_mode) and np.isfinite(h_value):
+                                h_mean = h_value
+                            if not np.isfinite(h_mean_bgsub) and (h_mode == "mean" or not h_mode) and np.isfinite(h_bgsub):
+                                h_mean_bgsub = h_bgsub
+                            if not np.isfinite(h_mean) and np.isfinite(h_value) and not np.isfinite(h_point):
+                                # backward-compatible fallback for legacy files
+                                h_mean = h_value
+                            if not np.isfinite(h_mean_bgsub) and np.isfinite(h_bgsub) and not np.isfinite(h_point_bgsub):
+                                h_mean_bgsub = h_bgsub
+                            if not np.isfinite(h_bgsub):
+                                if h_mode == "point" and np.isfinite(h_point_bgsub):
+                                    h_bgsub = h_point_bgsub
+                                elif np.isfinite(h_mean_bgsub):
+                                    h_bgsub = h_mean_bgsub
+                            spot["height_mean_nm"] = h_mean
+                            spot["height_mean_bgsub_nm"] = h_mean_bgsub
+                            spot["height_point_nm"] = h_point
+                            spot["height_point_bgsub_nm"] = h_point_bgsub
+                            spot["height_bg_nm"] = h_bg
+                            spot["height_bgsub_nm"] = h_bgsub
                 except Exception:
                     pass
 
-        return seed
+        restored: Dict[int, List[Dict[str, float]]] = {}
+        for frame_i, frame_map in seed_by_frame_and_p.items():
+            ordered = [frame_map[p] for p in sorted(frame_map.keys())]
+            if ordered:
+                restored[int(frame_i)] = ordered
+        return restored
     # --- helper ---
     def _ensure_live_window(self, win, cls):
         """Qt側で破棄された場合に再生成する"""
