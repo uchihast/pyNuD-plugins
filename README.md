@@ -32,6 +32,17 @@ These URLs always point to the latest GitHub Release assets.
 - [LAFMAnalysis.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/LAFMAnalysis.py)  
   Localizes intensity peaks in time-series AFM data and reconstructs super-resolution images.
 
+### Particle / Peak Analysis
+
+- [particle_cluster_analysis.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/particle_cluster_analysis.py)  
+  Detects particles and analyzes g(r), order parameters, clustering, ellipse fitting, and result save/load.
+- [ParticleAnalysis.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/ParticleAnalysis.py)  
+  Detects particles in AFM images and analyzes size, height, distributions, and summary statistics.
+- [ParticleTracking.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/ParticleTracking.py)  
+  Detects and tracks particles in time-series AFM data, including trajectories, velocity, and MSD analysis.
+- [SpotAnalysis.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/SpotAnalysis.py)  
+  Selects 2/3-peak 2D Gaussian mixture fits using AIC/BIC and evaluates spot counts and S/N.
+
 ## Raw Main Links
 
 For development snapshots, use:
