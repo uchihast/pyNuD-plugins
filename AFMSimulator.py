@@ -1900,7 +1900,7 @@ class HelpWindow(QWidget):
         self.setWindowTitle(self.content_manager.get_ui_text('window_title'))
         self.resize(800, 600)
         self.setupUI()
-        self.switch_language('ja') # デフォルトを日本語に
+        self.switch_language('en')  # Default: English
 
     def setupUI(self):
         layout = QVBoxLayout(self)

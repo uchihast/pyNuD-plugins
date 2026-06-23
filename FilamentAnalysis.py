@@ -2817,24 +2817,54 @@ class ContourLengthWindow(QtWidgets.QWidget):
 
     def _show_plugin_help(self) -> None:
         dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle(self._tr("Filament Analysis Help"))
+        dialog.setWindowTitle("Filament Analysis Help")
         dialog.resize(720, 560)
         layout = QtWidgets.QVBoxLayout(dialog)
+
+        lang_row = QtWidgets.QHBoxLayout()
+        lang_row.addWidget(QtWidgets.QLabel("Language / 言語:"))
+        btn_ja = QtWidgets.QPushButton("日本語", dialog)
+        btn_en = QtWidgets.QPushButton("English", dialog)
+        btn_ja.setCheckable(True)
+        btn_en.setCheckable(True)
+        lang_group = QtWidgets.QButtonGroup(dialog)
+        lang_group.addButton(btn_ja)
+        lang_group.addButton(btn_en)
+        lang_group.setExclusive(True)
+        selected_style = "QPushButton { background-color: #007aff; color: white; font-weight: bold; }"
+        normal_style = "QPushButton { background-color: #e5e5e5; color: black; }"
+        lang_row.addWidget(btn_ja)
+        lang_row.addWidget(btn_en)
+        lang_row.addStretch(1)
+        layout.addLayout(lang_row)
 
         text = QtWidgets.QPlainTextEdit()
         text.setReadOnly(True)
         text.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
-        text.setPlainText(self._plugin_help_text())
         layout.addWidget(text, 1)
 
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
         buttons.rejected.connect(dialog.reject)
         buttons.accepted.connect(dialog.accept)
         layout.addWidget(buttons)
+
+        def set_lang(lang: str) -> None:
+            use_ja = lang == UI_LANG_JA
+            btn_ja.setChecked(use_ja)
+            btn_en.setChecked(not use_ja)
+            btn_ja.setStyleSheet(selected_style if use_ja else normal_style)
+            btn_en.setStyleSheet(selected_style if not use_ja else normal_style)
+            dialog.setWindowTitle("Filament Analysisヘルプ" if use_ja else "Filament Analysis Help")
+            text.setPlainText(self._plugin_help_text(lang))
+
+        btn_ja.clicked.connect(lambda: set_lang(UI_LANG_JA))
+        btn_en.clicked.connect(lambda: set_lang(UI_LANG_EN))
+        set_lang(UI_LANG_EN)
         dialog.exec_()
 
-    def _plugin_help_text(self) -> str:
-        if self._ui_language == UI_LANG_EN:
+    def _plugin_help_text(self, lang: Optional[str] = None) -> str:
+        active_lang = lang if lang in (UI_LANG_JA, UI_LANG_EN) else self._ui_language
+        if active_lang == UI_LANG_EN:
             return (
                 "Filament Analysis Help\n"
                 "\n"

@@ -1,9 +1,10 @@
 """
 SpotAnalysis
 ------------
-スタンドアロンの輝点数判定モジュール。各フレームに対し、2 つまたは 3 つの
-2D ガウス関数の和をフィットし、AIC/BIC でモデル選択する。バンドパス前処理と
-重心追跡を行い、3 つ目のピークの S/N を自動評価する。
+Standalone spot-count analysis module. For each frame, the module fits a
+sum of 2D Gaussian functions with 2 or 3 peaks, selects the model by AIC/BIC,
+applies band-pass preprocessing and centroid tracking, and automatically
+evaluates the S/N of the third peak.
 """
 
 from __future__ import annotations
@@ -34,8 +35,442 @@ from fileio import LoadFrame, InitializeAryDataFallback
 
 logger = logging.getLogger(__name__)
 
-# プラグイン表示名（Pluginメニューに表示される名前）
+# Plugin display name shown in the Plugin menu
 PLUGIN_NAME = "Spot Analysis"
+
+
+HELP_CSS = """
+<style>
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+  font-size: 13px;
+  line-height: 1.55;
+  color: #20242a;
+}
+h2 {
+  font-size: 18px;
+  margin: 0 0 10px 0;
+}
+h3 {
+  font-size: 15px;
+  margin: 16px 0 6px 0;
+}
+p {
+  margin: 6px 0 10px 0;
+}
+ol, ul {
+  margin-top: 6px;
+  margin-bottom: 10px;
+  padding-left: 24px;
+}
+li {
+  margin: 5px 0;
+}
+table {
+  border-collapse: collapse;
+  margin: 8px 0 12px 0;
+  width: 100%;
+}
+th, td {
+  border: 1px solid #d8dde6;
+  padding: 6px 8px;
+  vertical-align: top;
+}
+th {
+  background: #eef2f7;
+}
+.note {
+  background: #fff7df;
+  border: 1px solid #efd37a;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 10px 0;
+}
+.good {
+  background: #eaf7ef;
+  border: 1px solid #9ed3ad;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 10px 0;
+}
+.term {
+  font-weight: 600;
+  color: #111827;
+}
+code {
+  background: #f0f2f5;
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+</style>
+"""
+
+
+HELP_TABS_EN = [
+    (
+        "Quick Start",
+        """
+        <h2>Recommended first workflow</h2>
+        <ol>
+          <li>Open AFM image data in pyNuD and show the file/frame you want to analyze.</li>
+          <li>Open <span class="term">Spot Analysis</span>. The full-image overlay window opens together with the control panel.</li>
+          <li>In the upper AFM image of the overlay window, drag the area where spots should be searched to create an ROI.</li>
+          <li>Click <span class="term">Run Analysis</span> to detect spots and select the Gaussian peak model for the current frame.</li>
+          <li>If needed, adjust <span class="term">Detection</span>, <span class="term">Initialization</span>, and <span class="term">Result Filters</span>.</li>
+          <li>For a frame series, enable the <span class="term">Run All Frames</span> checkbox, then click the <span class="term">Run All Frames</span> button.</li>
+          <li>After checking the result, use <span class="term">Export CSV</span> to save spot coordinates, heights, S/N values, and related metadata.</li>
+        </ol>
+        <div class="note">
+          <b>Core idea:</b><br>
+          The ROI is the search area. Detection creates initial spot candidates.
+          Fitting refines those candidates with Gaussian models. The final peak count is selected by AIC or BIC within the requested peak range.
+        </div>
+        """,
+    ),
+    (
+        "Views",
+        """
+        <h2>What each view shows</h2>
+        <table>
+          <tr><th>Area</th><th>Purpose</th><th>What to check</th></tr>
+          <tr>
+            <td><span class="term">Spot Analysis</span> control panel</td>
+            <td>Sets ROI shape, detection, initialization, Gaussian fitting, result filters, display, and CSV output.</td>
+            <td>Work from ROI / Basic through Preprocessing, Detection, Initialization, Fit, Result Filters, and Display / Recording.</td>
+          </tr>
+          <tr>
+            <td>Full overlay window, upper image</td>
+            <td>Shows the full AFM image, ROI outline, and final spot positions.</td>
+            <td>Check whether the ROI covers the intended area and whether final spots sit on real bright features.</td>
+          </tr>
+          <tr>
+            <td>Lower-left ROI image</td>
+            <td>Shows the preprocessed ROI image.</td>
+            <td>Check whether median/open preprocessing removed noise without removing the real spots.</td>
+          </tr>
+          <tr>
+            <td>Lower-right detection image</td>
+            <td>Shows the LoG/DoG detection image or the selected detection image.</td>
+            <td>Check whether seed candidates align with bright spots and whether noise is being over-detected.</td>
+          </tr>
+          <tr>
+            <td>Result text</td>
+            <td>Reports selected peak count, AIC/BIC, S/N values, and spot coordinates.</td>
+            <td>Check whether the peak count and S/N values are reasonable and whether any filters removed candidates.</td>
+          </tr>
+        </table>
+        <div class="good">
+          When a result looks wrong, compare the final positions in the upper view with the detection image below.
+          This separates detection problems from fitting or filtering problems.
+        </div>
+        """,
+    ),
+    (
+        "ROI and Frames",
+        """
+        <h2>ROI, frame navigation, and batch analysis</h2>
+        <h3>Creating an ROI</h3>
+        <ul>
+          <li>Select Rectangle or Ellipse (Circle) in <span class="term">ROI Shape</span>.</li>
+          <li>Drag on the upper AFM image in the full overlay window to save an ROI for the current frame.</li>
+          <li><span class="term">ROI Margin</span> excludes peaks near the ROI boundary. Use it when edge peaks are unstable.</li>
+        </ul>
+        <h3>Frame navigation</h3>
+        <ul>
+          <li>Use <span class="term">◀</span> / <span class="term">▶</span> to move to the previous or next frame.</li>
+          <li>When <span class="term">Auto Analyze on Frame Change</span> is enabled, frames with an ROI are analyzed automatically.</li>
+          <li>If a later frame has no ROI, the most recent earlier ROI is propagated.</li>
+        </ul>
+        <h3>All-frame analysis</h3>
+        <ul>
+          <li>The <span class="term">Run All Frames</span> button is enabled only when its checkbox is turned on.</li>
+          <li>Before running all frames, validate ROI, detection, and filters on representative frames.</li>
+          <li>If you manually edited spots, avoid unintended reanalysis before exporting the CSV.</li>
+        </ul>
+        """,
+    ),
+    (
+        "Detection and Fit",
+        """
+        <h2>How to tune parameters</h2>
+        <table>
+          <tr><th>Panel</th><th>Purpose</th><th>Practical tuning</th></tr>
+          <tr>
+            <td>Preprocessing</td>
+            <td>Reduces noise or small protrusions inside the ROI.</td>
+            <td><span class="term">Median</span> helps point noise. <span class="term">Open</span> removes small structures.</td>
+          </tr>
+          <tr>
+            <td>Detection</td>
+            <td>Chooses the image used to create seed candidates.</td>
+            <td>Start with <span class="term">LoG</span>, then tune sigma to the expected spot size.</td>
+          </tr>
+          <tr>
+            <td>Initialization</td>
+            <td>Creates initial peak positions for Gaussian fitting.</td>
+            <td><span class="term">Watershed</span> is robust for complex images, <span class="term">Blob DoH</span> is good for round spots, and <span class="term">Peak</span> is simple local-maximum detection.</td>
+          </tr>
+          <tr>
+            <td>Fit</td>
+            <td>Refines candidate positions with Gaussian models.</td>
+            <td>If fitting is unstable, tune <span class="term">Initial Sigma</span> and sigma lower/upper bounds to the spot diameter.</td>
+          </tr>
+          <tr>
+            <td>Result Filters</td>
+            <td>Removes low-S/N, weak, boundary, or spatial outlier peaks.</td>
+            <td>Raising <span class="term">S/N Threshold</span>, <span class="term">precheck</span>, or <span class="term">Min Amplitude</span> makes filtering stricter.</td>
+          </tr>
+        </table>
+        <div class="note">
+          AIC tends to accept additional peaks more easily. BIC is more conservative.
+          If noise is selected as a third peak, check BIC, S/N Threshold, and precheck settings.
+        </div>
+        """,
+    ),
+    (
+        "Editing and CSV",
+        """
+        <h2>Manual editing, centroid correction, and CSV</h2>
+        <h3>Spot editing</h3>
+        <ul>
+          <li><span class="term">Ctrl/Cmd + drag</span>: move an existing spot.</li>
+          <li><span class="term">Shift + click</span>: add a spot.</li>
+          <li><span class="term">Alt(Option) + click</span>: delete a spot.</li>
+        </ul>
+        <h3>Move spots to the spot-radius centroid</h3>
+        <ul>
+          <li><span class="term">Spot Radius</span> controls both the display circle and the circular area used for mean height.</li>
+          <li><span class="term">Move Spots to Radius Centroid</span> moves spots in the current frame to the intensity centroid inside each spot-radius circle.</li>
+          <li>Enable <span class="term">Auto Apply</span> to apply this centroid correction immediately after analysis.</li>
+        </ul>
+        <h3>CSV</h3>
+        <ul>
+          <li><span class="term">Height Value</span> selects whether the primary CSV height is the spot-position height or the spot-radius mean.</li>
+          <li><span class="term">Export CSV</span> saves per-frame spot coordinates, peak heights, S/N values, and related metadata.</li>
+          <li><span class="term">Load CSV -> Restore</span> restores ROI and in-progress spot display state from saved CSV files.</li>
+        </ul>
+        """,
+    ),
+    (
+        "Troubleshooting",
+        """
+        <h2>Common issues</h2>
+        <table>
+          <tr><th>Symptom</th><th>What to check</th></tr>
+          <tr>
+            <td>Run Analysis is disabled</td>
+            <td>Make sure a file is selected and an ROI exists for the current frame.</td>
+          </tr>
+          <tr>
+            <td>Cannot draw an ROI</td>
+            <td>Check that the full overlay window is open and drag on the upper AFM image with the left mouse button.</td>
+          </tr>
+          <tr>
+            <td>Too many spots are detected</td>
+            <td>Try BIC, raise S/N Threshold, raise precheck K(MAD), increase peak spacing, or increase detection sigma.</td>
+          </tr>
+          <tr>
+            <td>Real spots are missed</td>
+            <td>Lower S/N Threshold or precheck, tune LoG sigma to the spot size, and check whether Median/Open is too strong.</td>
+          </tr>
+          <tr>
+            <td>Fitted positions drift away</td>
+            <td>Tune Initial Sigma and sigma bounds, disable fitting to use seed positions only, or correct spots manually.</td>
+          </tr>
+          <tr>
+            <td>Restored CSV results change unexpectedly</td>
+            <td>Check whether auto analysis or parameter changes re-ran analysis and overwrote restored spots.</td>
+          </tr>
+        </table>
+        <div class="good">
+          Start by tuning one representative frame, then apply the validated settings to all frames.
+        </div>
+        """,
+    ),
+]
+
+HELP_TABS_JA = [
+    (
+        "最短手順",
+        """
+        <h2>まずはこの順番で解析する</h2>
+        <ol>
+          <li>pyNuD本体でAFM画像を開き、解析したいファイルとフレームを表示します。</li>
+          <li><span class="term">Spot Analysis</span> を開くと、全画像表示ウィンドウも開きます。</li>
+          <li>全画像表示ウィンドウの上段AFM画像で、スポットを探したい範囲をドラッグしてROIを作ります。</li>
+          <li><span class="term">Run Analysis</span> を押して、現在フレームのスポット検出とガウスモデル判定を行います。</li>
+          <li>結果を見て、必要なら <span class="term">Detection</span>、<span class="term">Initialization</span>、<span class="term">Result Filters</span> を調整します。</li>
+          <li>複数フレームに適用する場合は <span class="term">Run All Frames</span> をONにしてから、<span class="term">Run All Frames</span> ボタンを押します。</li>
+          <li>確認後、<span class="term">Export CSV</span> でスポット座標・高さ・S/Nなどを保存します。</li>
+        </ol>
+        <div class="note">
+          <b>基本の考え方:</b><br>
+          ROIは「探す範囲」、検出は「初期候補を見つける方法」、フィットは「候補をガウスモデルで最適化する工程」です。
+          最終的なピーク数は、指定したピーク数範囲の中からAIC/BICで選ばれます。
+        </div>
+        """,
+    ),
+    (
+        "画面の見方",
+        """
+        <h2>ウィンドウと表示の役割</h2>
+        <table>
+          <tr><th>場所</th><th>役割</th><th>確認すること</th></tr>
+          <tr>
+            <td><span class="term">Spot Analysis</span> 操作パネル</td>
+            <td>ROI形状、検出方法、初期候補、ガウスフィット、結果フィルタ、CSV出力を設定します。</td>
+            <td>ROI / Basic、Preprocessing、Detection、Initialization、Fit、Result Filters、Display / Recordingを順に調整します。</td>
+          </tr>
+          <tr>
+            <td>全画像表示ウィンドウ上段</td>
+            <td>AFM全体画像とROI、最終スポット位置を表示します。</td>
+            <td>ROIが目的の範囲を囲んでいるか、スポットが実際の輝点に乗っているか確認します。</td>
+          </tr>
+          <tr>
+            <td>下段左のROI画像</td>
+            <td>前処理後のROI画像です。</td>
+            <td>median/open後に、解析したいスポットが消えていないか確認します。</td>
+          </tr>
+          <tr>
+            <td>下段右の検出画像</td>
+            <td>LoG/DoGなど検出用画像です。</td>
+            <td>初期候補が輝点に対応しているか、ノイズを拾いすぎていないか確認します。</td>
+          </tr>
+          <tr>
+            <td>結果テキスト</td>
+            <td>採用ピーク数、AIC/BIC、S/N、ピーク座標などを表示します。</td>
+            <td>ピーク数とS/Nが妥当か、除外された理由がないか確認します。</td>
+          </tr>
+        </table>
+        <div class="good">
+          迷ったら、全画像表示の上段で最終位置、下段で検出画像を見比べてください。
+          「検出が悪い」のか「フィット後にずれている」のかを分けて判断できます。
+        </div>
+        """,
+    ),
+    (
+        "ROIと解析",
+        """
+        <h2>ROI、フレーム移動、全フレーム解析</h2>
+        <h3>ROIの作り方</h3>
+        <ul>
+          <li><span class="term">ROI Shape</span> で Rectangle または Ellipse (Circle) を選びます。</li>
+          <li>全画像表示ウィンドウの上段AFM画像をドラッグすると、ROIが現在フレームに保存されます。</li>
+          <li><span class="term">ROI Margin</span> は、ROI境界近くのピークを除外する距離です。境界で不安定なピークを避けたい時に使います。</li>
+        </ul>
+        <h3>フレーム移動</h3>
+        <ul>
+          <li><span class="term">◀</span> / <span class="term">▶</span> で前後フレームへ移動します。</li>
+          <li><span class="term">Auto Analyze on Frame Change</span> がONの場合、ROIがあるフレームでは自動的に解析します。</li>
+          <li>ROIがないフレームでは、直近過去フレームのROIを引き継ぎます。</li>
+        </ul>
+        <h3>全フレーム解析</h3>
+        <ul>
+          <li>誤操作防止のため、チェックボックスの <span class="term">Run All Frames</span> をONにした時だけボタンが有効になります。</li>
+          <li>全フレームに同じ設定を適用する前に、代表フレームでROI、検出、フィルタを確認してください。</li>
+          <li>解析結果を手動修正している場合、CSV保存前に意図せず再解析で上書きしないよう注意してください。</li>
+        </ul>
+        """,
+    ),
+    (
+        "検出とフィット",
+        """
+        <h2>パラメータ調整の考え方</h2>
+        <table>
+          <tr><th>パネル</th><th>主な目的</th><th>調整の目安</th></tr>
+          <tr>
+            <td>Preprocessing</td>
+            <td>ROI内のノイズや小さな突起を抑えます。</td>
+            <td><span class="term">Median</span> は点ノイズに有効です。<span class="term">Open</span> は小さな構造を削ります。</td>
+          </tr>
+          <tr>
+            <td>Detection</td>
+            <td>ピーク候補を作る画像を決めます。</td>
+            <td>通常は <span class="term">LoG</span> から始めます。スポットサイズに合わせてσを変えます。</td>
+          </tr>
+          <tr>
+            <td>Initialization</td>
+            <td>ガウスフィットへ渡す初期ピーク位置を作ります。</td>
+            <td><span class="term">Watershed</span> は複雑な画像向け、<span class="term">Blob DoH</span> は円形スポット向け、<span class="term">Peak</span> は単純な局所最大です。</td>
+          </tr>
+          <tr>
+            <td>Fit</td>
+            <td>候補位置をガウスモデルで最適化します。</td>
+            <td>フィットが不安定なら、<span class="term">Initial Sigma</span> とσ下限/上限をスポット径に合わせます。</td>
+          </tr>
+          <tr>
+            <td>Result Filters</td>
+            <td>低S/N、弱いピーク、境界近く、外れ値を除外します。</td>
+            <td><span class="term">S/N Threshold</span>、<span class="term">precheck</span>、<span class="term">Min Amplitude</span> を上げると厳しくなります。</td>
+          </tr>
+        </table>
+        <div class="note">
+          AICはピーク数を増やしやすく、BICはより保守的です。
+          ノイズを3つ目のピークとして拾う場合は、BIC、S/N Threshold、precheckを見直してください。
+        </div>
+        """,
+    ),
+    (
+        "手動編集とCSV",
+        """
+        <h2>手動修正、重心補正、CSV保存</h2>
+        <h3>Spot編集</h3>
+        <ul>
+          <li><span class="term">Ctrl/Cmd + ドラッグ</span>: 既存スポットを移動します。</li>
+          <li><span class="term">Shift + クリック</span>: スポットを追加します。</li>
+          <li><span class="term">Alt(Option) + クリック</span>: スポットを削除します。</li>
+        </ul>
+        <h3>Spot径の重心へ移動</h3>
+        <ul>
+          <li><span class="term">Spot Radius</span> は、表示円の大きさと、円内平均高さの計算範囲に使われます。</li>
+          <li><span class="term">Move Spots to Radius Centroid</span> は、現在フレームの各スポットを円内の強度重心へ移動します。</li>
+          <li><span class="term">Auto Apply</span> をONにすると、解析後に重心補正を自動で行います。</li>
+        </ul>
+        <h3>CSV</h3>
+        <ul>
+          <li><span class="term">Height Value</span> で、CSVの主高さをSpot位置またはSpot径内平均から選びます。</li>
+          <li><span class="term">Export CSV</span> は、フレームごとのスポット座標、ピーク高さ、S/Nなどを保存します。</li>
+          <li><span class="term">Load CSV -> Restore</span> は、保存済みCSVからROIやスポット表示状態を復元します。</li>
+        </ul>
+        """,
+    ),
+    (
+        "困ったとき",
+        """
+        <h2>よくあるトラブル</h2>
+        <table>
+          <tr><th>症状</th><th>確認すること</th></tr>
+          <tr>
+            <td>Run Analysisを実行できない</td>
+            <td>ファイルが選択され、現在フレームにROIが作られているか確認してください。</td>
+          </tr>
+          <tr>
+            <td>ROIを描けない</td>
+            <td>全画像表示ウィンドウが開いているか、上段AFM画像上で左ドラッグしているか確認してください。</td>
+          </tr>
+          <tr>
+            <td>スポット数が多すぎる</td>
+            <td>BICに変更する、S/N Thresholdを上げる、precheck K(MAD)を上げる、ピーク間隔を広げる、検出σを大きくする、の順で確認します。</td>
+          </tr>
+          <tr>
+            <td>スポットを拾わない</td>
+            <td>S/N Thresholdやprecheckを下げる、LoG σをスポット径に合わせる、Median/Openが強すぎないか確認します。</td>
+          </tr>
+          <tr>
+            <td>フィット後に位置がずれる</td>
+            <td>Initial Sigmaとσ範囲を見直し、必要ならフィットをOFFにして初期位置だけを使うか、手動編集で補正します。</td>
+          </tr>
+          <tr>
+            <td>CSV復元後に結果が変わる</td>
+            <td>自動解析やパラメータ変更による再解析で上書きされていないか確認してください。</td>
+          </tr>
+        </table>
+        <div class="good">
+          まず代表フレーム1枚でROIと検出条件を固めてから、全フレーム解析へ進むと調整が速くなります。
+        </div>
+        """,
+    ),
+]
 
 
 @dataclass
@@ -68,17 +503,18 @@ class FrameAnalysis:
     noise_sigma: float
     snr_threshold: float
     models: Dict[int, ModelSelectionResult]
-    roi: np.ndarray  # 可視化用のROI画像
-    origin: Tuple[int, int]  # 元画像内でのROI起点 (x0, y0)
-    roi_mask: Optional[np.ndarray] = None  # ROI内マスク（楕円など）
-    seed_spots: Optional[List[Dict[str, float]]] = None  # 検出段階のシード点（絶対座標）。表示用。
+    roi: np.ndarray  # ROI image for visualization
+    origin: Tuple[int, int]  # ROI origin in the source image (x0, y0)
+    roi_mask: Optional[np.ndarray] = None  # ROI mask such as ellipse mask
+    seed_spots: Optional[List[Dict[str, float]]] = None  # Seed points from detection stage in absolute coordinates, used for display.
 
 
 class SpotAnalysis:
     """
-    2 つ / 3 つガウスモデルの AIC/BIC 比較と S/N 評価を行うクラス。
+    Class for AIC/BIC comparison between 2- and 3-Gaussian models and
+    S/N evaluation.
 
-    使い方例:
+    Example:
         sa = SpotAnalysis(roi_size=48, snr_threshold=2.0)
         result = sa.analyze_frame(frame)  # frame: 2D numpy array
         print(result.best_n_peaks, result.models[2].aic, result.models[3].aic)
@@ -177,10 +613,10 @@ class SpotAnalysis:
     def detection_label(self) -> str:
         mode = (self.detection_mode or "dog").lower()
         if mode == "log":
-            return f"LoG (σ={self.log_sigma:g})"
+            return f"LoG (sigma={self.log_sigma:g})"
         if mode in ("pre", "preprocessed"):
             return "Pre (median/open)"
-        return f"DoG (σ={self.bandpass_low_sigma:g}–{self.bandpass_high_sigma:g})"
+        return f"DoG (sigma={self.bandpass_low_sigma:g}-{self.bandpass_high_sigma:g})"
 
     def _apply_roi_preprocess(self, img: np.ndarray) -> np.ndarray:
         out = img
@@ -732,7 +1168,7 @@ class SpotAnalysis:
                     dist = float(np.hypot(dx, dy))
                     _add_reject(
                         pk,
-                        f"ピーク間隔(min={d_min:.1f}px, dist={dist:.2f}px)",
+                        f"Peak spacing(min={d_min:.1f}px, dist={dist:.2f}px)",
                     )
                     ok = False
                     break
@@ -858,11 +1294,11 @@ class SpotAnalysis:
         return_rejections: bool = False,
     ) -> Any:
         """
-        検出されたピークに対してフィルタリングを行う。
-        1. 下限値フィルタ (σ, amplitude)
-        2. S/Nフィルタ (snr_threshold; 出力用)
-        3. 元画像の局所ピーク判定 (roi_pre; 中央値+MAD / 局所最大)
-        4. ROI境界フィルタ (margin, roi_mask)
+        Filter detected peaks.
+        1. Lower-bound filters (sigma, amplitude)
+        2. S/N filter (snr_threshold; output filter)
+        3. Local-maximum validation on the original ROI image (roi_pre; median+MAD / local maximum)
+        4. ROI boundary filter (margin, roi_mask)
         """
         rejected_map: Dict[int, Dict[str, Any]] = {}
 
@@ -881,7 +1317,7 @@ class SpotAnalysis:
 
         filtered: List[PeakStat] = []
 
-        # 1. 下限値フィルタ
+        # 1. Lower-bound filter
         for pk in peaks:
             try:
                 sigma_v = float(pk.sigma)
@@ -893,14 +1329,14 @@ class SpotAnalysis:
                 amp_v = float("nan")
 
             if np.isfinite(sigma_v) and sigma_v < float(self.min_sigma_result):
-                _add_reject(pk, f"最小σ: sigma={sigma_v:.3g} < thr={float(self.min_sigma_result):.3g}")
+                _add_reject(pk, f"Minσ: sigma={sigma_v:.3g} < thr={float(self.min_sigma_result):.3g}")
                 continue
             if np.isfinite(amp_v) and amp_v < float(self.min_amplitude):
-                _add_reject(pk, f"最小振幅: amp={amp_v:.3g} < thr={float(self.min_amplitude):.3g}")
+                _add_reject(pk, f"Minimum Amplitude: amp={amp_v:.3g} < thr={float(self.min_amplitude):.3g}")
                 continue
             filtered.append(pk)
 
-        # 2. S/Nフィルタ（出力用）。全て閾値未満の場合は落とし切らずに保持する。
+        # 2. S/N filter for output. If all peaks are below threshold, keep them instead of dropping all.
         if filtered and self.snr_threshold is not None:
             thr = float(self.snr_threshold)
             if thr > 0:
@@ -912,13 +1348,13 @@ class SpotAnalysis:
                         except Exception:
                             snr_v = float("nan")
                         if np.isfinite(snr_v) and snr_v < thr:
-                            _add_reject(pk, f"S/N閾値: snr={snr_v:.3g} < thr={thr:.3g}")
+                            _add_reject(pk, f"S/N threshold: snr={snr_v:.3g} < thr={thr:.3g}")
                     filtered = snr_pass
                 else:
-                    # 閾値超えが無い場合は全ピークを残す（見た目の落ち込みを防ぐ）
+                    # If no peak exceeds the threshold, keep all peaks to avoid an empty-looking result.
                     filtered = list(filtered)
 
-        # 3. 元画像（roi_pre）での局所ピーク判定
+        # 3. Local-peak validation on the original image (roi_pre)
         if filtered and roi_pre is not None:
             try:
                 r = int(self.precheck_radius_px)
@@ -946,14 +1382,14 @@ class SpotAnalysis:
                         lx = float(pk.x) - float(x0)
                         ly = float(pk.y) - float(y0)
                     except Exception:
-                        _add_reject(pk, "precheck: 座標変換失敗")
+                        _add_reject(pk, "precheck: coordinate transform failed")
                         continue
                     ix0 = int(round(lx))
                     iy0 = int(round(ly))
                     ix = ix0
                     iy = iy0
                     if ix < 0 or iy < 0 or ix >= w or iy >= h:
-                        _add_reject(pk, "precheck: ROI外")
+                        _add_reject(pk, "precheck: outside ROI")
                         continue
 
                     # Snap to the maximum pixel within precheck radius (instead of rejecting).
@@ -978,7 +1414,7 @@ class SpotAnalysis:
                     y_max = min(h - 1, iy + r)
                     win = roi_pre[y_min : y_max + 1, x_min : x_max + 1]
                     if win.size == 0:
-                        _add_reject(pk, "precheck: window空")
+                        _add_reject(pk, "precheck: empty window")
                         continue
 
                     if mask is not None:
@@ -996,10 +1432,10 @@ class SpotAnalysis:
                     try:
                         v0 = float(roi_pre[iy, ix])
                     except Exception:
-                        _add_reject(pk, "precheck: v0取得失敗")
+                        _add_reject(pk, "precheck: failed to get v0")
                         continue
                     if not np.isfinite(v0):
-                        _add_reject(pk, "precheck: v0が非有限")
+                        _add_reject(pk, "precheck: v0 is non-finite")
                         continue
 
                     ok = True
@@ -1027,7 +1463,7 @@ class SpotAnalysis:
 
                 filtered = kept_tmp
 
-        # 4. ROI境界フィルタ
+        # 4. ROI boundary filter
         h, w = roi_shape
         x0, y0 = roi_origin
 
@@ -1055,13 +1491,13 @@ class SpotAnalysis:
                         try:
                             if 0 <= ix < w and 0 <= iy < h and "base_allowed" in locals() and base_allowed.shape == (h, w):
                                 if not bool(base_allowed[iy, ix]):
-                                    _add_reject(pk, "ROI外(マスク)")
+                                    _add_reject(pk, "outside ROI (mask)")
                                 else:
-                                    _add_reject(pk, f"ROIマージン(margin={int(self.margin)}px)")
+                                    _add_reject(pk, f"ROI margin(margin={int(self.margin)}px)")
                             else:
-                                _add_reject(pk, "ROI外")
+                                _add_reject(pk, "outside ROI")
                         except Exception:
-                            _add_reject(pk, "ROI外")
+                            _add_reject(pk, "outside ROI")
                 filtered = temp
 
         # Rectangle ROI: apply simple margin-to-border exclusion.
@@ -1081,9 +1517,9 @@ class SpotAnalysis:
                         dx = min(float(pk.x) - float(x0), float(x0 + w) - float(pk.x))
                         dy = min(float(pk.y) - float(y0), float(y0 + h) - float(pk.y))
                         d_border = min(dx, dy)
-                        _add_reject(pk, f"ROIマージン(margin={int(self.margin)}px, border_dist≈{d_border:.2f}px)")
+                        _add_reject(pk, f"ROI margin(margin={int(self.margin)}px, border_dist~{d_border:.2f}px)")
                     except Exception:
-                        _add_reject(pk, f"ROIマージン(margin={int(self.margin)}px)")
+                        _add_reject(pk, f"ROI margin(margin={int(self.margin)}px)")
             filtered = temp2
 
         # 4. DBSCAN spatial outlier filtering (optional)
@@ -1097,7 +1533,7 @@ class SpotAnalysis:
                     if id(pk) in removed:
                         _add_reject(
                             pk,
-                            f"DBSCAN外れ値(eps={float(self.dbscan_eps):.3g}, min_samples={int(self.dbscan_min_samples)})",
+                            f"DBSCAN outlier(eps={float(self.dbscan_eps):.3g}, min_samples={int(self.dbscan_min_samples)})",
                         )
             filtered = filtered2
 
@@ -1409,10 +1845,10 @@ class SpotAnalysis:
         roi_bounds_override: Optional[Tuple[int, int, int, int]] = None,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """
-        ROI表示用の2枚を返す:
-        - 左: ROIの前処理後画像（median/openのみ。検出フィルタは未適用）
-        - 右: ROIの検出用画像（前処理→LoG/DoG）
-        いずれも ROI が無い場合は (None, None)。
+        Return two images for ROI display:
+        - Left: preprocessed ROI image (median/open only; detection filter not applied)
+        - Right: ROI image for detection (preprocess -> LoG/DoG)
+        Returns (None, None) when no ROI is available.
         """
         if roi_bounds_override is None:
             return None, None
@@ -2623,14 +3059,14 @@ __all__ = [
 
 class SpotVisualizationWindow(QtWidgets.QMainWindow):
     """
-    解析結果（ROI画像と検出ピーク）を可視化するウィンドウ。
+    Window for visualizing analysis results, including ROI images and detected peaks.
     """
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Spot Analysis Visualization")
         self.resize(600, 500)
         
-        # メインウィジェット
+        # Main widget
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)
         layout = QtWidgets.QVBoxLayout(central_widget)
@@ -2642,26 +3078,26 @@ class SpotVisualizationWindow(QtWidgets.QMainWindow):
         self.ax = self.figure.add_subplot(111)
         self.cbar = None
         
-        # ツールバー（Matplotlib標準）
+        # Standard Matplotlib toolbar
         from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
         self.toolbar = NavigationToolbar(self.canvas, self)
         self.addToolBar(QtCore.Qt.TopToolBarArea, self.toolbar)
 
     def update_view(self, roi: np.ndarray, result: FrameAnalysis, origin: Tuple[int, int]):
-        """ROI画像とフィッティング結果を描画"""
+        """Draw the ROI image and fitting results"""
         self.ax.clear()
         self._safe_remove_colorbar()
         self.figure.subplots_adjust(right=0.80)
-        # 背景画像
+        # Background image
         im = self.ax.imshow(roi, cmap='viridis', origin='lower')
         self.cbar = self.figure.colorbar(im, ax=self.ax, label='Height (nm)')
         
-        # 選択されたモデルのピークをプロット
+        # Plot peaks from the selected model
         best_model = result.models[result.best_n_peaks]
         colors = ["magenta", "white", "orange", "cyan", "yellow", "lime", "red", "deepskyblue"]
         
         for i, pk in enumerate(best_model.peaks):
-            # PeakStatの座標は全体座標なので、ROI内相対座標に戻す
+            # PeakStat coordinates are global coordinates, so convert them back to ROI-local coordinates.
             rx = pk.x - origin[0]
             ry = pk.y - origin[1]
             
@@ -2669,9 +3105,9 @@ class SpotVisualizationWindow(QtWidgets.QMainWindow):
             
             self.ax.plot(rx, ry, 'x', color=colors[i % len(colors)], markersize=10, markeredgewidth=2, label=label)
 
-        # 2ピークモデルと3ピークモデルの両方を比較したい場合のために、
-        # 補助的に他のモデルの点も点線などで出すことも検討できますが、
-        # まずは「採用されたモデル」を表示します。
+        # It may be useful to also plot other models with dotted markers
+        # when comparing both 2-peak and 3-peak models,
+        # but for now only the selected model is displayed.
         
         self.ax.set_title(f"Model: {result.best_n_peaks} peaks ({result.criterion.upper()})")
         self.ax.legend(
@@ -2682,12 +3118,12 @@ class SpotVisualizationWindow(QtWidgets.QMainWindow):
         )
         self.ax.set_xlabel("X (pixel)")
         self.ax.set_ylabel("Y (pixel)")
-        # Z Scale Barは表示しない
+        # Do not show the Z scale bar
         
         self.canvas.draw()
 
     def _safe_remove_colorbar(self):
-        """Colorbarを安全に削除する（MatplotlibのKeyError対策）"""
+        """Safely remove the colorbar to avoid Matplotlib KeyError issues"""
         try:
             if self.cbar:
                 self.cbar.remove()
@@ -2698,7 +3134,7 @@ class SpotVisualizationWindow(QtWidgets.QMainWindow):
 
 class SpotFullImageWindow(QtWidgets.QMainWindow):
     """
-    全画像にピーク位置をオーバーレイ表示するウィンドウ。
+    Window for overlaying peak positions on the full AFM image.
     """
 
     def __init__(self, parent=None):
@@ -2734,11 +3170,11 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
         self.canvas.mpl_connect("button_release_event", self._on_release)
 
     def set_edit_handler(self, handler):
-        """編集イベントをSpotAnalysisWindowへ渡す"""
+        """Forward edit events to SpotAnalysisWindow"""
         self.edit_handler = handler
 
     def enable_roi_selector(self, shape: str, callback):
-        """ROI選択を有効化し、選択結果をcallback(dict)に通知"""
+        """Enable ROI selection and notify callback(dict) with the selection result"""
         from matplotlib.widgets import RectangleSelector, EllipseSelector
 
         self.on_select_callback = callback
@@ -2829,7 +3265,7 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
         show_fit_spots_on_roi_pre: bool = False,
         init_mode: Optional[str] = None,
     ) -> None:
-        """上段: AFM全画像 / 下段: ROI前処理(左) + ROI検出画像(右) を描画"""
+        """Draw top: full AFM image / bottom: preprocessed ROI (left) + detection ROI (right)"""
         # NOTE: Avoid UnboundLocalError if 'np' becomes a local binding unexpectedly.
         import numpy as np
 
@@ -2954,11 +3390,11 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
                     w = float(roi_overlay.get("w", 0.0))
                     h = float(roi_overlay.get("h", 0.0))
 
-                    # マージンチェック用の設定（ROIマージンで除外される位置は表示しない）
+                    # Settings for margin checks; positions excluded by ROI margin are not displayed.
                     margin = 0
                     roi_mask_check = None
                     try:
-                        # SpotAnalysisPluginからmargin値を取得
+                        # Get margin value from SpotAnalysisPlugin
                         from PyQt5.QtWidgets import QApplication
                         for widget in QApplication.topLevelWidgets():
                             if hasattr(widget, 'margin_spin'):
@@ -2967,7 +3403,7 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
                     except Exception:
                         pass
 
-                    # 楕円ROIの場合はマスクを作成
+                    # Create a mask for elliptical ROI
                     if roi_overlay.get("shape") == "Ellipse":
                         try:
                             cx = float(roi_overlay.get("cx", 0.0))
@@ -2975,7 +3411,7 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
                             rx = float(roi_overlay.get("rx", 1.0))
                             ry = float(roi_overlay.get("ry", 1.0))
 
-                            # ROIローカル座標でマスクを作成
+                            # Create the mask in ROI-local coordinates
                             yy_grid, xx_grid = np.mgrid[0:int(h), 0:int(w)]
                             mask_full = ((xx_grid + x0 - cx) ** 2) / (rx ** 2 + 1e-12) + ((yy_grid + y0 - cy) ** 2) / (ry ** 2 + 1e-12) <= 1.0
 
@@ -2986,10 +3422,10 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
                         except Exception:
                             pass
                     else:
-                        # 矩形ROIの場合
+                        # Rectangle ROI
                         if margin > 0:
-                            # マージン分の境界チェック用
-                            pass  # 後で個別にチェック
+                            # For boundary checks with the margin amount
+                            pass  # Checked individually later
                     if w > 0 and h > 0:
                         colors = ["magenta", "white", "orange", "cyan", "yellow", "lime", "red", "deepskyblue"]
                         # Debug overlay: final (fit) peaks on ROI-pre image.
@@ -3001,8 +3437,8 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
                                 rx = sx - x0
                                 ry = sy - y0
 
-                                # マージンチェック（表示ノイズ回避）。ただし、座標不整合の切り分け用途なので
-                                # ROI外はそのままスキップ（軸外で見えないため）。
+                                # Margin check to avoid display noise. This is also used for isolating coordinate mismatches, so
+                                # outside-ROI points are skipped as-is because they are outside the axes and invisible.
                                 if roi_mask_check is not None:
                                     iy, ix = int(round(ry)), int(round(rx))
                                     if 0 <= iy < roi_mask_check.shape[0] and 0 <= ix < roi_mask_check.shape[1]:
@@ -3014,7 +3450,7 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
                                     if rx < margin or ry < margin or rx > w - margin or ry > h - margin:
                                         continue
 
-                                # ROI外は表示しない（見えないため）
+                                # Do not display outside-ROI points because they are invisible.
                                 if rx < 0 or ry < 0 or rx > w or ry > h:
                                     continue
 
@@ -3050,19 +3486,19 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
                                 rx = sx - x0
                                 ry = sy - y0
 
-                                # マージンチェック
+                                # Margin check
                                 if roi_mask_check is not None:
-                                    # 楕円ROI: マスクでチェック
+                                    # Ellipse ROI: check by mask
                                     iy, ix = int(round(ry)), int(round(rx))
                                     if 0 <= iy < roi_mask_check.shape[0] and 0 <= ix < roi_mask_check.shape[1]:
                                         if not roi_mask_check[iy, ix]:
-                                            continue  # マージン範囲内なのでスキップ
+                                            continue  # Skip because it is inside the margin range
                                     else:
                                         continue
                                 elif margin > 0:
-                                    # 矩形ROI: 境界からの距離でチェック
+                                    # Rectangle ROI: check by distance from boundary
                                     if rx < margin or ry < margin or rx > w - margin or ry > h - margin:
-                                        continue  # マージン範囲内なのでスキップ
+                                        continue  # Skip because it is inside the margin range
                                 self.ax_roi_pre.plot(
                                     rx, ry, "x", color=colors[i % len(colors)], markersize=9, markeredgewidth=2
                                 )
@@ -3087,19 +3523,19 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
                                 rx = sx - x0
                                 ry = sy - y0
 
-                                # マージンチェック
+                                # Margin check
                                 if roi_mask_check is not None:
-                                    # 楕円ROI: マスクでチェック
+                                    # Ellipse ROI: check by mask
                                     iy, ix = int(round(ry)), int(round(rx))
                                     if 0 <= iy < roi_mask_check.shape[0] and 0 <= ix < roi_mask_check.shape[1]:
                                         if not roi_mask_check[iy, ix]:
-                                            continue  # マージン範囲内なのでスキップ
+                                            continue  # Skip because it is inside the margin range
                                     else:
                                         continue
                                 elif margin > 0:
-                                    # 矩形ROI: 境界からの距離でチェック
+                                    # Rectangle ROI: check by distance from boundary
                                     if rx < margin or ry < margin or rx > w - margin or ry > h - margin:
-                                        continue  # マージン範囲内なのでスキップ
+                                        continue  # Skip because it is inside the margin range
                                 self.ax_roi_det.plot(
                                     rx, ry, "x", color=colors[i % len(colors)], markersize=9, markeredgewidth=2
                                 )
@@ -3136,7 +3572,7 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
         self.canvas.draw()
 
     def _safe_remove_colorbar(self):
-        """Colorbarを安全に削除する（MatplotlibのKeyError対策）"""
+        """Safely remove the colorbar to avoid Matplotlib KeyError issues"""
         try:
             if self.cbar:
                 self.cbar.remove()
@@ -3147,7 +3583,7 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
     def _on_press(self, event):
         if self.edit_handler is None:
             return
-        # Cmd/Ctrl 押下中はROIセレクタを一時停止して、ドラッグをSpot編集に譲る
+        # While Cmd/Ctrl is pressed, pause ROI selector and let spot editing handle drag events.
         is_mod = False
         try:
             gui_ev = getattr(event, "guiEvent", None)
@@ -3179,7 +3615,7 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
         if self.edit_handler is None:
             return
         self.edit_handler(event, "release")
-        # 一時停止していたROIセレクタを復帰
+        # Restore the paused ROI selector
         if self._roi_selector_paused and self.selector is not None:
             try:
                 self.selector.set_active(True)
@@ -3190,8 +3626,8 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
 
 class SpotAnalysisWindow(QtWidgets.QWidget):
     """
-    PyNuDメインウィンドウからオンデマンドで呼び出す簡易UI。
-    FileListで選択されたファイルの現在フレームに対し、SpotAnalysisを実行する。
+    Simple on-demand UI launched from the pyNuD main window.
+    Runs SpotAnalysis on the current frame of the file selected in FileList.
     """
 
     def __init__(self, main_window, parent=None) -> None:
@@ -3200,8 +3636,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.setWindowTitle("Spot Analysis (AIC/BIC)")
         self.setMinimumWidth(420)
         self.spot_analyzer = SpotAnalysis()
-        self.viz_window = None  # ROI可視化ウィンドウ
-        self.full_viz_window = None  # 全画像オーバーレイウィンドウ
+        self.viz_window = None  # ROI visualization window
+        self.full_viz_window = None  # Full-image overlay window
         self.last_frame = None
         self.last_result = None
         self.manual_roi = None  # dict: {"shape": str, "x0":..., "y0":..., "w":..., "h":..., "cx":..., "cy":..., "rx":..., "ry":...}
@@ -3225,13 +3661,96 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self._update_frame_label()
 
     def closeEvent(self, event):
-        """ウィンドウを閉じるときに可視化ウィンドウも閉じる"""
+        """Close visualization windows when this window closes"""
         if self.viz_window:
             self.viz_window.close()
         super().closeEvent(event)
 
+    @staticmethod
+    def _help_html(body: str) -> str:
+        return f"<html><head>{HELP_CSS}</head><body>{body}</body></html>"
+
+    def _show_help(self) -> None:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"{PLUGIN_NAME} Help")
+        dialog.resize(900, 720)
+
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        lang_row = QtWidgets.QHBoxLayout()
+        lang_row.addWidget(QtWidgets.QLabel("Language / 言語:"))
+        btn_ja = QtWidgets.QPushButton("日本語", dialog)
+        btn_en = QtWidgets.QPushButton("English", dialog)
+        btn_ja.setCheckable(True)
+        btn_en.setCheckable(True)
+        lang_group = QtWidgets.QButtonGroup(dialog)
+        lang_group.addButton(btn_ja)
+        lang_group.addButton(btn_en)
+        lang_group.setExclusive(True)
+        selected_style = "QPushButton { background-color: #007aff; color: white; font-weight: bold; }"
+        normal_style = "QPushButton { background-color: #e5e5e5; color: black; }"
+        lang_row.addWidget(btn_ja)
+        lang_row.addWidget(btn_en)
+        lang_row.addStretch(1)
+        layout.addLayout(lang_row)
+
+        heading = QtWidgets.QLabel("Spot Analysis Help")
+        heading_font = heading.font()
+        heading_font.setPointSize(max(heading_font.pointSize() + 3, 14))
+        heading_font.setBold(True)
+        heading.setFont(heading_font)
+        layout.addWidget(heading)
+
+        summary = QtWidgets.QLabel("")
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        tabs = QtWidgets.QTabWidget()
+        tabs.setDocumentMode(True)
+        layout.addWidget(tabs, stretch=1)
+
+        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        def set_lang(use_ja: bool) -> None:
+            btn_ja.setChecked(use_ja)
+            btn_en.setChecked(not use_ja)
+            btn_ja.setStyleSheet(selected_style if use_ja else normal_style)
+            btn_en.setStyleSheet(selected_style if not use_ja else normal_style)
+            summary.setText(
+                "ROIを指定して輝点を検出し、AIC/BICでピーク数を判定し、"
+                "CSVへ保存するまでの操作ガイドです。"
+                if use_ja
+                else "Guide for selecting an ROI, detecting bright spots, choosing peak counts with AIC/BIC, "
+                "editing results, and exporting CSV files."
+            )
+            tabs.clear()
+            for title, html_text in (HELP_TABS_JA if use_ja else HELP_TABS_EN):
+                browser = QtWidgets.QTextBrowser()
+                browser.setOpenExternalLinks(False)
+                browser.setHtml(self._help_html(html_text))
+                browser.setMinimumWidth(720)
+                tabs.addTab(browser, title)
+
+        btn_ja.clicked.connect(lambda: set_lang(True))
+        btn_en.clicked.connect(lambda: set_lang(False))
+        set_lang(False)
+
+        dialog.exec_()
+
     def _build_ui(self) -> None:
         outer_layout = QtWidgets.QVBoxLayout(self)
+
+        menu_bar = QtWidgets.QMenuBar(self)
+        menu_bar.setNativeMenuBar(False)
+        help_menu = menu_bar.addMenu("Help")
+        manual_action = help_menu.addAction("Manual")
+        manual_action.setStatusTip("Open Spot Analysis help.")
+        manual_action.triggered.connect(self._show_help)
+        outer_layout.setMenuBar(menu_bar)
 
         def _setup_grid(grid: QtWidgets.QGridLayout) -> None:
             # 0: label, 1: input, 2: expanding spacer column
@@ -3257,27 +3776,30 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
         # --- Top buttons (always visible) ---
         top_row = QtWidgets.QHBoxLayout()
-        self.run_btn = QtWidgets.QPushButton("解析を実行")
+        self.run_btn = QtWidgets.QPushButton("Run Analysis")
         self.run_btn.clicked.connect(self.run_analysis)
         self.run_btn.setEnabled(False)
+        self.help_btn = QtWidgets.QPushButton("Help")
+        self.help_btn.setToolTip("Open the Spot Analysis operation guide.")
+        self.help_btn.clicked.connect(self._show_help)
 
-        self.refit_manual_btn = QtWidgets.QPushButton("スポットをSpot径の重心に設定")
-        self.refit_manual_btn.setToolTip("各スポットを、Spot半径で描かれる円内の強度重心位置へ移動します（現在フレームのみ）。")
+        self.refit_manual_btn = QtWidgets.QPushButton("Move Spots to Radius Centroid")
+        self.refit_manual_btn.setToolTip("Move each spot to the intensity centroid inside its spot-radius circle for the current frame only.")
         self.refit_manual_btn.clicked.connect(self.refit_from_manual_spots)
         self.refit_manual_btn.setEnabled(False)
-        self.auto_centroid_check = QtWidgets.QCheckBox("自動適用")
+        self.auto_centroid_check = QtWidgets.QCheckBox("Auto Apply")
         self.auto_centroid_check.setChecked(False)
         self.auto_centroid_check.setToolTip(
-            "ONにすると、解析直後に各スポットを Spot 半径内の強度重心位置へ自動移動します。"
+            "When ON, automatically moves each spot to the intensity centroid inside its spot radius after analysis."
         )
 
-        self.run_all_btn = QtWidgets.QPushButton("全フレーム解析")
+        self.run_all_btn = QtWidgets.QPushButton("All Frames Analysis")
         self.run_all_btn.clicked.connect(self.run_analysis_all_frames)
         self.run_all_btn.setEnabled(False)
 
-        self.run_all_enable_check = QtWidgets.QCheckBox("全フレーム解析")
+        self.run_all_enable_check = QtWidgets.QCheckBox("All Frames Analysis")
         self.run_all_enable_check.setChecked(False)
-        self.run_all_enable_check.setToolTip("ONのときのみ「全フレーム解析」ボタンが有効になります。")
+        self.run_all_enable_check.setToolTip("The All Frames Analysis button is enabled only when this checkbox is ON.")
         self.run_all_enable_check.toggled.connect(self._sync_run_buttons_enabled)
 
         self.prev_frame_btn = QtWidgets.QPushButton("◀")
@@ -3291,6 +3813,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         top_row.addWidget(self.prev_frame_btn)
         top_row.addWidget(self.next_frame_btn)
         top_row.addWidget(self.frame_label)
+        top_row.addWidget(self.help_btn)
         top_row.addStretch(1)
         outer_layout.addLayout(top_row)
 
@@ -3323,44 +3846,44 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         form_layout = QtWidgets.QVBoxLayout(form_widget)
 
         # --- Groups ---
-        basic_group = QtWidgets.QGroupBox("ROI / 基本")
+        basic_group = QtWidgets.QGroupBox("ROI / Basic")
         basic_grid = QtWidgets.QGridLayout(basic_group)
         _setup_grid(basic_grid)
         r = 0
-        roi_shape_label = QtWidgets.QLabel("ROI形状")
+        roi_shape_label = QtWidgets.QLabel("ROI Shape")
         roi_shape_label.setToolTip(
-            "解析領域（ROI）の形状:\n"
-            "・Rectangle: 矩形領域\n"
-            "・Ellipse (Circle): 楕円/円形領域（境界外を除外）"
+            "Analysis ROI shape:\n"
+            "- Rectangle: rectangular ROI\n"
+            "- Ellipse (Circle): elliptical/circular ROI; pixels outside the boundary are excluded"
         )
         basic_grid.addWidget(roi_shape_label, r, 0)
         self.roi_shape_combo = QtWidgets.QComboBox()
         self.roi_shape_combo.addItems(["Rectangle", "Ellipse (Circle)"])
-        self.roi_shape_combo.setToolTip("ROI形状を選択します。")
+        self.roi_shape_combo.setToolTip("Select the ROI shape.")
         self.roi_shape_combo.setMaximumWidth(150)
         self.roi_shape_combo.currentTextChanged.connect(self._on_roi_shape_changed)
         basic_grid.addWidget(self.roi_shape_combo, r, 1, alignment=QtCore.Qt.AlignLeft)
         r += 1
 
-        auto_analyze_label = QtWidgets.QLabel("自動解析")
+        auto_analyze_label = QtWidgets.QLabel("Auto Analysis")
         auto_analyze_label.setToolTip(
-            "フレーム切替時に自動的に解析を実行:\n"
-            "有効にすると、ROIが設定されているフレームに切り替えた際、\n"
-            "自動的にピーク検出とフィッティングを実行します。"
+            "Automatically run analysis when changing frames:\n"
+            "when enabled, peak detection and fitting run automatically\n"
+            "when switching to a frame that has an ROI."
         )
         basic_grid.addWidget(auto_analyze_label, r, 0)
-        self.auto_analyze_check = QtWidgets.QCheckBox("フレーム切替時に自動解析")
-        self.auto_analyze_check.setChecked(True)  # デフォルトで有効
-        self.auto_analyze_check.setToolTip("ROIがあるフレームで自動的に解析を行います。")
+        self.auto_analyze_check = QtWidgets.QCheckBox("Auto-analyze on frame change")
+        self.auto_analyze_check.setChecked(True)  # Enabled by default
+        self.auto_analyze_check.setToolTip("Automatically analyze frames that have an ROI.")
         basic_grid.addWidget(self.auto_analyze_check, r, 1, alignment=QtCore.Qt.AlignLeft)
         r += 1
 
-        criterion_label = QtWidgets.QLabel("情報量基準")
+        criterion_label = QtWidgets.QLabel("Information Criterion")
         criterion_label.setToolTip(
-            "最適なピーク数を選択する情報量基準:\n"
-            "・AIC (Akaike Information Criterion): 予測精度重視\n"
-            "・BIC (Bayesian Information Criterion): モデル簡潔性重視（より保守的）\n"
-            "一般的にBICの方がオーバーフィッティングを抑えます。"
+            "Information criterion used to select the optimal number of peaks:\n"
+            "- AIC (Akaike Information Criterion): emphasizes predictive accuracy\n"
+            "- BIC (Bayesian Information Criterion): emphasizes model simplicity and is more conservative\n"
+            "BIC generally suppresses overfitting more strongly."
         )
         basic_grid.addWidget(criterion_label, r, 0)
         self.criterion_combo = QtWidgets.QComboBox()
@@ -3379,16 +3902,16 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.max_peaks_spin.setValue(3)
         self.max_peaks_spin.setMaximumWidth(70)
         peaks_row = QtWidgets.QHBoxLayout()
-        peaks_row.addWidget(QtWidgets.QLabel("最小"))
+        peaks_row.addWidget(QtWidgets.QLabel("Min"))
         peaks_row.addWidget(self.min_peaks_spin)
         peaks_row.addSpacing(8)
-        peaks_row.addWidget(QtWidgets.QLabel("最大"))
+        peaks_row.addWidget(QtWidgets.QLabel("Max"))
         peaks_row.addWidget(self.max_peaks_spin)
-        peaks_label = QtWidgets.QLabel("ピーク数")
+        peaks_label = QtWidgets.QLabel("Peak Count")
         peaks_label.setToolTip(
-            "フィッティングで試行するピーク数の範囲。\n"
-            "Peak系初期候補（seed）の候補数上限にも使われます。\n"
-            "AIC/BICで最適なモデルを選択します。"
+            "Range of peak counts tested during fitting.\n"
+            "Also used as the upper limit for Peak-type initial seed candidates.\n"
+            "The optimal model is selected by AIC/BIC."
         )
         basic_grid.addWidget(peaks_label, r, 0)
         basic_grid.addLayout(peaks_row, r, 1, alignment=QtCore.Qt.AlignLeft)
@@ -3397,23 +3920,23 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         _add_right_spacer(basic_grid, r)
         form_layout.addWidget(basic_group)
 
-        preprocess_group = QtWidgets.QGroupBox("前処理（ROI内）")
+        preprocess_group = QtWidgets.QGroupBox("Preprocessing (inside ROI)")
         pre_grid = QtWidgets.QGridLayout(preprocess_group)
         _setup_grid(pre_grid)
         r = 0
         self.median_check = QtWidgets.QCheckBox("Median")
-        self.median_check.setChecked(True)  # デフォルトで有効
+        self.median_check.setChecked(True)  # Enabled by default
         self.median_size_spin = QtWidgets.QSpinBox()
         self.median_size_spin.setRange(1, 31)
         self.median_size_spin.setSingleStep(2)
         self.median_size_spin.setValue(int(getattr(self.spot_analyzer, "median_size", 3)))
-        self.median_size_spin.setToolTip("Medianカーネルサイズ（奇数推奨）")
+        self.median_size_spin.setToolTip("Median kernel size; odd values are recommended.")
         self.median_size_spin.setMaximumWidth(80)
         median_row = QtWidgets.QHBoxLayout()
         median_row.addWidget(self.median_check)
         median_row.addSpacing(8)
         median_k_label = QtWidgets.QLabel("k")
-        median_k_label.setToolTip("メディアンフィルタのカーネルサイズ。ノイズを除去しつつスポットを保持します。")
+        median_k_label.setToolTip("Kernel size of the median filter. Removes noise while preserving spots.")
         median_row.addWidget(median_k_label)
         median_row.addWidget(self.median_size_spin)
         pre_grid.addLayout(median_row, r, 0, 1, 3, QtCore.Qt.AlignLeft)
@@ -3423,13 +3946,13 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.open_radius_spin = QtWidgets.QSpinBox()
         self.open_radius_spin.setRange(0, 20)
         self.open_radius_spin.setValue(int(getattr(self.spot_analyzer, "open_radius", 1)))
-        self.open_radius_spin.setToolTip("Openの半径(px)")
+        self.open_radius_spin.setToolTip("Opening radius (px)")
         self.open_radius_spin.setMaximumWidth(80)
         open_row = QtWidgets.QHBoxLayout()
         open_row.addWidget(self.open_check)
         open_row.addSpacing(8)
         open_r_label = QtWidgets.QLabel("r(px)")
-        open_r_label.setToolTip("Morphological opening の半径。小さな突起やノイズを除去します。")
+        open_r_label.setToolTip("Radius for morphological opening. Removes small protrusions and noise.")
         open_row.addWidget(open_r_label)
         open_row.addWidget(self.open_radius_spin)
         pre_grid.addLayout(open_row, r, 0, 1, 3, QtCore.Qt.AlignLeft)
@@ -3437,16 +3960,16 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         _add_right_spacer(pre_grid, r)
         form_layout.addWidget(preprocess_group)
 
-        detect_group = QtWidgets.QGroupBox("検出（LoG / DoG / Pre）")
+        detect_group = QtWidgets.QGroupBox("Detection (LoG / DoG / Pre)")
         det_grid = QtWidgets.QGridLayout(detect_group)
         _setup_grid(det_grid)
         r = 0
-        detection_mode_label = QtWidgets.QLabel("方式")
+        detection_mode_label = QtWidgets.QLabel("Method")
         detection_mode_label.setToolTip(
-            "ピーク初期位置の検出方法:\n"
-            "・DoG: Difference of Gaussians（σ highとσ lowの差分）でエッジ/ブロブ強調\n"
-            "・LoG: Laplacian of Gaussian（1つのσ）でブロブ検出\n"
-            "・Preprocessed: 前処理画像をそのまま使用（median/morphological opening）"
+            "Initial peak-position detection method:\n"
+            "- DoG: emphasizes edges/blobs using Difference of Gaussians (sigma high - sigma low)\n"
+            "- LoG: detects blobs using Laplacian of Gaussian with one sigma\n"
+            "- Preprocessed: uses the preprocessed image directly (median/morphological opening)"
         )
         det_grid.addWidget(detection_mode_label, r, 0)
         self.detection_mode_combo = QtWidgets.QComboBox()
@@ -3470,12 +3993,12 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.bandpass_high_spin.setMaximumWidth(90)
         dog_row = QtWidgets.QHBoxLayout()
         dog_sigma_low_label = QtWidgets.QLabel("σ low")
-        dog_sigma_low_label.setToolTip("DoG低周波側のガウシアンぼかし半径。小さいスポットに対応します。")
+        dog_sigma_low_label.setToolTip("Gaussian blur radius on the low-sigma side of DoG. Smaller values support smaller spots.")
         dog_row.addWidget(dog_sigma_low_label)
         dog_row.addWidget(self.bandpass_low_spin)
         dog_row.addSpacing(8)
         dog_sigma_high_label = QtWidgets.QLabel("σ high")
-        dog_sigma_high_label.setToolTip("DoG高周波側のガウシアンぼかし半径。大きい構造を除去します。")
+        dog_sigma_high_label.setToolTip("Gaussian blur radius on the high-sigma side of DoG. Removes larger structures.")
         dog_row.addWidget(dog_sigma_high_label)
         dog_row.addWidget(self.bandpass_high_spin)
         det_grid.addLayout(dog_row, r, 0, 1, 3, QtCore.Qt.AlignLeft)
@@ -3489,7 +4012,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.log_sigma_spin.setMaximumWidth(90)
         log_row = QtWidgets.QHBoxLayout()
         log_sigma_label = QtWidgets.QLabel("σ")
-        log_sigma_label.setToolTip("LoGのガウシアンぼかし半径。検出したいスポットのサイズに合わせて調整します。")
+        log_sigma_label.setToolTip("Gaussian blur radius for LoG. Tune it to the expected spot size.")
         log_row.addWidget(log_sigma_label)
         log_row.addWidget(self.log_sigma_spin)
         det_grid.addLayout(log_row, r, 0, 1, 3, QtCore.Qt.AlignLeft)
@@ -3499,7 +4022,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         form_layout.addWidget(detect_group)
 
         # NOTE: This group contains ONLY initializer (seed detection) related controls.
-        fit_group = QtWidgets.QGroupBox("初期化（初期位置）")
+        fit_group = QtWidgets.QGroupBox("Initialization (initial positions)")
         fit_grid = QtWidgets.QGridLayout(fit_group)
         _setup_grid(fit_grid)
         r = 0
@@ -3509,12 +4032,12 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.margin_spin.setRange(0, 100)
         self.margin_spin.setValue(self.spot_analyzer.margin)
         self.margin_spin.setMaximumWidth(70)
-        self.margin_spin.setToolTip("ROI境界からの除外距離 (px)")
-        margin_label = QtWidgets.QLabel("ROIマージン (px)")
+        self.margin_spin.setToolTip("Exclusion distance from ROI boundary (px)")
+        margin_label = QtWidgets.QLabel("ROI Margin (px)")
         margin_label.setToolTip(
-            "ROI境界からの除外距離（ピクセル）:\n"
-            "初期候補の選択と、最終結果の除外の両方に使用されます。\n"
-            "ROI境界からこの距離以内にあるピークを除外します。"
+            "Exclusion distance from the ROI boundary in pixels:\n"
+            "Used both for initial candidate selection and final result filtering.\n"
+            "Peaks within this distance from the ROI boundary are excluded."
         )
         fit_grid.addWidget(margin_label, r, 0)
         fit_grid.addWidget(self.margin_spin, r, 1, alignment=QtCore.Qt.AlignLeft)
@@ -3525,50 +4048,50 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.peak_min_distance_spin.setRange(1, 50)
         self.peak_min_distance_spin.setValue(self.spot_analyzer.peak_min_distance)
         self.peak_min_distance_spin.setMaximumWidth(70)
-        peak_min_distance_label = QtWidgets.QLabel("ピーク間隔 (px)")
+        peak_min_distance_label = QtWidgets.QLabel("Peak Spacing (px)")
         peak_min_distance_label.setToolTip(
-            "ピーク間の最小距離（ピクセル）:\n"
-            "Peak系初期候補では、この距離以内の候補は最も強いもの1つだけが残されます（NMS）。\n"
-            "近接したピークの重複検出を防ぎます。"
+            "Minimum distance between peaks in pixels:\n"
+            "For Peak-type initial candidates, only the strongest candidate within this distance is kept (NMS).\n"
+            "Prevents duplicate detection of close peaks."
         )
         fit_grid.addWidget(peak_min_distance_label, r, 0)
         fit_grid.addWidget(self.peak_min_distance_spin, r, 1, alignment=QtCore.Qt.AlignLeft)
         r += 1
 
         # initializer mode
-        init_mode_label = QtWidgets.QLabel("初期候補")
+        init_mode_label = QtWidgets.QLabel("Initial Candidates")
         init_mode_label.setToolTip(
-            "ガウスフィットの初期ピーク候補生成方法:\n"
-            "・Watershed: 適応的h-maximaで複雑な画像に強い（推奨）\n"
-            "・Blob DoH: 円形スポット検出に最適、計算効率が良い\n"
-            "・Peak: シンプルな局所最大値検出"
+            "Initial peak-candidate generation method for Gaussian fitting:\n"
+            "- Watershed: robust for complex images using adaptive h-maxima (recommended)\n"
+            "- Blob DoH: efficient and well suited for circular spot detection\n"
+            "- Peak: simple local-maximum detection"
         )
         fit_grid.addWidget(init_mode_label, r, 0)
         self.init_mode_combo = QtWidgets.QComboBox()
         self.init_mode_combo.addItems([
-            "Watershed (推奨)",
-            "Blob DoH (高速)",
+            "Watershed (Recommended)",
+            "Blob DoH (Fast)",
             "Peak"
         ])
         self.init_mode_combo.setCurrentText("Peak")
         self.init_mode_combo.setMaximumWidth(180)
         self.init_mode_combo.setToolTip(
-            "ガウスフィットの初期ピーク候補生成方法:\n\n"
-            "• Watershed (推奨)\n"
-            "  適応的h-maximaで複雑な画像に強い\n\n"
-            "• Blob DoH (高速)\n"
-            "  円形スポット検出に最適、計算効率が良い\n\n"
+            "Initial peak-candidate generation method for Gaussian fitting:\n\n"
+            "• Watershed (Recommended)\n"
+            "  Robust for complex images using adaptive h-maxima\n\n"
+            "• Blob DoH (Fast)\n"
+            "  Efficient and well suited for circular spot detection\n\n"
             "• Peak\n"
-            "  シンプルな局所最大値検出"
+            "  Simple local-maximum detection"
         )
         self.init_mode_combo.currentTextChanged.connect(self._update_init_mode_ui_enabled)
         fit_grid.addWidget(self.init_mode_combo, r, 1, alignment=QtCore.Qt.AlignLeft)
         r += 1
 
         # Subpixel refinement option
-        self.subpixel_check = QtWidgets.QCheckBox("サブピクセル精度")
+        self.subpixel_check = QtWidgets.QCheckBox("Subpixel Refinement")
         self.subpixel_check.setChecked(False)
-        self.subpixel_check.setToolTip("Peak モードでサブピクセル精度の位置補正を行います。")
+        self.subpixel_check.setToolTip("Refine positions to subpixel accuracy in Peak mode.")
         fit_grid.addWidget(self.subpixel_check, r, 1, alignment=QtCore.Qt.AlignLeft)
         r += 1
 
@@ -3578,21 +4101,21 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.watershed_h_rel_spin.setDecimals(3)
         self.watershed_h_rel_spin.setValue(float(getattr(self.spot_analyzer, "watershed_h_rel", 0.05)))
         self.watershed_h_rel_spin.setMaximumWidth(90)
-        self.watershed_h_rel_spin.setToolTip("h-maximaの相対高さ。大きいほど過剰分割を抑えます（0〜1）。")
+        self.watershed_h_rel_spin.setToolTip("Relative h-maxima height. Larger values suppress over-segmentation (0-1).")
         ws_h_label = QtWidgets.QLabel("WS h(rel)")
         ws_h_label.setToolTip(
-            "Watershed h-maximaの相対高さ（0〜1）:\n"
-            "画像の強度範囲に対する比率でノイズ抑制の強さを設定します。\n"
-            "大きいほど小さな極大値を無視し、過剰分割を抑えます。\n"
-            "適応的h-maximaが有効な場合は、ノイズレベルも考慮されます。"
+            "Relative height for Watershed h-maxima (0-1):\n"
+            "Sets noise suppression strength as a fraction of the image intensity range.\n"
+            "Larger values ignore smaller local maxima and suppress over-segmentation.\n"
+            "When adaptive h-maxima is enabled, the noise level is also considered."
         )
         fit_grid.addWidget(ws_h_label, r, 0)
         fit_grid.addWidget(self.watershed_h_rel_spin, r, 1, alignment=QtCore.Qt.AlignLeft)
         r += 1
 
-        self.watershed_adaptive_h_check = QtWidgets.QCheckBox("適応的h-maxima")
+        self.watershed_adaptive_h_check = QtWidgets.QCheckBox("Adaptive h-maxima")
         self.watershed_adaptive_h_check.setChecked(bool(getattr(self.spot_analyzer, "watershed_adaptive_h", True)))
-        self.watershed_adaptive_h_check.setToolTip("ノイズレベルに基づいてh値を自動調整します。")
+        self.watershed_adaptive_h_check.setToolTip("Automatically adjusts the h value based on the noise level.")
         fit_grid.addWidget(self.watershed_adaptive_h_check, r, 1, alignment=QtCore.Qt.AlignLeft)
         r += 1
 
@@ -3609,19 +4132,19 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.blob_doh_max_sigma_spin.setMaximumWidth(90)
         blob_doh_sigma_row = QtWidgets.QHBoxLayout()
         doh_min_sigma_label = QtWidgets.QLabel("minσ")
-        doh_min_sigma_label.setToolTip("DoH (Determinant of Hessian) 検出の最小σ")
+        doh_min_sigma_label.setToolTip("Minimum sigma for DoH (Determinant of Hessian) detection")
         blob_doh_sigma_row.addWidget(doh_min_sigma_label)
         blob_doh_sigma_row.addWidget(self.blob_doh_min_sigma_spin)
         blob_doh_sigma_row.addSpacing(8)
         doh_max_sigma_label = QtWidgets.QLabel("maxσ")
-        doh_max_sigma_label.setToolTip("DoH (Determinant of Hessian) 検出の最大σ")
+        doh_max_sigma_label.setToolTip("Maximum sigma for DoH (Determinant of Hessian) detection")
         blob_doh_sigma_row.addWidget(doh_max_sigma_label)
         blob_doh_sigma_row.addWidget(self.blob_doh_max_sigma_spin)
-        doh_sigma_range_label = QtWidgets.QLabel("DoH σ範囲")
+        doh_sigma_range_label = QtWidgets.QLabel("DoH Sigma Range")
         doh_sigma_range_label.setToolTip(
-            "DoH (Determinant of Hessian) blob検出のσ範囲:\n"
-            "Hessian行列の行列式を用いた高速blob検出方法です。\n"
-            "LoGよりも計算効率が良く、円形スポット検出に適しています。"
+            "Sigma range for DoH (Determinant of Hessian) blob detection:\n"
+            "This fast blob detector uses the determinant of the Hessian matrix.\n"
+            "It is more efficient than LoG and suitable for circular spot detection."
         )
         fit_grid.addWidget(doh_sigma_range_label, r, 0)
         fit_grid.addLayout(blob_doh_sigma_row, r, 1, alignment=QtCore.Qt.AlignLeft)
@@ -3635,9 +4158,9 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.blob_doh_threshold_rel_spin.setMaximumWidth(90)
         doh_thr_label = QtWidgets.QLabel("DoH thr(rel)")
         doh_thr_label.setToolTip(
-            "DoH検出の相対閾値（0〜1）:\n"
-            "DoH応答の最大値に対する比率で閾値を設定します。\n"
-            "低い値ほど多くのblobを検出します。"
+            "Relative threshold for DoH detection (0-1):\n"
+            "Sets the threshold as a fraction of the maximum DoH response.\n"
+            "Lower values detect more blobs."
         )
         fit_grid.addWidget(doh_thr_label, r, 0)
         fit_grid.addWidget(self.blob_doh_threshold_rel_spin, r, 1, alignment=QtCore.Qt.AlignLeft)
@@ -3649,15 +4172,15 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.localmax_thr_spin.setDecimals(3)
         self.localmax_thr_spin.setValue(float(getattr(self.spot_analyzer, "localmax_threshold_rel", 0.05)))
         self.localmax_thr_spin.setMaximumWidth(90)
-        self.localmax_thr_spin.setToolTip("peak_local_max の閾値。検出画像（LoG/DoG）最大値に対する相対値（0〜1）。")
+        self.localmax_thr_spin.setToolTip("Threshold for peak_local_max, relative to the maximum value in the detection image (LoG/DoG) (0-1).")
         localmax_thr_label = QtWidgets.QLabel("localmax thr(rel)")
         localmax_thr_label.setToolTip(
-            "検出画像（LoG/DoG）でのピーク検出相対閾値（0〜1）:\n"
-            "検出画像の最大値に対する比率で閾値を設定します。\n"
-            "例: 最大値100、thr=0.05 → 閾値5以上のピークを検出"
+            "Relative peak-detection threshold in the detection image (LoG/DoG) (0-1):\n"
+            "Sets the threshold as a fraction of the maximum detection-image value.\n"
+            "Example: maximum=100, thr=0.05 -> detect peaks with values >= 5"
         )
-        # NOTE: Peak初期化は現在NMSベースであり、この閾値は実質使われません。
-        # 後方互換（保存/復元・内部参照）のためウィジェットは残しつつUIから非表示にします。
+        # NOTE: Peak initialization is currently NMS-based, so this threshold is effectively unused.
+        # Keep the widget for backward compatibility (save/restore and internal references), but hide it from the UI.
         localmax_thr_label.setVisible(False)
         self.localmax_thr_spin.setVisible(False)
         fit_grid.addWidget(localmax_thr_label, r, 0)
@@ -3670,13 +4193,13 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.localmax_snr_spin.setDecimals(2)
         self.localmax_snr_spin.setValue(float(getattr(self.spot_analyzer, "localmax_threshold_snr", 0.0)))
         self.localmax_snr_spin.setMaximumWidth(90)
-        self.localmax_snr_spin.setToolTip("検出画像のノイズ(MAD)基準の閾値。0で無効。")
+        self.localmax_snr_spin.setToolTip("Noise-based threshold for the detection image using MAD. 0 disables it.")
         localmax_snr_label = QtWidgets.QLabel("localmax thr(SNR)")
         localmax_snr_label.setToolTip(
-            "検出画像のノイズ基準SNR閾値:\n"
-            "閾値 = thr(SNR) × ノイズレベル(MAD)\n"
-            "thr(rel)と併用時は大きい方が採用されます。\n"
-            "0で無効化。ノイズに強いピークのみ検出したい場合に設定。"
+            "Noise-based SNR threshold for the detection image:\n"
+            "threshold = thr(SNR) x noise level (MAD)\n"
+            "When used with thr(rel), the larger threshold is applied.\n"
+            "Set to 0 to disable. Use this when you only want peaks that stand above noise."
         )
         localmax_snr_label.setVisible(False)
         self.localmax_snr_spin.setVisible(False)
@@ -3688,16 +4211,16 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         form_layout.addWidget(fit_group)
 
         # --- Fit (Gaussian model) ---
-        fit_model_group = QtWidgets.QGroupBox("フィット（ガウスモデル）")
+        fit_model_group = QtWidgets.QGroupBox("Fit (Gaussian Model)")
         fit_model_grid = QtWidgets.QGridLayout(fit_model_group)
         _setup_grid(fit_model_grid)
         r = 0
 
-        self.fit_enabled_check = QtWidgets.QCheckBox("ガウスフィットを行う")
+        self.fit_enabled_check = QtWidgets.QCheckBox("Enable Gaussian Fit")
         self.fit_enabled_check.setChecked(bool(getattr(self.spot_analyzer, "fit_enabled", True)))
         self.fit_enabled_check.setToolTip(
-            "OFFにすると、初期位置検索で得たピーク座標をそのまま最終結果として採用します。\n"
-            "このとき座標最適化は行わず、AIC/BICは初期モデルのまま評価します。"
+            "When OFF, peak coordinates found by initial-position search are used directly as the final result.\n"
+            "Coordinate optimization is skipped, and AIC/BIC are evaluated using the initial model."
         )
         self.fit_enabled_check.toggled.connect(self._update_fit_ui_enabled)
         fit_model_grid.addWidget(self.fit_enabled_check, r, 0, 1, 3, alignment=QtCore.Qt.AlignLeft)
@@ -3708,11 +4231,11 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.initial_sigma_spin.setSingleStep(0.1)
         self.initial_sigma_spin.setValue(self.spot_analyzer.initial_sigma)
         self.initial_sigma_spin.setMaximumWidth(90)
-        initial_sigma_label = QtWidgets.QLabel("初期σ")
+        initial_sigma_label = QtWidgets.QLabel("Initial Sigma")
         initial_sigma_label.setToolTip(
-            "ガウシアンフィッティングの初期σ値:\n"
-            "ピーク候補のσ初期値として使用されます。\n"
-            "スポットの典型的なサイズに合わせて設定してください。"
+            "Initial sigma value for Gaussian fitting:\n"
+            "Used as the initial sigma for peak candidates.\n"
+            "Set it according to the typical spot size."
         )
         fit_model_grid.addWidget(initial_sigma_label, r, 0)
         fit_model_grid.addWidget(self.initial_sigma_spin, r, 1, alignment=QtCore.Qt.AlignLeft)
@@ -3730,20 +4253,20 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.sigma_max_spin.setValue(self.spot_analyzer.sigma_bounds[1])
         self.sigma_max_spin.setMaximumWidth(90)
         sigma_row = QtWidgets.QHBoxLayout()
-        sigma_lower_label = QtWidgets.QLabel("下限")
-        sigma_lower_label.setToolTip("フィッティング時のσ最小値。これ以下に収束しません。")
+        sigma_lower_label = QtWidgets.QLabel("Lower")
+        sigma_lower_label.setToolTip("Minimum sigma during fitting. The fit will not converge below this value.")
         sigma_row.addWidget(sigma_lower_label)
         sigma_row.addWidget(self.sigma_min_spin)
         sigma_row.addSpacing(8)
-        sigma_upper_label = QtWidgets.QLabel("上限")
-        sigma_upper_label.setToolTip("フィッティング時のσ最大値。これ以上に収束しません。")
+        sigma_upper_label = QtWidgets.QLabel("Upper")
+        sigma_upper_label.setToolTip("Maximum sigma during fitting. The fit will not converge above this value.")
         sigma_row.addWidget(sigma_upper_label)
         sigma_row.addWidget(self.sigma_max_spin)
         sigma_bounds_label = QtWidgets.QLabel("σ")
         sigma_bounds_label.setToolTip(
-            "ガウシアンフィッティング時のσ制約範囲:\n"
-            "フィッティング中にσがこの範囲内に制限されます。\n"
-            "スポットサイズの変動範囲に合わせて設定してください。"
+            "Sigma constraint range during Gaussian fitting:\n"
+            "Sigma is constrained to this range during fitting.\n"
+            "Set it according to the expected variation in spot size."
         )
         fit_model_grid.addWidget(sigma_bounds_label, r, 0)
         fit_model_grid.addLayout(sigma_row, r, 1, alignment=QtCore.Qt.AlignLeft)
@@ -3752,7 +4275,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
         form_layout.addWidget(fit_model_group)
 
-        filter_group = QtWidgets.QGroupBox("結果フィルタ")
+        filter_group = QtWidgets.QGroupBox("Result Filters")
         filter_grid = QtWidgets.QGridLayout(filter_group)
         _setup_grid(filter_grid)
         r = 0
@@ -3763,12 +4286,12 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.snr_spin.setSingleStep(0.1)
         self.snr_spin.setValue(self.spot_analyzer.snr_threshold)
         self.snr_spin.setMaximumWidth(90)
-        snr_label = QtWidgets.QLabel("S/N閾値（出力フィルタ）")
+        snr_label = QtWidgets.QLabel("S/N Threshold (output filter)")
         snr_label.setToolTip(
-            "最終結果に含めるピークのS/N比（Signal-to-Noise Ratio）最小値:\n"
-            "S/N = 振幅 / ノイズレベル\n"
-            "この値以下のピークは最終結果から除外されます。\n"
-            "ノイズの多い画像では高めに設定してください。"
+            "Minimum S/N ratio (Signal-to-Noise Ratio) for peaks included in final results:\n"
+            "S/N = amplitude / noise level\n"
+            "Peaks below this value are excluded from final results.\n"
+            "Use a higher value for noisy images."
         )
         filter_grid.addWidget(snr_label, r, 0)
         filter_grid.addWidget(self.snr_spin, r, 1, alignment=QtCore.Qt.AlignLeft)
@@ -3779,13 +4302,13 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.precheck_radius_spin.setRange(0, 20)
         self.precheck_radius_spin.setValue(int(getattr(self.spot_analyzer, "precheck_radius_px", 2)))
         self.precheck_radius_spin.setMaximumWidth(70)
-        self.precheck_radius_spin.setToolTip("元画像(ROI)の局所ピーク判定半径。0で無効。")
+        self.precheck_radius_spin.setToolTip("Local-peak validation radius on the original ROI image. 0 disables it.")
         precheck_r_label = QtWidgets.QLabel("precheck r(px)")
         precheck_r_label.setToolTip(
-            "元画像での局所最大値判定半径（ピクセル）:\n"
-            "各ピーク候補の周囲r(px)の窓内で最大値かチェック。\n"
-            "窓内最大値より10%以上小さい場合、そのピークを除外。\n"
-            "0で無効化。検出画像で見つかったが実際には局所最大でないピークを除外。"
+            "Local-maximum validation radius on the original image, in pixels:\n"
+            "Checks whether each peak candidate is the maximum inside an r(px) window.\n"
+            "If it is more than 10% below the window maximum, the peak is excluded.\n"
+            "Set to 0 to disable. This removes peaks detected in the detection image that are not local maxima in the original image."
         )
         filter_grid.addWidget(precheck_r_label, r, 0)
         filter_grid.addWidget(self.precheck_radius_spin, r, 1, alignment=QtCore.Qt.AlignLeft)
@@ -3797,23 +4320,23 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.precheck_kmad_spin.setDecimals(2)
         self.precheck_kmad_spin.setValue(float(getattr(self.spot_analyzer, "precheck_kmad", 1.0)))
         self.precheck_kmad_spin.setMaximumWidth(90)
-        self.precheck_kmad_spin.setToolTip("元画像(ROI)で中央値+K*MADを下回るピークを除外。0で無効。")
+        self.precheck_kmad_spin.setToolTip("Exclude peaks below median + K*MAD in the original ROI image. 0 disables it.")
         precheck_kmad_label = QtWidgets.QLabel("precheck K(MAD)")
         precheck_kmad_label.setToolTip(
-            "元画像のノイズ基準閾値係数:\n"
-            "各ピーク周囲の窓で 中央値 + K×MAD を計算。\n"
-            "ピーク強度がこの値を下回る場合、除外します。\n"
-            "MAD = Median Absolute Deviation（ロバストな分散推定）\n"
-            "0で無効化。ノイズレベル以上の強度を持つピークのみ残したい場合に設定。"
+            "Noise-based threshold coefficient for the original image:\n"
+            "Calculates median + K*MAD in a window around each peak.\n"
+            "If the peak intensity is below this value, the peak is excluded.\n"
+            "MAD = Median Absolute Deviation, a robust variance estimate.\n"
+            "Set to 0 to disable. Use this when you only want peaks above the noise level."
         )
         filter_grid.addWidget(precheck_kmad_label, r, 0)
         filter_grid.addWidget(self.precheck_kmad_spin, r, 1, alignment=QtCore.Qt.AlignLeft)
         r += 1
 
         # DBSCAN params (spatial outlier filtering)
-        self.dbscan_enabled_check = QtWidgets.QCheckBox("DBSCAN 外れ値除去")
+        self.dbscan_enabled_check = QtWidgets.QCheckBox("DBSCAN Outlier Removal")
         self.dbscan_enabled_check.setChecked(bool(getattr(self.spot_analyzer, "dbscan_enabled", False)))
-        self.dbscan_enabled_check.setToolTip("空間的に孤立したピークをノイズとして除去します。")
+        self.dbscan_enabled_check.setToolTip("Removes spatially isolated peaks as noise.")
         filter_grid.addWidget(self.dbscan_enabled_check, r, 0, 1, 3, alignment=QtCore.Qt.AlignLeft)
         r += 1
 
@@ -3822,13 +4345,13 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.dbscan_eps_spin.setSingleStep(0.5)
         self.dbscan_eps_spin.setValue(float(getattr(self.spot_analyzer, "dbscan_eps", 5.0)))
         self.dbscan_eps_spin.setMaximumWidth(90)
-        self.dbscan_eps_spin.setToolTip("DBSCANの近傍半径（ピクセル）。")
+        self.dbscan_eps_spin.setToolTip("DBSCAN neighborhood radius in pixels.")
         dbscan_eps_label = QtWidgets.QLabel("DBSCAN eps")
         dbscan_eps_label.setToolTip(
-            "DBSCAN クラスタリングの近傍半径（ピクセル）:\n"
-            "Multiscale (LoG+DBSCAN) 初期化モードで使用されます。\n"
-            "この距離以内の点を同一クラスタとみなし、重複検出を除去します。\n"
-            "ピーク間の最小距離程度に設定すると良いでしょう。"
+            "Neighborhood radius for DBSCAN clustering in pixels:\n"
+            "Used by the Multiscale (LoG+DBSCAN) initialization mode.\n"
+            "Points within this distance are treated as the same cluster to remove duplicate detections.\n"
+            "A value near the minimum peak distance is often a good starting point."
         )
         filter_grid.addWidget(dbscan_eps_label, r, 0)
         filter_grid.addWidget(self.dbscan_eps_spin, r, 1, alignment=QtCore.Qt.AlignLeft)
@@ -3839,11 +4362,11 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.min_amp_spin.setSingleStep(0.1)
         self.min_amp_spin.setValue(self.spot_analyzer.min_amplitude)
         self.min_amp_spin.setMaximumWidth(90)
-        min_amp_label = QtWidgets.QLabel("最小振幅")
+        min_amp_label = QtWidgets.QLabel("Minimum Amplitude")
         min_amp_label.setToolTip(
-            "最終結果に含めるピークの最小振幅:\n"
-            "フィッティングされたガウス関数の振幅（高さ）がこの値以下の\n"
-            "ピークは最終結果から除外されます。"
+            "Minimum amplitude for peaks included in final results:\n"
+            "Peaks whose fitted Gaussian amplitude (height) is below this value\n"
+            "are excluded from final results."
         )
         filter_grid.addWidget(min_amp_label, r, 0)
         filter_grid.addWidget(self.min_amp_spin, r, 1, alignment=QtCore.Qt.AlignLeft)
@@ -3854,11 +4377,11 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.min_sigma_result_spin.setSingleStep(0.1)
         self.min_sigma_result_spin.setValue(self.spot_analyzer.min_sigma_result)
         self.min_sigma_result_spin.setMaximumWidth(90)
-        min_sigma_result_label = QtWidgets.QLabel("最小σ (結果)")
+        min_sigma_result_label = QtWidgets.QLabel("Minimum Sigma (result)")
         min_sigma_result_label.setToolTip(
-            "最終結果に含めるピークの最小σ:\n"
-            "フィッティング後のσがこの値以下のピークを除外します。\n"
-            "極端に小さい（点状の）ピークをノイズとして除外したい場合に設定します。"
+            "Minimum sigma for peaks included in final results:\n"
+            "Peaks whose fitted sigma is below this value are excluded.\n"
+            "Use this to remove extremely small point-like peaks as noise."
         )
         filter_grid.addWidget(min_sigma_result_label, r, 0)
         filter_grid.addWidget(self.min_sigma_result_spin, r, 1, alignment=QtCore.Qt.AlignLeft)
@@ -3867,55 +4390,55 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
         form_layout.addWidget(filter_group)
 
-        view_group = QtWidgets.QGroupBox("表示 / 記録")
+        view_group = QtWidgets.QGroupBox("Display / Recording")
         view_grid = QtWidgets.QGridLayout(view_group)
         _setup_grid(view_grid)
         r = 0
         self.spot_radius_spin = QtWidgets.QSpinBox()
         self.spot_radius_spin.setRange(1, 200)
         self.spot_radius_spin.setValue(4)
-        self.spot_radius_spin.setToolTip("スポット中心から半径r(px)円内の平均高さを記録します。")
+        self.spot_radius_spin.setToolTip("Records the average height inside a circle of radius r(px) around each spot center.")
         self.spot_radius_spin.setMaximumWidth(80)
         self.spot_radius_spin.valueChanged.connect(self._on_spot_radius_changed)
-        spot_radius_label = QtWidgets.QLabel("Spot半径 (px)")
+        spot_radius_label = QtWidgets.QLabel("Spot Radius (px)")
         spot_radius_label.setToolTip(
-            "スポット測定半径（ピクセル）:\n"
-            "検出されたピーク中心から半径r(px)の円内の平均高さを計算し記録します。\n"
-            "この値は表示にも使用され、ピークマーカーの円の大きさになります。"
+            "Spot measurement radius in pixels:\n"
+            "Calculates and records the average height inside a circle of radius r(px) from the detected peak center.\n"
+            "This value is also used for display as the peak marker circle size."
         )
         view_grid.addWidget(spot_radius_label, r, 0)
         view_grid.addWidget(self.spot_radius_spin, r, 1, alignment=QtCore.Qt.AlignLeft)
         r += 1
 
-        self.show_roi_spots_check = QtWidgets.QCheckBox("ROI画像にスポット表示")
+        self.show_roi_spots_check = QtWidgets.QCheckBox("Show Spots on ROI Images")
         self.show_roi_spots_check.setChecked(True)
-        self.show_roi_spots_check.setToolTip("下段のROI画像（前処理ROI/LoG・DoG ROI）にスポットを重ねて表示します。")
+        self.show_roi_spots_check.setToolTip("Overlay spots on the lower ROI images (preprocessed ROI / LoG or DoG ROI).")
         self.show_roi_spots_check.toggled.connect(self._on_any_ui_changed)
         view_grid.addWidget(self.show_roi_spots_check, r, 0, 1, 3, alignment=QtCore.Qt.AlignLeft)
         r += 1
 
-        self.show_det_spots_check = QtWidgets.QCheckBox("検出画像にスポット表示")
+        self.show_det_spots_check = QtWidgets.QCheckBox("Show Spots on Detection Image")
         self.show_det_spots_check.setChecked(True)
-        self.show_det_spots_check.setToolTip("下段の検出画像（LoG/DoG）にスポットを重ねて表示します。")
+        self.show_det_spots_check.setToolTip("Overlay spots on the lower detection image (LoG/DoG).")
         self.show_det_spots_check.toggled.connect(self._on_any_ui_changed)
         view_grid.addWidget(self.show_det_spots_check, r, 0, 1, 3, alignment=QtCore.Qt.AlignLeft)
         r += 1
 
         # Debug: show fit-result (final) peaks on ROI(preprocessed)
-        self.show_fit_spots_on_roi_pre_check = QtWidgets.QCheckBox("ROI(pre)にフィット後ピーク表示（デバッグ）")
+        self.show_fit_spots_on_roi_pre_check = QtWidgets.QCheckBox("Show Fitted Peaks on ROI(pre) (debug)")
         self.show_fit_spots_on_roi_pre_check.setChecked(False)
         self.show_fit_spots_on_roi_pre_check.setToolTip(
-            "左下のROI(preprocessed)に、フィット後の最終ピーク位置（final peaks）を重ねて表示します。\n"
-            "LoG/DoGで得た初期位置とフィット結果の整合チェック用です。"
+            "Overlay final fitted peak positions on the lower-left ROI(preprocessed) image.\n"
+            "Use this to check consistency between LoG/DoG initial positions and fitted results."
         )
         self.show_fit_spots_on_roi_pre_check.toggled.connect(self._on_any_ui_changed)
         view_grid.addWidget(self.show_fit_spots_on_roi_pre_check, r, 0, 1, 3, alignment=QtCore.Qt.AlignLeft)
         r += 1
 
         # Snap-to-local-max (final peak coordinates)
-        self.snap_enabled_check = QtWidgets.QCheckBox("最終ピークを局所最大へスナップ")
+        self.snap_enabled_check = QtWidgets.QCheckBox("Snap Final Peaks to Local Maxima")
         self.snap_enabled_check.setChecked(bool(getattr(self.spot_analyzer, "snap_enabled", False)))
-        self.snap_enabled_check.setToolTip("最終結果のピーク座標を、検出画像（LoG/DoG）上の局所最大へ寄せます。")
+        self.snap_enabled_check.setToolTip("Move final peak coordinates to local maxima on the detection image (LoG/DoG).")
         view_grid.addWidget(self.snap_enabled_check, r, 0, 1, 3, alignment=QtCore.Qt.AlignLeft)
         r += 1
 
@@ -3923,21 +4446,21 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.snap_radius_spin.setRange(0, 50)
         self.snap_radius_spin.setValue(int(getattr(self.spot_analyzer, "snap_radius", 2)))
         self.snap_radius_spin.setMaximumWidth(80)
-        self.snap_radius_spin.setToolTip("スナップ探索半径（px）。0でスナップしません。")
-        snap_radius_label = QtWidgets.QLabel("スナップ半径 (px)")
+        self.snap_radius_spin.setToolTip("Snap search radius (px). 0 disables snapping.")
+        snap_radius_label = QtWidgets.QLabel("Snap Radius (px)")
         snap_radius_label.setToolTip(
-            "スナップ探索半径（ピクセル）:\n"
-            "最終ピークを検出画像（LoG/DoG）の局所最大へ移動（スナップ）する際、\n"
-            "この半径以内で最大値を探索します。\n"
-            "0に設定するとスナップを無効化します。"
+            "Snap search radius in pixels:\n"
+            "When moving final peaks to local maxima on the detection image (LoG/DoG),\n"
+            "the maximum is searched inside this radius.\n"
+            "Set to 0 to disable snapping."
         )
         view_grid.addWidget(snap_radius_label, r, 0)
         view_grid.addWidget(self.snap_radius_spin, r, 1, alignment=QtCore.Qt.AlignLeft)
         r += 1
 
-        self.snap_refit_check = QtWidgets.QCheckBox("スナップ後に再フィット(1回)")
+        self.snap_refit_check = QtWidgets.QCheckBox("Refit Once After Snap")
         self.snap_refit_check.setChecked(bool(getattr(self.spot_analyzer, "snap_refit_enabled", False)))
-        self.snap_refit_check.setToolTip("スナップ位置を初期値にして、同じピーク数で1回だけ再フィットします（遅くなることがあります）。")
+        self.snap_refit_check.setToolTip("Use snapped positions as initial values and refit once with the same number of peaks. This may be slower.")
         view_grid.addWidget(self.snap_refit_check, r, 0, 1, 3, alignment=QtCore.Qt.AlignLeft)
         r += 1
 
@@ -3946,7 +4469,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         form_layout.addWidget(view_group)
 
         # --- Status / output ---
-        self.roi_status_label = QtWidgets.QLabel("ROI未選択")
+        self.roi_status_label = QtWidgets.QLabel("ROI Not Selected")
         form_layout.addWidget(self.roi_status_label)
 
         self.selection_label = QtWidgets.QLabel("")
@@ -3967,38 +4490,38 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         form_layout.addWidget(self.output)
 
         height_export_row = QtWidgets.QHBoxLayout()
-        height_export_label = QtWidgets.QLabel("高さ保存値")
+        height_export_label = QtWidgets.QLabel("Height Value for CSV")
         height_export_label.setToolTip(
-            "CSVへ保存する高さの主値を選択します。\n"
-            "・Spot位置: スポット座標での高さ\n"
-            "・Spot径内平均: Spot半径の円内平均高さ"
+            "Select the primary height value saved to CSV.\n"
+            "- Spot Position: height at the spot coordinate\n"
+            "- Spot-Radius Mean: average height inside the spot-radius circle"
         )
         height_export_row.addWidget(height_export_label)
         self.height_export_mode_combo = QtWidgets.QComboBox()
-        self.height_export_mode_combo.addItems(["Spot位置", "Spot径内平均"])
-        self.height_export_mode_combo.setCurrentText("Spot径内平均")
-        self.height_export_mode_combo.setToolTip("CSVの高さ主値として保存する方式を選択します。")
+        self.height_export_mode_combo.addItems(["Spot Position", "Spot-Radius Mean"])
+        self.height_export_mode_combo.setCurrentText("Spot-Radius Mean")
+        self.height_export_mode_combo.setToolTip("Select which height value is saved as the primary CSV height.")
         height_export_row.addWidget(self.height_export_mode_combo)
         height_export_row.addStretch(1)
         form_layout.addLayout(height_export_row)
 
-        self.export_btn = QtWidgets.QPushButton("CSVエクスポート")
+        self.export_btn = QtWidgets.QPushButton("Export CSV")
         self.export_btn.clicked.connect(self.export_spots_csv)
         self.export_btn.setEnabled(False)
         form_layout.addWidget(self.export_btn)
 
-        self.import_resume_btn = QtWidgets.QPushButton("CSV読み込み→復元")
-        self.import_resume_btn.setToolTip("保存したSpot CSVを読み込み、解析途中のスポット表示状態を復元します。")
+        self.import_resume_btn = QtWidgets.QPushButton("Load CSV -> Restore")
+        self.import_resume_btn.setToolTip("Load saved Spot CSV files and restore the in-progress spot display state.")
         self.import_resume_btn.clicked.connect(self.import_csv_restore)
         form_layout.addWidget(self.import_resume_btn)
 
-        self.reset_btn = QtWidgets.QPushButton("解析結果をリセット")
-        self.reset_btn.setToolTip("スポット結果・ROI・表示を一括でクリアします（手動）。")
+        self.reset_btn = QtWidgets.QPushButton("Reset Analysis Results")
+        self.reset_btn.setToolTip("Clear spot results, ROI, and display state together manually.")
         self.reset_btn.clicked.connect(self._reset_analysis_results)
         form_layout.addWidget(self.reset_btn)
 
         self.edit_help_label = QtWidgets.QLabel(
-            "Spot編集: Ctrl/⌘+ドラッグ=移動, Shift+クリック=追加, Alt(Option)+クリック=削除"
+            "Spot editing: Ctrl/Cmd+drag=move, Shift+click=add, Alt(Option)+click=delete"
         )
         self.edit_help_label.setStyleSheet("color: #666; font-size: 11px;")
         form_layout.addWidget(self.edit_help_label)
@@ -4076,7 +4599,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         # NOTE: redraw/reanalysis is handled by the parameter-change handler
 
     def _update_init_mode_ui_enabled(self, *_args) -> None:
-        mode = (self.init_mode_combo.currentText() or "Watershed (推奨)").strip().lower()
+        mode = (self.init_mode_combo.currentText() or "Watershed (Recommended)").strip().lower()
         is_doh = "doh" in mode
         is_ws = "watershed" in mode or "water" in mode
         is_peak = "peak" in mode
@@ -4122,11 +4645,11 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                 self.snap_enabled_check.setEnabled(fit_enabled)
                 if not fit_enabled:
                     self.snap_enabled_check.setToolTip(
-                        "フィットOFF時は、初期位置検索で得た座標をそのまま使うためスナップしません。"
+                        "When fitting is OFF, snapping is disabled because coordinates from initial-position search are used directly."
                     )
                 else:
                     self.snap_enabled_check.setToolTip(
-                        "最終結果のピーク座標を、検出画像（LoG/DoG）上の局所最大へ寄せます。"
+                        "Move final peak coordinates to local maxima on the detection image (LoG/DoG)."
                     )
             if getattr(self, "snap_radius_spin", None) is not None:
                 self.snap_radius_spin.setEnabled(fit_enabled)
@@ -4134,11 +4657,11 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                 self.snap_refit_check.setEnabled(fit_enabled)
                 if not fit_enabled:
                     self.snap_refit_check.setToolTip(
-                        "ガウスフィットをOFFにしている間は再フィットできません。"
+                        "Refitting is unavailable while Gaussian fitting is OFF."
                     )
                 else:
                     self.snap_refit_check.setToolTip(
-                        "スナップ位置を初期値にして、同じピーク数で1回だけ再フィットします（遅くなることがあります）。"
+                        "Use snapped positions as initial values and refit once with the same number of peaks. This may be slower."
                     )
         except Exception:
             pass
@@ -4166,14 +4689,14 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                 pass
 
     def _on_any_ui_changed(self, *_args) -> None:
-        """UI変更時の即時更新（表示のみ）。"""
+        """Immediate UI-change update for display only."""
         self._refresh_overlay()
 
     def _on_analysis_param_changed(self, *_args) -> None:
         """
-        解析パラメータ変更時:
-        - 表示（ROI画像など）は即時更新
-        - 解析（spots更新）はデバウンスして実行
+        When analysis parameters change:
+        - Display elements such as ROI images update immediately
+        - Analysis updates for spots are debounced
         """
         self._refresh_overlay()
         self._schedule_reanalysis()
@@ -4186,7 +4709,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         if self.manual_roi is None:
             return
         try:
-            # debounce: spinbox連続操作で解析が連打されないようにする
+            # Debounce spinbox changes so analysis is not triggered repeatedly.
             self._reanalysis_timer.start(250)
         except Exception:
             pass
@@ -4345,7 +4868,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             high_sigma = float(self.bandpass_high_spin.value())
             if high_sigma <= low_sigma:
                 if show_errors:
-                    QtWidgets.QMessageBox.warning(self, "Invalid Parameter", "DoG: σ high は σ low より大きくしてください。")
+                    QtWidgets.QMessageBox.warning(self, "Invalid Parameter", "DoG: sigma high must be greater than sigma low.")
                 return False
             self.spot_analyzer.bandpass_low_sigma = low_sigma
             self.spot_analyzer.bandpass_high_sigma = high_sigma
@@ -4353,12 +4876,12 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             log_sigma = float(self.log_sigma_spin.value())
             if log_sigma <= 0:
                 if show_errors:
-                    QtWidgets.QMessageBox.warning(self, "Invalid Parameter", "LoG: σ は正の値にしてください。")
+                    QtWidgets.QMessageBox.warning(self, "Invalid Parameter", "LoG: sigma must be positive.")
                 return False
             self.spot_analyzer.log_sigma = log_sigma
 
         # fit params
-        init_ui = (self.init_mode_combo.currentText() or "Watershed (推奨)").strip().lower()
+        init_ui = (self.init_mode_combo.currentText() or "Watershed (Recommended)").strip().lower()
         if "watershed" in init_ui or "water" in init_ui:
             self.spot_analyzer.init_mode = "watershed"
         elif "doh" in init_ui or "blob doh" in init_ui:
@@ -4398,7 +4921,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         sigma_max = float(self.sigma_max_spin.value())
         if sigma_max <= sigma_min:
             if show_errors:
-                QtWidgets.QMessageBox.warning(self, "Invalid Parameter", "σ上限はσ下限より大きくしてください。")
+                QtWidgets.QMessageBox.warning(self, "Invalid Parameter", "The sigma upper bound must be greater than the sigma lower bound.")
             return False
         self.spot_analyzer.sigma_bounds = (sigma_min, sigma_max)
         self.spot_analyzer.snr_threshold = float(self.snr_spin.value())
@@ -4417,22 +4940,22 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
     def _refresh_selection_label(self) -> None:
         if not self.main_window or not hasattr(self.main_window, "FileList"):
-            self.selection_label.setText("ファイル選択情報を取得できません。")
+            self.selection_label.setText("Could not get file-selection information.")
             return
         selected = self.main_window.FileList.selectedItems()
         if selected:
             names = [item.text() for item in selected]
-            self.selection_label.setText(f"選択中: {', '.join(names)}")
+            self.selection_label.setText(f"Selected: {', '.join(names)}")
         else:
             current = self.main_window.FileList.currentItem()
             if current:
-                self.selection_label.setText(f"現在: {current.text()}")
+                self.selection_label.setText(f"Current: {current.text()}")
             else:
-                self.selection_label.setText("選択なし")
+                self.selection_label.setText("No selection")
 
     def _ensure_selection_loaded(self) -> bool:
         if not self.main_window or not hasattr(self.main_window, "FileList"):
-            QtWidgets.QMessageBox.warning(self, "No Selection", "FileListが見つかりません。")
+            QtWidgets.QMessageBox.warning(self, "No Selection", "FileList was not found.")
             return False
         selected = self.main_window.FileList.selectedIndexes()
         if selected:
@@ -4440,12 +4963,12 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         else:
             target_row = self.main_window.FileList.currentRow()
         if target_row is None or target_row < 0:
-            QtWidgets.QMessageBox.information(self, "Select File", "ファイルリストで対象を選択してください。")
+            QtWidgets.QMessageBox.information(self, "Select File", "Select a target in the file list.")
             return False
 
-        # MainWindowのロジックに合わせて選択を反映させる
-        # setCurrentRowが itemSelectionChanged を発火し、pyNuD側の通常ハンドラ経由で
-        # メインウィンドウが最前面化するのを避けるため、シグナルを一時的にブロックする
+        # Reflect selection according to MainWindow logic
+        # setCurrentRow emits itemSelectionChanged, and the normal pyNuD handler may
+        # bring the main window to front, so block signals temporarily to avoid that.
         try:
             blocker = QtCore.QSignalBlocker(self.main_window.FileList)
             self.main_window.FileList.setCurrentRow(target_row)
@@ -4453,39 +4976,39 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             self.main_window.FileList.setCurrentRow(target_row)
         if hasattr(self.main_window, "ListClickFunction"):
             try:
-                # SpotAnalysisからの呼び出しではメインウィンドウを最前面化しない
+                # Do not bring the main window to front when called from SpotAnalysis.
                 try:
                     self.main_window.ListClickFunction(bring_to_front=False)
                 except TypeError:
-                    # 旧シグネチャ互換
+                    # Compatibility with the old signature
                     self.main_window.ListClickFunction()
             except Exception as exc:  # noqa: BLE001
-                QtWidgets.QMessageBox.warning(self, "Load Error", f"ファイル読み込みに失敗しました:\n{exc}")
+                QtWidgets.QMessageBox.warning(self, "Load Error", f"Failed to load file:\n{exc}")
                 return False
         return True
 
     def _prepare_frame(self) -> Optional[np.ndarray]:
         if not hasattr(gv, "files") or not gv.files:
-            QtWidgets.QMessageBox.information(self, "No Files", "ファイルがロードされていません。")
+            QtWidgets.QMessageBox.information(self, "No Files", "No files are loaded.")
             return None
         if getattr(gv, "currentFileNum", -1) < 0 or gv.currentFileNum >= len(gv.files):
-            QtWidgets.QMessageBox.warning(self, "Invalid Selection", "選択中のファイルインデックスが不正です。")
+            QtWidgets.QMessageBox.warning(self, "Invalid Selection", "The selected file index is invalid.")
             return None
 
-        # 最新のフレームを取得
+        # Get the latest frame
         try:
             LoadFrame(gv.files[gv.currentFileNum])
             InitializeAryDataFallback()
         except Exception as exc:  # noqa: BLE001
-            QtWidgets.QMessageBox.warning(self, "Load Error", f"フレーム読み込みに失敗しました:\n{exc}")
+            QtWidgets.QMessageBox.warning(self, "Load Error", f"Failed to load frame:\n{exc}")
             return None
 
         if not hasattr(gv, "aryData") or gv.aryData is None:
-            QtWidgets.QMessageBox.warning(self, "No Data", "画像データが利用できません。")
+            QtWidgets.QMessageBox.warning(self, "No Data", "Image data is not available.")
             return None
         frame = np.asarray(gv.aryData, dtype=np.float64)
         if frame.ndim != 2:
-            QtWidgets.QMessageBox.warning(self, "Data Error", "2D画像データのみ解析可能です。")
+            QtWidgets.QMessageBox.warning(self, "Data Error", "Only 2D image data can be analyzed.")
             return None
         return frame
 
@@ -4497,18 +5020,18 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                 pass
 
     def _on_frame_changed(self, frame_index: int) -> None:
-        # 現フレームの表示更新
+        # Update the current frame display
         if self.auto_analyze_check.isChecked():
-            # 自動解析時:
-            #  - そのフレームに手動ROIがあればそれを優先
-            #  - なければ直近過去フレームのROIを引き継ぐ（伝播）
+            # During Auto Analysis:
+            #  - Prefer the manual ROI for that frame if available
+            #  - Otherwise inherit the most recent ROI from a previous frame (propagation)
             roi_here = self.roi_by_frame.get(frame_index)
             if roi_here is not None:
                 self.manual_roi = roi_here
             else:
                 prev_roi = self._get_last_roi_at_or_before(frame_index - 1)
                 if prev_roi is not None:
-                    # 参照共有による意図しない書き換えを避けるためコピーして保存
+                    # Save a copy to avoid unintended mutation through shared references
                     propagated = dict(prev_roi)
                     self.roi_by_frame[frame_index] = propagated
                     self.manual_roi = propagated
@@ -4517,9 +5040,9 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         else:
             self.manual_roi = self.roi_by_frame.get(frame_index)
         if self.manual_roi is None:
-            self.roi_status_label.setText("ROI未選択")
+            self.roi_status_label.setText("ROI Not Selected")
         else:
-            self.roi_status_label.setText("ROI選択済み")
+            self.roi_status_label.setText("ROI Selected")
         self._sync_run_buttons_enabled()
         frame = self._prepare_frame()
         if frame is None:
@@ -4564,8 +5087,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
     def _get_last_roi_at_or_before(self, frame_index: int) -> Optional[Dict[str, float]]:
         """
-        指定フレーム以前（frame_index を含む）で、最後に設定されたROIを返す。
-        存在しない場合は None。
+        Return the most recently set ROI at or before the specified frame_index.
+        Returns None when no ROI exists.
         """
         if frame_index < 0:
             return None
@@ -4612,7 +5135,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
     def run_analysis(self) -> None:
         if self.manual_roi is None:
-            QtWidgets.QMessageBox.information(self, "ROI Required", "ROIを選択してください。")
+            QtWidgets.QMessageBox.information(self, "ROI Required", "Select an ROI first.")
             return
         if not self._ensure_selection_loaded():
             return
@@ -4627,7 +5150,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         min_peaks = int(self.min_peaks_spin.value())
         max_peaks = int(self.max_peaks_spin.value())
         if max_peaks < min_peaks:
-            QtWidgets.QMessageBox.warning(self, "Invalid Parameter", "最大ピーク数は最小ピーク数以上にしてください。")
+            QtWidgets.QMessageBox.warning(self, "Invalid Parameter", "The maximum peak count must be greater than or equal to the minimum peak count.")
             return
 
         center_override, roi_size_override, roi_mask, roi_bounds = self._roi_overrides(frame.shape)
@@ -4650,7 +5173,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         Spot-radius circle drawn for each spot.
         """
         if self.manual_roi is None:
-            QtWidgets.QMessageBox.information(self, "ROI Required", "ROIを選択してください。")
+            QtWidgets.QMessageBox.information(self, "ROI Required", "Select an ROI first.")
             return
         if not self._ensure_selection_loaded():
             return
@@ -4690,13 +5213,13 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         spots = list(self.spots_by_frame.get(frame_index) or [])
         if not spots:
             if show_messages:
-                QtWidgets.QMessageBox.information(self, "No Spots", "手動スポットがありません（追加/移動してから再フィットしてください）。")
+                QtWidgets.QMessageBox.information(self, "No Spots", "No manual spots are available. Add or move spots before refitting.")
             return False
 
         use_frame = frame if frame is not None else self.last_frame
         if use_frame is None:
             if show_messages:
-                QtWidgets.QMessageBox.warning(self, "No Data", "画像データが利用できません。")
+                QtWidgets.QMessageBox.warning(self, "No Data", "Image data is not available.")
             return False
 
         reference_spots = list(self.centroid_reference_by_frame.get(frame_index) or [])
@@ -4716,7 +5239,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             seeds_abs.append((x, y))
         if not seeds_abs:
             if show_messages:
-                QtWidgets.QMessageBox.warning(self, "Invalid Spots", "手動スポット座標が不正です。")
+                QtWidgets.QMessageBox.warning(self, "Invalid Spots", "Manual spot coordinates are invalid.")
             return False
 
         center_override, roi_size_override, roi_mask, roi_bounds = self._roi_overrides(use_frame.shape)
@@ -4743,7 +5266,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             ly = float(y_abs) - float(origin[1])
             if not (0.0 <= lx < float(w_roi) and 0.0 <= ly < float(h_roi)):
                 if show_messages:
-                    QtWidgets.QMessageBox.warning(self, "Spot Outside ROI", "手動スポットがROIの外にあります。ROI内へ移動してから再フィットしてください。")
+                    QtWidgets.QMessageBox.warning(self, "Spot Outside ROI", "Manual spots are outside the ROI. Move them inside the ROI before refitting.")
                 return False
             if roi_mask_bool is not None:
                 try:
@@ -4751,7 +5274,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                     iy = int(round(ly))
                     if ix < 0 or iy < 0 or ix >= w_roi or iy >= h_roi or not bool(roi_mask_bool[iy, ix]):
                         if show_messages:
-                            QtWidgets.QMessageBox.warning(self, "Spot Outside ROI Mask", "手動スポットがROIマスク（楕円など）の外にあります。マスク内へ移動してから再フィットしてください。")
+                            QtWidgets.QMessageBox.warning(self, "Spot Outside ROI Mask", "Manual spots are outside the ROI mask, such as an ellipse. Move them inside the mask before refitting.")
                         return False
                 except Exception:
                     pass
@@ -4759,7 +5282,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
         if not initial_local:
             if show_messages:
-                QtWidgets.QMessageBox.warning(self, "No Valid Spots", "再フィットに使えるスポットがありません。")
+                QtWidgets.QMessageBox.warning(self, "No Valid Spots", "No valid spots are available for refitting.")
             return False
 
         self.last_frame = use_frame
@@ -4810,7 +5333,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         fit_suffix = ""
         if best_model is not None and not bool(getattr(best_model, "fit_applied", True)):
             fit_suffix = ", No Fit"
-        html_lines.append(esc(f"判定モデル: {result.best_n_peaks} peaks ({result.criterion.upper()}{fit_suffix})"))
+        html_lines.append(esc(f"Selected model: {result.best_n_peaks} peaks ({result.criterion.upper()}{fit_suffix})"))
         for n_peaks in sorted(result.models.keys()):
             model = result.models[n_peaks]
             mode_label = "Fit" if bool(getattr(model, "fit_applied", True)) else "NoFit"
@@ -4826,14 +5349,14 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                     )
                 )
 
-        # 除外されたピークの情報を表示（bestモデルのみ）
+        # Show excluded-peak information for the best model only
         if result.best_n_peaks is not None and result.best_n_peaks in result.models:
             best_model = result.models[result.best_n_peaks]
             init_peaks = best_model.init_peaks if hasattr(best_model, 'init_peaks') else []
             final_peaks = best_model.peaks
             excluded_infos = list(getattr(best_model, "excluded_infos", []) or [])
-            # 2px近傍マッチを廃止し、解析側で確定収集した excluded_infos（真に落としたピーク）から表示する。
-            # P番号はフィルタ前ピークのインデックス（= init_peaks順）をIDマップで引く。
+            # Avoid 2px-neighborhood matching and display from excluded_infos collected by the analyzer.
+            # P numbers come from pre-filter peak indices, equivalent to init_peaks order, through an ID map.
             idx_map = getattr(best_model, "prefilter_index_by_id", None)
             excluded_rows: List[Tuple[Any, Dict[str, Any]]] = []
             for ent in excluded_infos:
@@ -4867,7 +5390,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             if excluded_rows:
                 excluded_rows.sort(key=lambda t: (t[0], str(t[1].get("reasons", ""))))
                 html_lines.append("")
-                html_lines.append(esc("--- 除外されたピーク ---"))
+                html_lines.append(esc("--- Excluded Peaks ---"))
                 for idx0, ent in excluded_rows:
                     pk = ent.get("peak")
                     try:
@@ -4875,12 +5398,12 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                     except Exception:
                         reasons = []
                     if not reasons:
-                        reasons = ["理由取得失敗"]
+                        reasons = ["Failed to get reason"]
                     reason_str = ", ".join(reasons)
                     peak_label = f"P{idx0 + 1}" if np.isfinite(idx0) else "P?"
                     prefix = (
-                        f"  [除外] {peak_label}: amp={pk.amplitude:.3g}, sigma={pk.sigma:.3g}, "
-                        f"(x,y)=({pk.x:.2f},{pk.y:.2f}), S/N={pk.snr:.2f}  ★理由: "
+                        f"  [Excluded] {peak_label}: amp={pk.amplitude:.3g}, sigma={pk.sigma:.3g}, "
+                        f"(x,y)=({pk.x:.2f},{pk.y:.2f}), S/N={pk.snr:.2f}  Reason: "
                     )
                     html_lines.append(
                         esc(prefix)
@@ -4890,9 +5413,9 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                     )
 
         html_lines.append("")
-        html_lines.append(esc(f"S/N閾値（出力フィルタ）: {result.snr_threshold:.2f}"))
+        html_lines.append(esc(f"S/N Threshold (output filter): {result.snr_threshold:.2f}"))
 
-        # Rich text (HTML) で表示（理由部分のみ赤字）
+        # Display as rich text (HTML), coloring only the reason text red.
         body = "\n".join(html_lines)
         html_doc = (
             '<pre style="margin:0; font-family:monospace; font-size:12px; white-space:pre-wrap;">'
@@ -4909,21 +5432,21 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                 pass
 
     def _show_roi_view(self, result: FrameAnalysis) -> None:
-        """ROI可視化ウィンドウを表示/更新"""
-        # ROI可視化ウィンドウは使用しない
+        """Show or update the ROI visualization window"""
+        # Do not use the ROI visualization window
         return
 
     def show_full_image_view(self, result: FrameAnalysis = None) -> None:
-        """全画像に検出ピークをオーバーレイ表示（矩形選択も可能）"""
+        """Overlay detected peaks on the full image; rectangle selection is also available"""
         if result is None:
             result = self.last_result
-        # 解析結果がなくても現在のフレームを表示してROI指定を可能にする
+        # Show the current frame even without analysis results so ROI selection remains possible.
         if result is None or self.last_frame is None:
             if not self._ensure_selection_loaded():
                 return
             frame = self._prepare_frame()
             if frame is None:
-                QtWidgets.QMessageBox.information(self, "No Data", "画像がロードされていません。")
+                QtWidgets.QMessageBox.information(self, "No Data", "No image is loaded.")
                 return
             self.last_frame = frame
             result = None
@@ -4969,14 +5492,14 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             return 4
 
     def _on_spot_radius_changed(self, _value: int) -> None:
-        # 半径が変わったら、現在フレームの高さを再計算して再描画
+        # When radius changes, recompute current-frame heights and redraw.
         frame_index = self._get_current_frame_index()
         self._recompute_spot_heights_for_frame(frame_index)
         self._refresh_overlay()
 
     def _reset_analysis_results(self) -> None:
-        """解析結果（spots/ROI/UI/表示）を一括でクリアする。"""
-        # データをクリア
+        """Clear analysis results, spots, ROI, UI state, and display state together."""
+        # Clear data
         self.spots_by_frame = {}
         self.centroid_reference_by_frame = {}
         self.initial_spots_by_frame = {}
@@ -4991,7 +5514,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self._dragging = False
         self._drag_index = None
 
-        # UIを初期状態へ
+        # Restore the initial UI state
         try:
             try:
                 self.output.setHtml("")
@@ -5000,7 +5523,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         except Exception:
             pass
         try:
-            self.roi_status_label.setText("ROI未選択")
+            self.roi_status_label.setText("ROI Not Selected")
         except Exception:
             pass
         for btn in (getattr(self, "run_btn", None), getattr(self, "run_all_btn", None), getattr(self, "export_btn", None)):
@@ -5011,11 +5534,11 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                 pass
         self._sync_run_buttons_enabled()
 
-        # 表示を更新（spots/ROIなしで再描画）
+        # Update display by redrawing without spots/ROI
         self._refresh_overlay()
 
     def _on_full_image_selected(self, roi_info: Dict[str, float]) -> None:
-        """全画像でのROI選択コールバック"""
+        """ROI selection callback on the full image"""
         w = roi_info.get("w", 0)
         h = roi_info.get("h", 0)
         if w <= 1 or h <= 1:
@@ -5023,9 +5546,9 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         frame_index = self._get_current_frame_index()
         self.roi_by_frame[frame_index] = roi_info
         self.manual_roi = roi_info
-        self.roi_status_label.setText("ROI選択済み")
+        self.roi_status_label.setText("ROI Selected")
         self._sync_run_buttons_enabled()
-        # 自動で再解析（ROI中心・サイズを利用）
+        # Reanalyze automatically using ROI center and size
         self.run_analysis()
 
     def _on_roi_shape_changed(self, text: str) -> None:
@@ -5239,7 +5762,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                     {"x": float(pk.x), "y": float(pk.y), "snr": float(pk.snr)}
                     for pk in best.init_peaks
                 ]
-        # 高さ情報を付与
+        # Add height information
         use_frame = frame if frame is not None else self.last_frame
         if use_frame is not None:
             self._recompute_spot_heights_for_frame(frame_index, frame=use_frame)
@@ -5344,7 +5867,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             text = str(self.height_export_mode_combo.currentText() or "").strip()
         except Exception:
             text = ""
-        if text == "Spot位置":
+        if text == "Spot Position":
             return "point"
         return "mean"
 
@@ -5356,9 +5879,9 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         spots: Sequence[Dict[str, float]],
     ) -> float:
         """
-        背景=フレーム全体の中央値。
+        Background = median of the full frame.
 
-        互換のため引数は残しているが、現在は ROI / spot 配置には依存しない。
+        Arguments are kept for compatibility, but the current calculation does not depend on ROI or spot placement.
         """
         img = np.asarray(frame, dtype=np.float64)
         if img.size == 0:
@@ -5441,8 +5964,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             is_delete = bool(mods & QtCore.Qt.AltModifier)
             is_ctrl = bool(mods & QtCore.Qt.ControlModifier)
             is_cmd = bool(mods & QtCore.Qt.MetaModifier)
-        # Matplotlib(Qt backend)では、修飾キーが event.key / keyboardModifiers に反映されないことがあるため
-        # 元のQtイベントからも取得する（macOSのCtrl+クリック/ドラッグ=右クリック扱い等の対策）
+        # In the Matplotlib Qt backend, modifier keys may not appear in event.key or keyboardModifiers, so
+        # also read them from the original Qt event to handle macOS Ctrl+click/drag as right-click, etc.
         try:
             gui_ev = getattr(event, "guiEvent", None)
             if gui_ev is not None and hasattr(gui_ev, "modifiers"):
@@ -5468,7 +5991,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                     self._recompute_spot_heights_for_frame(frame_index)
                     self._refresh_overlay()
                 return
-            # 移動は Ctrl または Cmd(⌘) 押下時のみ開始（ROI描画のドラッグと衝突しないようにする）
+            # Start moving only while Ctrl or Cmd is pressed to avoid conflicting with ROI drawing drags.
             if not (is_ctrl or is_cmd):
                 return
             idx = self._find_nearest_spot(spots, event.xdata, event.ydata)
@@ -5508,22 +6031,22 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
     def run_analysis_all_frames(self) -> None:
         if hasattr(self, "run_all_enable_check") and not self.run_all_enable_check.isChecked():
-            QtWidgets.QMessageBox.information(self, "All Frames Disabled", "「全フレーム解析を有効化」をONにしてください。")
+            QtWidgets.QMessageBox.information(self, "All Frames Disabled", "Turn ON Enable All Frames Analysis first.")
             return
         if self.manual_roi is None:
-            QtWidgets.QMessageBox.information(self, "ROI Required", "ROIを選択してください。")
+            QtWidgets.QMessageBox.information(self, "ROI Required", "Select an ROI first.")
             return
         if not self._ensure_selection_loaded():
             return
         if not hasattr(gv, "FrameNum") or gv.FrameNum <= 0:
-            QtWidgets.QMessageBox.warning(self, "No Frames", "フレーム数が取得できません。")
+            QtWidgets.QMessageBox.warning(self, "No Frames", "Could not get the number of frames.")
             return
         if not self._apply_ui_to_analyzer(show_errors=True):
             return
         min_peaks = int(self.min_peaks_spin.value())
         max_peaks = int(self.max_peaks_spin.value())
         if max_peaks < min_peaks:
-            QtWidgets.QMessageBox.warning(self, "Invalid Parameter", "最大ピーク数は最小ピーク数以上にしてください。")
+            QtWidgets.QMessageBox.warning(self, "Invalid Parameter", "The maximum peak count must be greater than or equal to the minimum peak count.")
             return
         original_index = int(getattr(gv, "index", 0))
         self.spots_by_frame = {}
@@ -5556,7 +6079,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             self._store_spots_for_frame(idx, result, frame=frame)
             if getattr(self, "auto_centroid_check", None) is not None and self.auto_centroid_check.isChecked():
                 self._apply_spot_centroid_to_frame(idx, frame=frame, result=result, show_messages=False, refresh_display=False)
-            # 署名を記録（同じ条件の再解析をスキップ）
+            # Record signature to skip reanalysis under the same conditions
             try:
                 roi_info = self.roi_by_frame.get(idx, self.manual_roi)
                 self._analysis_signature_by_frame[idx] = self._analysis_signature(idx, roi_info)
@@ -5595,7 +6118,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             )
         except Exception as exc:  # noqa: BLE001
             if show_errors:
-                QtWidgets.QMessageBox.critical(self, "分析エラー", f"SpotAnalysisの実行に失敗しました:\n{exc}")
+                QtWidgets.QMessageBox.critical(self, "Analysis Error", f"Failed to run SpotAnalysis:\n{exc}")
             return
 
         self.last_frame = frame
@@ -5612,7 +6135,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                 refresh_display=False,
             )
         self._display_result(result)
-        # 署名を記録（同じ条件なら再解析をスキップできる）
+        # Record signature so reanalysis can be skipped when conditions are unchanged
         try:
             fi = frame_index
             self._analysis_signature_by_frame[fi] = self._analysis_signature(fi, self._current_roi_overlay())
@@ -5663,16 +6186,16 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
     def export_spots_csv(self) -> None:
         if not self.spots_by_frame:
-            QtWidgets.QMessageBox.information(self, "No Data", "保存できるスポットがありません。")
+            QtWidgets.QMessageBox.information(self, "No Data", "There are no spots to save.")
             return
         if not hasattr(gv, "files") or not gv.files or gv.currentFileNum < 0:
-            QtWidgets.QMessageBox.warning(self, "No File", "元ファイル情報が取得できません。")
+            QtWidgets.QMessageBox.warning(self, "No File", "Could not get source file information.")
             return
         if not hasattr(gv, "XScanSize") or not hasattr(gv, "YScanSize") or gv.XScanSize == 0 or gv.YScanSize == 0:
-            QtWidgets.QMessageBox.warning(self, "Invalid Scan Size", "scan_sizeが0です。先に正しいデータを読み込んでください。")
+            QtWidgets.QMessageBox.warning(self, "Invalid Scan Size", "scan_size is 0. Load valid data first.")
             return
         if not hasattr(gv, "XPixel") or not hasattr(gv, "YPixel") or gv.XPixel == 0 or gv.YPixel == 0:
-            QtWidgets.QMessageBox.warning(self, "Invalid Pixel Size", "ピクセルサイズ情報が取得できません。")
+            QtWidgets.QMessageBox.warning(self, "Invalid Pixel Size", "Could not get pixel-size information.")
             return
 
         nm_per_pixel_x = gv.XScanSize / gv.XPixel
@@ -5723,10 +6246,10 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             box = QtWidgets.QMessageBox(self)
             box.setIcon(QtWidgets.QMessageBox.Question)
             box.setWindowTitle("File Exists")
-            box.setText("同名のCSVファイルが既に存在します。どうしますか？")
-            overwrite_btn = box.addButton("上書き", QtWidgets.QMessageBox.AcceptRole)
-            number_btn = box.addButton("連番で回避", QtWidgets.QMessageBox.ActionRole)
-            cancel_btn = box.addButton("キャンセル", QtWidgets.QMessageBox.RejectRole)
+            box.setText("CSV files with the same name already exist. What would you like to do?")
+            overwrite_btn = box.addButton("Overwrite", QtWidgets.QMessageBox.AcceptRole)
+            number_btn = box.addButton("Create Numbered Files", QtWidgets.QMessageBox.ActionRole)
+            cancel_btn = box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
             box.setDefaultButton(number_btn)
             box.exec_()
             clicked = box.clickedButton()
@@ -5740,10 +6263,10 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         for spot_index in range(max_spots):
             out_pos_path, out_h_path = self._unique_spot_paths(export_dir, base_stub, spot_index + 1, mode=mode)
             if out_pos_path is None or out_h_path is None:
-                QtWidgets.QMessageBox.warning(self, "Save Error", "保存先ファイル名の衝突回避に失敗しました。")
+                QtWidgets.QMessageBox.warning(self, "Save Error", "Failed to resolve output filename conflicts.")
                 return
             try:
-                # 位置CSV
+                # Position CSV
                 with open(out_pos_path, "w", encoding="utf-8") as f_pos:
                     f_pos.write("frame_index,x_nm,y_nm\n")
                     for frame_idx in sorted(self.spots_by_frame.keys()):
@@ -5755,7 +6278,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
                         f_pos.write(f"{frame_idx},{x_nm:.6f},{y_nm:.6f}\n")
 
-                # 高さCSV
+                # Height CSV
                 with open(out_h_path, "w", encoding="utf-8") as f_h:
                     f_h.write(
                         "frame_index,height_value_nm,height_bg_nm,height_bgsub_nm,height_mode,"
@@ -5765,7 +6288,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                         spots = self.spots_by_frame[frame_idx]
                         if spot_index >= len(spots):
                             continue
-                        # 高さが未計算なら、現在のフレームデータで計算（可能な範囲で）
+                        # If height is not calculated, calculate from current frame data when possible
                         if (
                             "height_point_nm" not in spots[spot_index]
                             or "height_mean_nm" not in spots[spot_index]
@@ -5852,7 +6375,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             "median_size": _try_get(lambda: int(self.median_size_spin.value()), 3),
             "open_enabled": _try_get(lambda: bool(self.open_check.isChecked()), False),
             "open_radius": _try_get(lambda: int(self.open_radius_spin.value()), 1),
-            "init_mode": _try_get(lambda: (self.init_mode_combo.currentText() or "Watershed (推奨)")),
+            "init_mode": _try_get(lambda: (self.init_mode_combo.currentText() or "Watershed (Recommended)")),
             "subpixel_refine": _try_get(lambda: bool(self.subpixel_check.isChecked()), False),
             "watershed_h_rel": _try_get(lambda: float(self.watershed_h_rel_spin.value()), 0.05),
             "watershed_adaptive_h": _try_get(lambda: bool(self.watershed_adaptive_h_check.isChecked()), True),
@@ -5968,12 +6491,12 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                 # Map old mode names to new UI labels
                 old_mode = str(params["init_mode"]).lower()
                 if "watershed" in old_mode or "water" in old_mode:
-                    self.init_mode_combo.setCurrentText("Watershed (推奨)")
+                    self.init_mode_combo.setCurrentText("Watershed (Recommended)")
                 elif "doh" in old_mode:
-                    self.init_mode_combo.setCurrentText("Blob DoH (高速)")
+                    self.init_mode_combo.setCurrentText("Blob DoH (Fast)")
                 elif "blob" in old_mode:
                     # Old blob_log maps to blob_doh
-                    self.init_mode_combo.setCurrentText("Blob DoH (高速)")
+                    self.init_mode_combo.setCurrentText("Blob DoH (Fast)")
                 elif "peak" in old_mode or "multiscale" in old_mode:
                     self.init_mode_combo.setCurrentText("Peak")
                 else:
@@ -6036,9 +6559,9 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             if "height_export_mode" in params:
                 mode = str(params["height_export_mode"]).strip().lower()
                 if mode == "point":
-                    self.height_export_mode_combo.setCurrentText("Spot位置")
+                    self.height_export_mode_combo.setCurrentText("Spot Position")
                 else:
-                    self.height_export_mode_combo.setCurrentText("Spot径内平均")
+                    self.height_export_mode_combo.setCurrentText("Spot-Radius Mean")
         finally:
             blockers.clear()
 
@@ -6052,13 +6575,13 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         If <base>_meta.json exists, restore ROI / UI params / analysis signatures too.
         """
         if not hasattr(gv, "files") or not gv.files or getattr(gv, "currentFileNum", -1) < 0:
-            QtWidgets.QMessageBox.warning(self, "No File", "先にデータをロードしてください。")
+            QtWidgets.QMessageBox.warning(self, "No File", "Load data first.")
             return
         if not hasattr(gv, "XScanSize") or not hasattr(gv, "YScanSize") or gv.XScanSize == 0 or gv.YScanSize == 0:
-            QtWidgets.QMessageBox.warning(self, "Invalid Scan Size", "scan_sizeが0です。先に正しいデータを読み込んでください。")
+            QtWidgets.QMessageBox.warning(self, "Invalid Scan Size", "scan_size is 0. Load valid data first.")
             return
         if not hasattr(gv, "XPixel") or not hasattr(gv, "YPixel") or gv.XPixel == 0 or gv.YPixel == 0:
-            QtWidgets.QMessageBox.warning(self, "Invalid Pixel Size", "ピクセルサイズ情報が取得できません。")
+            QtWidgets.QMessageBox.warning(self, "Invalid Pixel Size", "Could not get pixel-size information.")
             return
 
         if self.export_dir is None and hasattr(gv, "files") and gv.files:
@@ -6083,7 +6606,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         if m:
             base_stub = m.group(1)
         if not base_stub:
-            QtWidgets.QMessageBox.warning(self, "Invalid File", "ベース名が取得できません。")
+            QtWidgets.QMessageBox.warning(self, "Invalid File", "Could not determine the base name.")
             return
 
         nm_per_pixel_x = gv.XScanSize / gv.XPixel
@@ -6091,7 +6614,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
         restored = self._load_seed_spots_from_csv(export_dir, base_stub, nm_per_pixel_x, nm_per_pixel_y)
         if not restored:
-            QtWidgets.QMessageBox.information(self, "No Data", "読み込めるスポットCSVが見つかりませんでした。")
+            QtWidgets.QMessageBox.information(self, "No Data", "No readable spot CSV files were found.")
             return
 
         # restore in-memory state (display)
@@ -6144,7 +6667,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         if frame is not None:
             self.last_frame = frame
         try:
-            self.roi_status_label.setText("ROI選択済み" if self.manual_roi is not None else "ROI未選択")
+            self.roi_status_label.setText("ROI Selected" if self.manual_roi is not None else "ROI Not Selected")
         except Exception:
             pass
         self._sync_run_buttons_enabled()
@@ -6284,7 +6807,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         return restored
     # --- helper ---
     def _ensure_live_window(self, win, cls):
-        """Qt側で破棄された場合に再生成する"""
+        """Regenerate the window if the Qt object has been destroyed"""
         if win is not None and self._is_window_live(win):
             return win
         return cls(self)
@@ -6298,7 +6821,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
 def create_plugin(main_window) -> QtWidgets.QWidget:
     """
-    Pluginメニューから呼び出されるファクトリ。
-    メインウィンドウを受け取り、SpotAnalysisWindowを返す。
+    Factory called from the Plugin menu.
+    Receives the main window and returns a SpotAnalysisWindow.
     """
     return SpotAnalysisWindow(main_window)

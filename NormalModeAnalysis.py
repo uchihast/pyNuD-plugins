@@ -1172,7 +1172,7 @@ class NMAHelpContentManager:
     """
     
     def _initialize_content(self):
-        self.current_language = 'ja'
+        self.current_language = 'en'
         
         # --- 日本語コンテンツ ---
         toc_structure_ja = [
@@ -1667,7 +1667,7 @@ class NMAHelpContentManager:
 class NMAHelpWindow(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("NMA (Normal Mode Analysis) ヘルプ")
+        self.setWindowTitle("NMA (Normal Mode Analysis) Help")
         self.setGeometry(100, 100, 900, 700)
         
         # 独立したウィンドウとして設定
@@ -1707,7 +1707,7 @@ class NMAHelpWindow(QMainWindow):
         
         # 目次ツリー
         self.toc_tree = QTreeWidget()
-        self.toc_tree.setHeaderLabel("目次")
+        self.toc_tree.setHeaderLabel("Contents")
         self.toc_tree.setMaximumWidth(250)
         self.toc_tree.itemClicked.connect(self.onTocItemClicked)
         
@@ -1727,6 +1727,7 @@ class NMAHelpWindow(QMainWindow):
     def switch_language(self, lang_code):
         self.content_manager.set_language(lang_code)
         self.setWindowTitle(self.content_manager.get_ui_text('window_title'))
+        self.toc_tree.setHeaderLabel("目次" if lang_code == 'ja' else "Contents")
         self.loadTocContent()
         self.showHomePage()
 
