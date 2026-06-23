@@ -704,9 +704,8 @@ class DwellAnalysisWindow(QtWidgets.QMainWindow):
         # Menu bar
         menu_bar = self.menuBar()
         menu_bar.setNativeMenuBar(False)
-        is_ja = QtCore.QLocale().language() == QtCore.QLocale.Japanese
-        help_menu = menu_bar.addMenu("ヘルプ" if is_ja else "Help")
-        manual_act = help_menu.addAction("マニュアル" if is_ja else "Manual")
+        help_menu = menu_bar.addMenu("Help")
+        manual_act = help_menu.addAction("Manual")
         manual_act.triggered.connect(self._show_help)
 
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical, self.central_widget)

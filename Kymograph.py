@@ -280,8 +280,8 @@ class KymographWindow(QtWidgets.QWidget):
         # Help メニュー（ウィンドウ内に表示するため setNativeMenuBar(False)）
         menu_bar = QtWidgets.QMenuBar(self)
         menu_bar.setNativeMenuBar(False)
-        help_menu = menu_bar.addMenu("Help" if QtCore.QLocale().language() != QtCore.QLocale.Japanese else "ヘルプ")
-        manual_action = help_menu.addAction("Manual" if QtCore.QLocale().language() != QtCore.QLocale.Japanese else "マニュアル")
+        help_menu = menu_bar.addMenu("Help")
+        manual_action = help_menu.addAction("Manual")
         manual_action.triggered.connect(self.showHelpDialog)
         top_layout.addWidget(menu_bar)
 
