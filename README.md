@@ -27,6 +27,11 @@ These URLs always point to the latest GitHub Release assets.
 - [Kymograph.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/Kymograph.py)  
   Creates time-distance kymographs by stacking intensity profiles along line or polyline ROIs.
 
+### Movie Editing
+
+- [AFMMovieEditor.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/AFMMovieEditor.py)  
+  Builds presentation-ready AFM movies from loaded frame stacks, with clips, titles, text/shape overlays, preview playback, sessions, and MP4/AVI export.
+
 ### L-AFM Analysis
 
 - [LAFMAnalysis.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/LAFMAnalysis.py)  
