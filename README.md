@@ -11,7 +11,7 @@ These URLs always point to the latest GitHub Release assets.
 ### Structure / Simulation
 
 - [AFMSimulator.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/AFMSimulator.py)  
-  Simulates AFM images from PDB/mmCIF files and supports comparison with real AFM images.
+  Simulates AFM images from PDB/mmCIF/MRC data, aligns models to real AFM images, and includes experimental ENM-domain flexible fitting.
 - [NormalModeAnalysis.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/NormalModeAnalysis.py)  
   Loads PDB files and visualizes molecular flexibility and collective motions using ProDy normal modes.
 
