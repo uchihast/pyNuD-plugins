@@ -2,12 +2,12 @@
 # type: ignore
 """
 pyNuD Simulator - Standalone application for AFM image simulation from PDB/CIF/MRC.
-Uses simplified VTK rendering for speed and reliability.
+Uses native PyMOL rendering with VTK fallback for speed and reliability.
 
-Version: 1.0.0
+Version: 1.2.0
 """
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 
 import sys
 import numpy as np
@@ -19,6 +19,7 @@ import struct  # ★★★ 追加 ★★★
 import datetime # ★★★ 追加 ★★★
 import time
 import tempfile
+import subprocess
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,9 +30,9 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QSplitter, QFrame, QCheckBox, QScrollArea,
                             QColorDialog, QTabWidget, QProgressBar, QInputDialog, QAction,
                             QTreeWidget, QTextBrowser, QTreeWidgetItem, QSpacerItem, QSizePolicy, QLineEdit, QDialog, QProgressDialog,
-                            QStackedLayout)
+                            QStackedLayout, QMenu)
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QTime, QSettings, QEventLoop, QEvent, QObject, QRect
-from PyQt5.QtGui import QFont, QColor, QPixmap
+from PyQt5.QtGui import QFont, QColor, QPixmap, QIcon
 from PyQt5.QtCore import QThread, pyqtSignal
 
 # Support plugin launch: use globalvals when run from pyNuD, else minimal stub.
@@ -446,6 +447,82 @@ class _ASDDropFilter(QObject):
 
 APP_NAME = "pyNuD Simulator"
 PLUGIN_NAME = "AFM Simulator"
+APP_ICON_FILENAME = "pyNuD_sim.png"
+APP_ICON_FALLBACK_FILENAMES = ("pyNuD_sim.png", "pyNuD_simulator.ico")
+THIRD_PARTY_NOTICES_FILENAME = "THIRD_PARTY_NOTICES.md"
+
+def iter_bundled_file_paths(filenames):
+    """Yield possible bundled file paths for source and frozen app layouts."""
+    if isinstance(filenames, (str, Path)):
+        filenames = (filenames,)
+    candidate_dirs = []
+    if getattr(sys, 'frozen', False):
+        bundle_dir = getattr(sys, '_MEIPASS', None)
+        if bundle_dir:
+            candidate_dirs.append(Path(bundle_dir))
+        candidate_dirs.append(Path(sys.executable).resolve().parent)
+    candidate_dirs.extend([
+        Path(__file__).resolve().parent,
+        Path.cwd(),
+    ])
+    seen = set()
+    for directory in candidate_dirs:
+        try:
+            directory = directory.resolve()
+        except Exception:
+            pass
+        for filename in filenames:
+            path = directory / filename
+            path_key = str(path)
+            if path_key in seen:
+                continue
+            seen.add(path_key)
+            yield path
+
+def iter_app_icon_paths():
+    """Yield possible bundled pyNuD icon paths."""
+    yield from iter_bundled_file_paths(APP_ICON_FALLBACK_FILENAMES)
+
+def get_bundled_file_path(filenames):
+    """Return the first available bundled file path."""
+    for path in iter_bundled_file_paths(filenames):
+        try:
+            if path.exists():
+                return path
+        except Exception:
+            pass
+    return None
+
+def get_app_icon_path():
+    """Return the bundled pyNuD icon path when available."""
+    return get_bundled_file_path(APP_ICON_FALLBACK_FILENAMES)
+
+def load_app_icon():
+    """Load the application icon as a QIcon."""
+    last_existing = None
+    for icon_path in iter_app_icon_paths():
+        try:
+            if not icon_path.exists():
+                continue
+            last_existing = icon_path
+            icon = QIcon(str(icon_path))
+            if not icon.isNull():
+                return icon, icon_path
+        except Exception:
+            pass
+    return QIcon(), last_existing
+
+def apply_macos_dock_icon(icon_path):
+    """Set the macOS Dock icon for non-bundled Python launches when possible."""
+    if not sys.platform.startswith('darwin') or icon_path is None:
+        return
+    try:
+        from AppKit import NSApplication, NSImage  # type: ignore
+        image = NSImage.alloc().initWithContentsOfFile_(str(icon_path))
+        if image is not None:
+            NSApplication.sharedApplication().setApplicationIconImage_(image)
+    except Exception:
+        pass
 
 HELP_HTML_EN = """
 <h1>pyNuD Simulator</h1>
@@ -508,17 +585,17 @@ def apply_low_pass_filter(image, scan_x_nm, scan_y_nm, cutoff_wl_nm):
     """
     if cutoff_wl_nm <= 0:
         return image
-    
+
     # 周波数グリッド (cycles/nm)
     f_grid = create_frequency_grid(image.shape, scan_x_nm, scan_y_nm)
-    
+
     # カットオフ周波数 (1/nm)
     f_cutoff = 1.0 / cutoff_wl_nm
-    
+
     # バターワースフィルター (n=2)
     # H(f) = 1 / sqrt(1 + (f/f_cutoff)^(2n))
     h_f = 1.0 / np.sqrt(1.0 + (f_grid / f_cutoff)**4)
-    
+
     # FFT
     img_fft = fft2(image)
     filtered_fft = img_fft * h_f
@@ -623,11 +700,10 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 - AFM Tip Settings
 - Tip Position Control
 - AFM Simulation
-- View Control
 - AFM Appearance（独立ウィンドウ）
 
 ### 2.2 右パネル（Structure + AFM） {#ja-sec2-2}
-- 上段: 構造表示（PyMOLビュー / VTKビュー）
+- 上段: 構造表示ツールバー（Drop / Show Molecule / Show AFM Tip / Show Bonds / Sequence / Reset View）と構造表示（PyMOLビュー / VTKビュー）
 - 中段: Structure & View Control（回転、Find Initial Plane など）
 - 下段: Simulated AFM Images（XY/YZ/ZX）
 
@@ -645,8 +721,9 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 - `AFM Appearance`: AFM外観パラメータ（ノイズ・低域フィルタ）を開く
 - `Real AFM image`: Real AFM / Sim Aligned 比較ウィンドウを開く
 - `Help` → `View Help...` (`F1`): ヘルプウィンドウを開く
+- `Help` → `Third-Party Notices...`: サードパーティの著作権・ライセンス・商標表示を開く
 
-`Help` メニューは `View Help...` の1項目に統合されています（`Manual` は廃止）。
+`Manual` メニューは廃止され、ヘルプと通知表示は `Help` メニューへ統合されています。
 
 ---
 
@@ -687,7 +764,6 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 - `Single Color`: 単色モード色
 - `Ambient`: 0–50%（デフォルト 10）
 - `Specular`: 0–100%（デフォルト 60）
-- `PyMOL Style`: 見た目プリセット
 - `Dark Theme`: ダーク背景系プリセット
 
 ### 5.4 AFM Tip Settings {#ja-sec5-4}
@@ -775,7 +851,7 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 | `delta_elec [A]` | 電荷評価殻厚 |
 | `K_geom` | 幾何上位候補数 |
 | `N_dir`, `K` | 球面探索密度・局所候補数 |
-| `delta [A]`, `lambda` | 接触評価の閾値・重み |
+| `delta [A]`, `lambda` | 接触候補の厚み・広がり同点処理 |
 | `theta1/2/3 [deg]` | 局所探索角ステップ |
 | `local grid` | 局所格子半径 |
 | `surf r [A]`, `surf n` | 表面原子抽出条件 |
@@ -838,7 +914,7 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 - `Auto-fit AFM Appearance`
   - 1段階目で探針 `Radius (nm)` / `Angle (deg)` とLow-pass `Cutoff Wavelength (nm)` を探索
   - Auto-fit成功時は `Apply Low-pass Filter` をONにする
-  - ノイズ/アーティファクト条件は探索・変更しない
+  - 2段階目でノイズ/アーティファクト条件を探索してReal AFMへ見た目を寄せる
   - 反映結果は Sim Aligned 側にも適用
 
 ---
@@ -875,20 +951,24 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 
 ## 10. Auto-fit AFM Appearance の仕様 {#ja-sec10}
 
-目的: 実AFM像に近い探針条件・Low-pass条件を自動探索。
+目的: 実AFM像に近い探針条件・Low-pass条件・外観ノイズ条件を自動探索。
 
 主な特徴:
-- Real AFM と PDB/CIF 構造が必要
-- ASDの `Scan X/Y` と `Nx/Ny` に合わせて、PDBからXY像を再シミュレーションして評価
+- Real AFM と PDB/CIF/MRC/Coarse-grain などのシミュレーション対象構造が必要
+- ASDの `Scan X/Y` と `Nx/Ny` に合わせてXY像を再シミュレーションして評価
 - Stage 1: 探針 `Radius (nm)`、`Angle (deg)`、Low-pass `Cutoff Wavelength (nm)` を探索
+- Stage 2: Stage 1の最良像を基準に、ノイズ/走査アーティファクト条件を探索
 - `Apply Low-pass Filter` はAuto-fit成功時にONになり、`Cutoff Wavelength (nm)` をAuto-fitで変更可能
 - `Cutoff Wavelength (nm)` はLow-passの空間周波数カットオフに対応する波長パラメータ
 - `Scan Direction` は内部的に `L2R` 固定で評価
-- Noise/Drift/Feedbackなどのノイズ/走査アーティファクト条件はAuto-fitでは変更しない
 - 探索候補:
   - Tip radius / angle
   - Low-pass cutoff wavelength
-- 最良候補をAFM Tip SettingsとLow-pass UIに反映して再描画
+  - Height noise
+  - Line noise
+  - Drift
+  - Feedback mode（none / linear_lag / tapping_parachute 系）
+- 最良候補を AFM Appearance UI に反映して再描画
 
 ---
 
@@ -942,7 +1022,7 @@ OFF時:
 4. 必要に応じROIで対象分子を中心化  
 5. `Get Simulated image` でスキャン条件一致シミュレーション  
 6. `Estimate Pose` で方位推定（精度選択）  
-7. `Auto-fit AFM Appearance` で探針・Low-pass条件を調整
+7. `Auto-fit AFM Appearance` で探針・Low-pass・ノイズ外観を調整
 8. メイン下段 `Simulated AFM Images` と `Sim Aligned` が一致することを確認  
 9. ASD/画像を保存
 
@@ -975,7 +1055,7 @@ OFF時:
 
 ## 17. 変更履歴メモ（現行実装で重要な挙動） {#ja-sec17}
 
-- `Help` メニューは `View Help...` のみ
+- `Help` メニューには `View Help...` と `Third-Party Notices...` を配置
 - Real AFM と Sim Aligned は専用ウィンドウで管理
 - Estimate Pose は画像回転比較だけでなく、Rotation XYZを変えて再シミュレーションする方式
 - Auto-fit AFM Appearance は Sim Aligned 側にも反映
@@ -1014,11 +1094,10 @@ Main use cases:
 - AFM Tip Settings
 - Tip Position Control
 - AFM Simulation
-- View Control
 - AFM Appearance (separate window)
 
 ### 2.2 Right Panel (Structure + AFM) {#en-sec2-2}
-- Top: structure view (PyMOL / VTK)
+- Top: structure toolbar (Drop / Show Molecule / Show AFM Tip / Show Bonds / Sequence / Reset View) and structure view (PyMOL / VTK)
 - Middle: Structure & View Control (rotation, Find Initial Plane, etc.)
 - Bottom: Simulated AFM Images (XY/YZ/ZX)
 
@@ -1036,8 +1115,9 @@ When the main window closes, these child windows close automatically.
 - `AFM Appearance`: open appearance controls (filter/noise/artifacts)
 - `Real AFM image`: open Real AFM / Sim Aligned window
 - `Help` → `View Help...` (`F1`): open built-in detailed manual
+- `Help` → `Third-Party Notices...`: open third-party copyright, license, and trademark notices
 
-`Help` is unified into one entry (`View Help...`).
+The old `Manual` menu has been removed; help and notices are available from `Help`.
 
 ---
 
@@ -1078,7 +1158,6 @@ When the main window closes, these child windows close automatically.
 - `Single Color`
 - `Ambient`: 0-50% (default 10)
 - `Specular`: 0-100% (default 60)
-- `PyMOL Style` preset
 - `Dark Theme` preset
 
 ### 5.4 AFM Tip Settings {#en-sec5-4}
@@ -1165,7 +1244,7 @@ When the main window closes, these child windows close automatically.
 | `delta_elec [A]` | Electrostatic shell thickness |
 | `K_geom` | Number of top geometry candidates |
 | `N_dir`, `K` | Sphere sampling density / local candidate count |
-| `delta [A]`, `lambda` | Contact threshold / spread weight |
+| `delta [A]`, `lambda` | Contact shell thickness / spread tie-break |
 | `theta1/2/3 [deg]` | Local search angle steps |
 | `local grid` | Local neighborhood radius |
 | `surf r [A]`, `surf n` | Surface atom extraction condition |
@@ -1223,7 +1302,7 @@ Image drawing areas are kept aligned in size.
 - `Auto-fit AFM Appearance`
   - first searches probe `Radius (nm)` / `Angle (deg)` and low-pass `Cutoff Wavelength (nm)`
   - turns `Apply Low-pass Filter` on when Auto-fit succeeds
-  - does not search or change noise/artifact parameters
+  - then searches noise/artifact parameters to visually match Real AFM
   - applies result to aligned preview as well
 
 ---
@@ -1259,20 +1338,24 @@ Axes disabled in `Pose axes` are fixed at their current Rotation values during E
 
 ## 10. Auto-fit AFM Appearance Behavior {#en-sec10}
 
-Purpose: fit probe and low-pass appearance to the Real AFM look.
+Purpose: fit probe, low-pass, and noise appearance to the Real AFM look.
 
 Key points:
-- requires Real AFM and PDB/CIF structure
-- re-simulates XY from the structure using ASD `Scan X/Y` and `Nx/Ny`
+- requires Real AFM and a simulation target structure such as PDB/CIF/MRC/coarse-grain
+- re-simulates XY using ASD `Scan X/Y` and `Nx/Ny`
 - Stage 1 fits probe `Radius (nm)`, `Angle (deg)`, and low-pass `Cutoff Wavelength (nm)`
+- Stage 2 fits noise/scan artifact parameters from the best Stage 1 image
 - `Apply Low-pass Filter` is turned on when Auto-fit succeeds, and Auto-fit changes `Cutoff Wavelength (nm)`
 - `Cutoff Wavelength (nm)` is the wavelength-form parameter corresponding to the low-pass spatial-frequency cutoff
 - uses fixed `Scan Direction = L2R` during search
-- noise/scan artifact controls such as Noise, Drift, and Feedback are not changed by Auto-fit
 - explores candidates over:
   - tip radius / angle
   - low-pass cutoff wavelength
-- writes best candidate back to AFM Tip Settings and low-pass controls
+  - height noise
+  - line noise
+  - drift
+  - feedback mode parameters (`none`, `linear_lag`, `tapping_parachute`)
+- writes best candidate back to AFM Appearance controls
 
 ---
 
@@ -1352,7 +1435,7 @@ When OFF:
 
 ## 17. Current Important Behavior Summary {#en-sec17}
 
-- `Help` menu has only `View Help...`
+- `Help` menu contains `View Help...` and `Third-Party Notices...`
 - Real AFM and aligned preview are managed in a separate window
 - Estimate Pose optimizes Rotation XYZ with re-simulation
 - Auto-fit AFM Appearance is applied to aligned preview as well
@@ -1784,7 +1867,7 @@ class HelpContentManager:
             <h3>Find Initial Plane</h3>
             <ul>
                 <li><strong>Purpose:</strong> Automatically orients the structure to its optimal viewing angle.</li>
-                <li><strong>PDB Files:</strong> Uses Principal Component Analysis (PCA) to find the best orientation based on atom distribution.</li>
+                <li><strong>PDB Files:</strong> Searches support-plane normals and maximizes the projected occupied area of near-contact atoms.</li>
                 <li><strong>MRC Files:</strong> Uses surface coordinate analysis to find the optimal orientation for volume data.</li>
                 <li><strong>Usage:</strong> Click the button to automatically rotate the structure to its most stable orientation.</li>
             </ul>
@@ -1870,7 +1953,7 @@ class HelpContentManager:
             <h3>Find Initial Plane / 初期平面検出</h3>
             <ul>
                 <li><strong>Purpose:</strong> 構造を最適な視角に自動的に向けます。</li>
-                <li><strong>PDB Files:</strong> 主成分分析（PCA）を使用して原子分布に基づく最適な向きを見つけます。</li>
+                <li><strong>PDB Files:</strong> 支持面法線を探索し、接触候補原子の射影占有面積が最大になる向きを見つけます。</li>
                 <li><strong>MRC Files:</strong> 表面座標解析を使用してボリュームデータの最適な向きを見つけます。</li>
                 <li><strong>Usage:</strong> ボタンをクリックして構造を最も安定した向きに自動回転します。</li>
             </ul>
@@ -1900,7 +1983,7 @@ class HelpWindow(QWidget):
         self.setWindowTitle(self.content_manager.get_ui_text('window_title'))
         self.resize(800, 600)
         self.setupUI()
-        self.switch_language('en')  # Default: English
+        self.switch_language('ja') # デフォルトを日本語に
 
     def setupUI(self):
         layout = QVBoxLayout(self)
@@ -2498,6 +2581,9 @@ class pyNuD_simulator(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
+        icon, _icon_path = load_app_icon()
+        if not icon.isNull():
+            self.setWindowIcon(icon)
         
         # Windows固有の設定
         #if sys.platform.startswith('win'):
@@ -2573,23 +2659,70 @@ class pyNuD_simulator(QMainWindow):
 
         # --- PyMOL rendering state ---
         self.render_backend = "vtk"
-        # User preference for protein structures (pdb/cif): "dual" | "pymol" | "vtk"
+        # User preference for protein structures (pdb/cif): "pymol" | "vtk"
         # MRC is always forced to VTK-only.
-        self.user_render_backend_preference = "dual"
+        self.user_render_backend_preference = "pymol"
         self.pymol_cmd = None
         self.pymol_widget = None
         self.pymol_image_label = None
         self.pymol_image_mode = False
         self.pymol_force_image_mode = False
         self.pymol_available = False
-        self.dual_view_mode = True
+        self.pymol_native_widget_active = False
         self._vtk_camera_observer_id = None
         self._vtk_camera_sync_timer = None
         self.pymol_object_name = "pynud_molecule"
+        self.pymol_tip_object_name = "pynud_afm_tip"
         self.pymol_loaded_path = None
         self.current_structure_path = None
         self.current_structure_type = None
         self.pymol_esp_object = None
+        self.pymol_residue_selection_name = "pynud_selected_residues"
+        self.pymol_block_transform_selection_name = "pynud_block_transform"
+        self.sequence_panel_visible = False
+        self.sequence_residues = []
+        self.deleted_sequence_residues = {}
+        self.sequence_residue_order = []
+        self.sequence_duplicate_counter = 0
+        self.sequence_button_by_key = {}
+        self.selected_residue_keys = set()
+        self._last_sequence_key = None
+        self.sequence_drag_selecting = False
+        self.sequence_drag_seen_keys = set()
+        self.sequence_drag_grab_widget = None
+        self.sequence_highlight_timer = None
+        self.sequence_highlight_actor = None
+        self.block_transform_active = False
+        self.block_transform_keys = set()
+        self.block_transform_dragging = False
+        self.block_transform_drag_mode = None
+        self.block_transform_last_pos = None
+        self.block_transform_pending_dx = 0.0
+        self.block_transform_pending_dy = 0.0
+        self.block_transform_last_apply_ts = 0.0
+        self.block_transform_min_apply_interval_s = 1.0 / 30.0
+        self.block_transform_fast_render_active = False
+        self.block_transform_pymol_selection_ready = False
+        self.block_transform_fast_restore_timer = None
+        self.block_transform_saved_pymol_settings = {}
+        self.in_memory_structure_edited = False
+        self.original_atoms_data = None
+        self.pymol_structure_temp_path = None
+        self.pymol_structure_temp_dirty = True
+        embed_env = os.environ.get("PYNUD_PYMOL_EMBED", "").strip().lower()
+        legacy_embed_env = os.environ.get("PYNUD_PYMOL_EMBED_EXPERIMENT", "").strip().lower()
+        disabled_values = ("0", "false", "no", "off", "disable", "disabled")
+        enabled_values = ("1", "true", "yes", "on", "enable", "enabled")
+        # Native PyMOL embedding is the default. Use PYNUD_PYMOL_EMBED=0
+        # or PYNUD_PYMOL_NO_GUI=1 only when an environment needs the old fallback.
+        if embed_env in disabled_values or legacy_embed_env in disabled_values:
+            self.pymol_embed_native = False
+        elif embed_env in enabled_values or legacy_embed_env in enabled_values:
+            self.pymol_embed_native = True
+        else:
+            self.pymol_embed_native = True
+        if self.pymol_embed_native:
+            self.user_render_backend_preference = "pymol"
         self._color_scheme_before_esp = None
         self.display_widget = None
         self.vtk_initialized = False
@@ -2604,6 +2737,8 @@ class pyNuD_simulator(QMainWindow):
         self._pymol_mouse_panning = False
         self._pymol_mouse_last_pos = None
         self._pymol_mouse_mode = None
+        self.current_standard_view = None
+        self.view_plane_buttons = {}
         
         # 変換を二段に分離
         self.base_transform = vtk.vtkTransform()
@@ -2654,7 +2789,7 @@ class pyNuD_simulator(QMainWindow):
         
         # 簡単で確実なカラーマップ
         self.element_colors = {
-            'C': (0.3, 0.3, 0.3), 'O': (1.0, 0.3, 0.3), 'N': (0.3, 0.3, 1.0),
+            'C': (0.565, 0.565, 0.565), 'O': (1.0, 0.3, 0.3), 'N': (0.3, 0.3, 1.0),
             'H': (0.9, 0.9, 0.9), 'S': (1.0, 1.0, 0.3), 'P': (1.0, 0.5, 0.0),
             'other': (0.7, 0.7, 0.7)
         }
@@ -2719,16 +2854,31 @@ class pyNuD_simulator(QMainWindow):
             import pymol
             # Some PyMOL builds expect argv to be set to avoid empty-list parse errors
             is_macos = sys.platform.startswith('darwin')
-            if is_macos:
+            force_pymol_no_gui = os.environ.get("PYNUD_PYMOL_NO_GUI", "").strip().lower() in ("1", "true", "yes", "on")
+            if self.pymol_embed_native and not force_pymol_no_gui:
+                self.pymol_available = True
+                if not self._init_pymol_embedded_widget():
+                    self.pymol_available = False
+                    self.pymol_cmd = None
+                    print("[WARNING] Native PyMOL Qt/OpenGL widget failed; falling back to image mode.")
+                    force_pymol_no_gui = True
+                else:
+                    print("[INFO] Native PyMOL Qt/OpenGL widget enabled.")
+            if is_macos and not self.pymol_embed_native:
                 # On macOS, GUI launch from a thread is not supported.
                 # Use no-GUI mode and render to images.
+                force_pymol_no_gui = True
+
+            if self.pymol_cmd is None and force_pymol_no_gui:
+                # Stable mode for packaged environments (e.g., Windows installers):
+                # avoid spawning PyMOL's own Qt app and use image-mode rendering.
                 self.pymol_force_image_mode = True
                 try:
                     pymol.pymol_argv = ['pymol', '-cq']
                 except Exception:
                     pass
                 pymol.finish_launching(['pymol', '-cq'])
-            else:
+            elif self.pymol_cmd is None:
                 try:
                     pymol.pymol_argv = ['pymol', '-q']
                 except Exception:
@@ -2737,8 +2887,9 @@ class pyNuD_simulator(QMainWindow):
                     pymol.finish_launching()
                 except Exception:
                     pymol.finish_launching(['pymol', '-q'])
-            from pymol import cmd
-            self.pymol_cmd = cmd
+            if self.pymol_cmd is None:
+                from pymol import cmd
+                self.pymol_cmd = cmd
             self.pymol_available = True
         except Exception as e:
             print(f"PyMOL setup error: {e}")
@@ -2754,17 +2905,244 @@ class pyNuD_simulator(QMainWindow):
             return
 
         # Qtウィジェットの初期化
-        self._init_pymol_widget()
+        if self.pymol_widget is None:
+            self._init_pymol_widget()
         self._apply_pymol_defaults()
-        # Always initialize VTK in dual-view mode to avoid missing renderer
-        self._ensure_vtk_initialized()
-        # Default: show both when possible
+        if self.pymol_embed_native:
+            # Keep native PyMOL as the only active molecular viewer. Running two independent
+            # OpenGL widgets (PyMOL + VTK) at startup is fragile on macOS.
+            self._set_render_backend("pymol")
+        else:
+            if getattr(self, 'current_structure_type', None) == "mrc":
+                self._set_render_backend("vtk")
+            else:
+                self._set_render_backend("pymol")
         if getattr(self, 'current_structure_type', None) == "mrc":
             self._set_render_backend("vtk")
-        else:
-            self._set_render_backend("dual")
         if hasattr(self, 'esp_check'):
             self.esp_check.setEnabled(self.render_backend in ("pymol", "dual") and self.pymol_available)
+
+    def _install_pymol_widget(self, widget, install_event_filter=True, accept_drops=True):
+        """Install a PyMOL widget or image fallback label into the existing panel."""
+        self.pymol_widget = widget
+        if accept_drops and hasattr(self.pymol_widget, 'setAcceptDrops'):
+            self.pymol_widget.setAcceptDrops(True)
+        if install_event_filter and hasattr(self.pymol_widget, 'installEventFilter'):
+            self.pymol_widget.installEventFilter(self)
+
+        if hasattr(self, 'pymol_widget_layout') and self.pymol_widget_layout is not None:
+            while self.pymol_widget_layout.count():
+                item = self.pymol_widget_layout.takeAt(0)
+                if item.widget():
+                    item.widget().setParent(None)
+            self.pymol_widget_layout.addWidget(self.pymol_widget)
+        self._update_esp_colorbar_visibility()
+
+    def _force_persistent_scrollbars(self, scroll_area, vertical=True, horizontal=False):
+        """Use styled scroll bars so macOS overlay scrollbars do not auto-hide."""
+        vertical_style = """
+            QScrollBar:vertical {
+                width: 14px;
+                background: #e6e6e6;
+                border: 1px solid #c8c8c8;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: #9a9a9a;
+                border-radius: 4px;
+                min-height: 28px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #777;
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                width: 0px;
+                height: 0px;
+            }
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
+        """
+        horizontal_style = """
+            QScrollBar:horizontal {
+                height: 14px;
+                background: #e6e6e6;
+                border: 1px solid #c8c8c8;
+                margin: 0px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #9a9a9a;
+                border-radius: 4px;
+                min-width: 28px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #777;
+            }
+            QScrollBar::add-line:horizontal,
+            QScrollBar::sub-line:horizontal {
+                width: 0px;
+                height: 0px;
+            }
+            QScrollBar::add-page:horizontal,
+            QScrollBar::sub-page:horizontal {
+                background: transparent;
+            }
+        """
+        if vertical:
+            scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+            scroll_area.verticalScrollBar().setStyleSheet(vertical_style)
+        if horizontal:
+            scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+            scroll_area.horizontalScrollBar().setStyleSheet(horizontal_style)
+
+    def _init_pymol_embedded_widget(self):
+        """Try PyMOL's native Qt/OpenGL widget without finish_launching()."""
+        try:
+            from pmg_qt.pymol_gl_widget import PyMOLGLWidget
+
+            class PyNuDPyMOLGLWidget(PyMOLGLWidget):
+                """PyMOL GL widget with Cmd/Ctrl+left drag mapped to pyNuD pose rotation."""
+
+                def __init__(self, owner, parent=None):
+                    super().__init__(parent)
+                    self._pynud_owner = owner
+                    self._pynud_object_dragging = False
+                    self._pynud_last_pos = None
+
+                def _pynud_is_object_drag(self, event):
+                    modifiers = event.modifiers()
+                    is_ctrl_or_cmd = bool(modifiers & Qt.ControlModifier) or bool(modifiers & Qt.MetaModifier)
+                    is_shift = bool(modifiers & Qt.ShiftModifier)
+                    return bool(event.button() == Qt.LeftButton and is_ctrl_or_cmd and not is_shift)
+
+                def _pynud_finish_object_drag(self):
+                    owner = self._pynud_owner
+                    self._pynud_object_dragging = False
+                    self._pynud_last_pos = None
+                    owner.actor_rotating = False
+                    owner._pymol_mouse_dragging = False
+                    owner._pymol_mouse_mode = None
+                    try:
+                        if (
+                            hasattr(owner, 'interactive_update_check')
+                            and owner.interactive_update_check.isChecked()
+                            and hasattr(owner, 'schedule_high_res_simulation')
+                        ):
+                            owner.schedule_high_res_simulation()
+                    except Exception:
+                        pass
+                    owner._mark_pymol_interaction()
+
+                def mousePressEvent(self, event, state=0):
+                    if state == 0 and self._pynud_owner._start_block_transform_drag_from_event(event):
+                        return
+                    if state == 0 and self._pynud_is_object_drag(event):
+                        owner = self._pynud_owner
+                        self._pynud_object_dragging = True
+                        self._pynud_last_pos = event.pos()
+                        owner.actor_rotating = True
+                        owner._pymol_mouse_dragging = True
+                        owner._pymol_mouse_mode = "object_rotate"
+                        owner._mark_pymol_interaction()
+                        event.accept()
+                        return
+                    super().mousePressEvent(event, state)
+
+                def mouseMoveEvent(self, event):
+                    if self._pynud_owner._continue_block_transform_drag_from_event(event):
+                        return
+                    if self._pynud_object_dragging:
+                        if not (event.buttons() & Qt.LeftButton):
+                            self._pynud_finish_object_drag()
+                            event.accept()
+                            return
+                        if self._pynud_last_pos is None:
+                            self._pynud_last_pos = event.pos()
+                            event.accept()
+                            return
+                        dx = event.pos().x() - self._pynud_last_pos.x()
+                        dy = event.pos().y() - self._pynud_last_pos.y()
+                        self._pynud_last_pos = event.pos()
+                        if dx or dy:
+                            try:
+                                self._pynud_owner.update_rotation_from_drag(
+                                    angle_x_delta=dy * 0.5,
+                                    angle_y_delta=dx * 0.5,
+                                    angle_z_delta=0.0,
+                                )
+                            except Exception:
+                                pass
+                            self._pynud_owner._mark_pymol_interaction()
+                        event.accept()
+                        return
+                    super().mouseMoveEvent(event)
+
+                def mouseReleaseEvent(self, event):
+                    if self._pynud_owner._finish_block_transform_drag_from_event(event):
+                        return
+                    if self._pynud_object_dragging and event.button() == Qt.LeftButton:
+                        self._pynud_finish_object_drag()
+                        event.accept()
+                        return
+                    super().mouseReleaseEvent(event)
+
+                def wheelEvent(self, event):
+                    if self._pynud_owner._handle_block_transform_wheel_from_event(event):
+                        return
+                    super().wheelEvent(event)
+
+                def leaveEvent(self, event):
+                    if self._pynud_owner.block_transform_dragging:
+                        self._pynud_owner._finish_block_transform_drag()
+                    if self._pynud_object_dragging:
+                        self._pynud_finish_object_drag()
+                    super().leaveEvent(event)
+
+                def dragEnterEvent(self, event):
+                    if self._pynud_owner._structure_path_from_mime(event.mimeData()):
+                        event.acceptProposedAction()
+                        return
+                    super().dragEnterEvent(event)
+
+                def dragMoveEvent(self, event):
+                    if self._pynud_owner._structure_path_from_mime(event.mimeData()):
+                        event.acceptProposedAction()
+                        return
+                    super().dragMoveEvent(event)
+
+                def dropEvent(self, event):
+                    path = self._pynud_owner._structure_path_from_mime(event.mimeData())
+                    if path and self._pynud_owner._load_structure_file(path):
+                        event.acceptProposedAction()
+                        return
+                    super().dropEvent(event)
+
+            pymol_widget = PyNuDPyMOLGLWidget(self, self)
+            pymol_widget.setToolTip(
+                "PyMOL embedded interaction:\n"
+                "Left drag: view rotate\n"
+                "Cmd/Ctrl+Left drag: rotate molecule pose for simulation\n"
+                "Middle drag: pan\n"
+                "Mouse wheel: zoom\n"
+                "Drop PDB/CIF/MRC: import structure"
+            )
+            self.pymol_cmd = pymol_widget.cmd
+            self.pymol_image_mode = False
+            self.pymol_force_image_mode = False
+            self.pymol_native_widget_active = True
+            try:
+                pymol_widget.setAcceptDrops(True)
+            except Exception:
+                pass
+            # PyMOLGLWidget owns its mouse and OpenGL paint events. Drop handling
+            # is implemented in the subclass above, so avoid the generic eventFilter.
+            self._install_pymol_widget(pymol_widget, install_event_filter=False, accept_drops=True)
+            return True
+        except Exception as e:
+            print(f"[WARNING] PyMOL embedded widget init failed: {e}")
+            return False
 
     def _init_pymol_widget(self):
         """PyMOLの描画ウィジェットを作成してビューへ追加"""
@@ -2774,6 +3152,7 @@ class pyNuD_simulator(QMainWindow):
         if self.pymol_force_image_mode:
             # 強制イメージモード（macOS no-GUI）
             self.pymol_image_mode = True
+            self.pymol_native_widget_active = False
             self.pymol_image_label = QLabel("PyMOL view (image mode)")
             self.pymol_image_label.setAlignment(Qt.AlignCenter)
             self.pymol_image_label.setToolTip(
@@ -2781,20 +3160,10 @@ class pyNuD_simulator(QMainWindow):
                 "Left drag: view rotate\n"
                 "Cmd/Ctrl+Left drag: object rotate\n"
                 "Shift+Left or Right drag: pan\n"
-                "Mouse wheel: zoom"
+                "Mouse wheel: zoom\n"
+                "Drop PDB/CIF/MRC: import structure"
             )
-            self.pymol_widget = self.pymol_image_label
-            if hasattr(self.pymol_widget, 'setAcceptDrops'):
-                self.pymol_widget.setAcceptDrops(True)
-            if hasattr(self.pymol_widget, 'installEventFilter'):
-                self.pymol_widget.installEventFilter(self)
-            if hasattr(self, 'pymol_widget_layout') and self.pymol_widget_layout is not None:
-                while self.pymol_widget_layout.count():
-                    item = self.pymol_widget_layout.takeAt(0)
-                    if item.widget():
-                        item.widget().setParent(None)
-                self.pymol_widget_layout.addWidget(self.pymol_widget)
-            self._update_esp_colorbar_visibility()
+            self._install_pymol_widget(self.pymol_image_label)
             return
 
         pymol_widget = None
@@ -2815,6 +3184,7 @@ class pyNuD_simulator(QMainWindow):
         if pymol_widget is None:
             # フォールバック: PyMOLの描画を画像として表示
             self.pymol_image_mode = True
+            self.pymol_native_widget_active = False
             self.pymol_image_label = QLabel("PyMOL view (image mode)")
             self.pymol_image_label.setAlignment(Qt.AlignCenter)
             self.pymol_image_label.setToolTip(
@@ -2822,27 +3192,15 @@ class pyNuD_simulator(QMainWindow):
                 "Left drag: view rotate\n"
                 "Cmd/Ctrl+Left drag: object rotate\n"
                 "Shift+Left or Right drag: pan\n"
-                "Mouse wheel: zoom"
+                "Mouse wheel: zoom\n"
+                "Drop PDB/CIF/MRC: import structure"
             )
             pymol_widget = self.pymol_image_label
         else:
             self.pymol_image_mode = False
+            self.pymol_native_widget_active = False
 
-        self.pymol_widget = pymol_widget
-        if hasattr(self.pymol_widget, 'setAcceptDrops'):
-            self.pymol_widget.setAcceptDrops(True)
-        if hasattr(self.pymol_widget, 'installEventFilter'):
-            self.pymol_widget.installEventFilter(self)
-
-        # 既存のPyMOLビューコンテナに追加
-        if hasattr(self, 'pymol_widget_layout') and self.pymol_widget_layout is not None:
-            # プレースホルダを削除
-            while self.pymol_widget_layout.count():
-                item = self.pymol_widget_layout.takeAt(0)
-                if item.widget():
-                    item.widget().setParent(None)
-            self.pymol_widget_layout.addWidget(self.pymol_widget)
-        self._update_esp_colorbar_visibility()
+        self._install_pymol_widget(pymol_widget)
 
     def _apply_pymol_defaults(self):
         """PyMOLの表示設定を初期化"""
@@ -2855,8 +3213,1494 @@ class pyNuD_simulator(QMainWindow):
             self.pymol_cmd.set("cartoon_fancy_helices", 1)
             self.pymol_cmd.set("cartoon_smooth_loops", 1)
             self.pymol_cmd.set("cartoon_sampling", 10)
+            for name, value in (
+                ("two_sided_lighting", 1),
+                ("depth_cue", 0),
+                ("ray_shadow", 0),
+            ):
+                try:
+                    self.pymol_cmd.set(name, value)
+                except Exception:
+                    pass
+            if self.pymol_embed_native:
+                self._apply_pymol_embedded_viewer_defaults()
+            self._apply_pymol_lighting()
         except Exception:
             pass
+
+    def _apply_pymol_embedded_viewer_defaults(self):
+        """Hide PyMOL's own panels so the embedded widget behaves like a viewer."""
+        for name, value in (
+            ("internal_gui", 0),
+            ("internal_feedback", 0),
+            ("internal_prompt", 0),
+            ("movie_panel", 0),
+        ):
+            try:
+                self.pymol_cmd.set(name, value)
+            except Exception:
+                pass
+        self._set_pymol_internal_sequence_view(False)
+
+    def _set_pymol_internal_sequence_view(self, enabled):
+        """Keep PyMOL's own sequence panel disabled; pyNuD uses a common Qt panel."""
+        if self.pymol_cmd is None:
+            return
+        try:
+            self.pymol_cmd.set("seq_view", 1 if enabled else 0)
+        except Exception as e:
+            print(f"[WARNING] PyMOL sequence view setting failed: {e}")
+
+    def _has_sequence_data(self):
+        """Return whether the current structure has residue records for the common sequence panel."""
+        data = getattr(self, "atoms_data", None)
+        if data is None or getattr(self, "current_structure_type", None) == "mrc":
+            return False
+        required = ("residue_name", "chain_id", "residue_id")
+        return all(name in data for name in required)
+
+    def _update_sequence_control(self):
+        """Enable or disable the common Sequence toolbar checkbox."""
+        if not hasattr(self, "show_sequence_check"):
+            return
+        available = self._has_sequence_data()
+        self.show_sequence_check.setEnabled(available)
+        if not available:
+            self._set_sequence_panel_visible(False)
+        elif self.sequence_panel_visible:
+            self._set_sequence_panel_visible(True)
+
+    def _set_sequence_panel_visible(self, visible):
+        """Show/hide the common Qt sequence panel."""
+        visible = bool(visible and self._has_sequence_data())
+        self.sequence_panel_visible = visible
+        if hasattr(self, "sequence_panel") and self.sequence_panel is not None:
+            if visible and not self.sequence_residues:
+                self._rebuild_sequence_panel()
+            self.sequence_panel.setVisible(visible)
+        if hasattr(self, "show_sequence_check"):
+            self.show_sequence_check.blockSignals(True)
+            self.show_sequence_check.setChecked(visible)
+            self.show_sequence_check.blockSignals(False)
+
+    def create_sequence_panel(self):
+        """Create a renderer-independent residue sequence panel."""
+        panel = QFrame()
+        panel.setObjectName("sequence_panel")
+        panel.setMaximumHeight(128)
+        panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        panel.setStyleSheet("""
+            QFrame#sequence_panel {
+                background-color: #f7f7f7;
+                border: 1px solid #d2d2d2;
+                border-radius: 3px;
+            }
+            QLabel#sequence_summary_label {
+                color: #333;
+                font-size: 11px;
+                font-weight: bold;
+            }
+            QLabel#sequence_chain_label {
+                color: #333;
+                font-size: 10px;
+                font-weight: bold;
+                padding-right: 4px;
+            }
+            QPushButton {
+                border: 1px solid #bbb;
+                border-radius: 2px;
+                padding: 0px;
+                font-size: 9px;
+                font-family: Menlo, Monaco, Consolas, monospace;
+            }
+        """)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(3)
+
+        self.sequence_summary_label = QLabel("No sequence loaded")
+        self.sequence_summary_label.setObjectName("sequence_summary_label")
+        layout.addWidget(self.sequence_summary_label)
+
+        scroll = QScrollArea(panel)
+        scroll.setObjectName("sequence_scroll_area")
+        scroll.setWidgetResizable(False)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("""
+            QScrollArea#sequence_scroll_area {
+                background: transparent;
+            }
+            QScrollBar:horizontal {
+                height: 14px;
+                background: #e6e6e6;
+                border: 1px solid #c8c8c8;
+                margin: 0px;
+            }
+            QScrollBar:vertical {
+                width: 14px;
+                background: #e6e6e6;
+                border: 1px solid #c8c8c8;
+                margin: 0px;
+            }
+            QScrollBar::handle:horizontal,
+            QScrollBar::handle:vertical {
+                background: #9a9a9a;
+                border-radius: 4px;
+                min-width: 28px;
+                min-height: 28px;
+            }
+            QScrollBar::handle:horizontal:hover,
+            QScrollBar::handle:vertical:hover {
+                background: #777;
+            }
+            QScrollBar::add-line,
+            QScrollBar::sub-line {
+                width: 0px;
+                height: 0px;
+            }
+            QScrollBar::add-page,
+            QScrollBar::sub-page {
+                background: transparent;
+            }
+        """)
+        content = QWidget(scroll)
+        content.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Minimum)
+        self.sequence_content_widget = content
+        self.sequence_content_layout = QVBoxLayout(content)
+        self.sequence_content_layout.setContentsMargins(0, 0, 0, 0)
+        self.sequence_content_layout.setSpacing(2)
+        scroll.setWidget(content)
+        self.sequence_scroll_area = scroll
+        layout.addWidget(scroll, 1)
+        panel.setVisible(False)
+        return panel
+
+    def _clear_layout_widgets(self, layout):
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            child_layout = item.layout()
+            widget = item.widget()
+            if child_layout is not None:
+                self._clear_layout_widgets(child_layout)
+            if widget is not None:
+                widget.deleteLater()
+
+    def _residue_one_letter(self, residue_name):
+        """Convert common residue names to one-letter display codes."""
+        name = str(residue_name).strip().upper()
+        aa = {
+            "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+            "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+            "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+            "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+            "SEC": "U", "PYL": "O", "ASX": "B", "GLX": "Z", "UNK": "X",
+            "A": "A", "C": "C", "G": "G", "T": "T", "U": "U",
+            "DA": "A", "DC": "C", "DG": "G", "DT": "T", "DU": "U",
+            "ADE": "A", "CYT": "C", "GUA": "G", "THY": "T", "URA": "U",
+        }
+        return aa.get(name, "X")
+
+    def _sequence_key_from_atom_arrays(self, index):
+        data = self.atoms_data
+        chain = str(data["chain_id"][index]).strip() or " "
+        residue_id = str(data["residue_id"][index]).strip()
+        icode_arr = data.get("icode", None)
+        icode = str(icode_arr[index]).strip() if icode_arr is not None else ""
+        return (chain, residue_id, icode)
+
+    def _build_sequence_model(self):
+        """Build ordered residue records, including soft-deleted residues."""
+        if not self._has_sequence_data():
+            return []
+        residues_by_key = {}
+        active_order = []
+        names = self.atoms_data["residue_name"]
+        for i in range(len(self.atoms_data["x"])):
+            key = self._sequence_key_from_atom_arrays(i)
+            if key not in residues_by_key:
+                chain, residue_id, icode = key
+                res_name = str(names[i]).strip().upper() or "UNK"
+                try:
+                    residue_int = int(residue_id)
+                except Exception:
+                    residue_int = residue_id
+                ss = self.secondary_structure.get((chain.strip(), residue_int), "C")
+                residues_by_key[key] = {
+                    "key": key,
+                    "chain": chain,
+                    "residue_id": residue_id,
+                    "icode": icode,
+                    "residue_name": res_name,
+                    "one_letter": self._residue_one_letter(res_name),
+                    "secondary_structure": ss,
+                    "deleted": False,
+                    "atom_indices": [],
+                }
+                active_order.append(key)
+            residues_by_key[key]["atom_indices"].append(i)
+
+        deleted_records = getattr(self, "deleted_sequence_residues", {})
+        all_keys = set(residues_by_key) | set(deleted_records)
+        order = []
+        seen = set()
+        for key in getattr(self, "sequence_residue_order", []):
+            if key in all_keys and key not in seen:
+                order.append(key)
+                seen.add(key)
+        for key in active_order:
+            if key not in seen:
+                order.append(key)
+                seen.add(key)
+        for key in deleted_records:
+            if key not in seen:
+                order.append(key)
+                seen.add(key)
+        self.sequence_residue_order = order
+
+        records = []
+        for key in order:
+            if key in residues_by_key:
+                records.append(residues_by_key[key])
+            elif key in deleted_records:
+                record = dict(deleted_records[key])
+                record["deleted"] = True
+                record["atom_indices"] = []
+                records.append(record)
+        return records
+
+    def _rebuild_sequence_panel(self):
+        """Populate the common sequence panel from the current atoms_data."""
+        self.sequence_residues = self._build_sequence_model()
+        self.sequence_button_by_key = {}
+        if hasattr(self, "sequence_content_layout"):
+            self._clear_layout_widgets(self.sequence_content_layout)
+        if not self.sequence_residues:
+            if hasattr(self, "sequence_summary_label"):
+                self.sequence_summary_label.setText("No sequence loaded")
+            return
+
+        chains = []
+        for residue in self.sequence_residues:
+            if residue["chain"] not in chains:
+                chains.append(residue["chain"])
+        if hasattr(self, "sequence_summary_label"):
+            selected = len(self.selected_residue_keys)
+            suffix = f" | selected: {selected}" if selected else ""
+            self.sequence_summary_label.setText(
+                f"Sequence: {len(self.sequence_residues)} residues / {len(chains)} chains"
+                f"  (click: select, Cmd/Ctrl-click: add/remove, Shift-click: range){suffix}"
+            )
+
+        max_row_width = 0
+        row_height = 38
+        label_width = 64
+        max_residue_label_len = max(
+            len(self._sequence_residue_number_text(residue))
+            for residue in self.sequence_residues
+        )
+        button_width = max(34, min(64, 12 + max_residue_label_len * 7))
+        button_height = 34
+        button_pitch = button_width + 4
+
+        for chain in chains:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(2)
+            chain_text = chain.strip() or "(blank)"
+            label = QLabel(f"Chain {chain_text}")
+            label.setObjectName("sequence_chain_label")
+            label.setFixedWidth(label_width)
+            row_layout.addWidget(label)
+            residue_count = 0
+            for residue in self.sequence_residues:
+                if residue["chain"] != chain:
+                    continue
+                residue_count += 1
+                button = QPushButton(self._sequence_residue_cell_text(residue))
+                button.setFixedSize(button_width, button_height)
+                button.setToolTip(self._sequence_residue_tooltip(residue))
+                button.setMouseTracking(True)
+                button.setProperty("sequence_key", residue["key"])
+                button.installEventFilter(self)
+                row_layout.addWidget(button)
+                self.sequence_button_by_key[residue["key"]] = button
+                self._style_sequence_button(button, residue["key"] in self.selected_residue_keys, residue)
+            row_layout.addStretch(1)
+            row_width = label_width + residue_count * button_pitch + 12
+            row.setMinimumSize(row_width, row_height)
+            row.setMaximumHeight(row_height)
+            max_row_width = max(max_row_width, row_width)
+            self.sequence_content_layout.addWidget(row)
+        self.sequence_content_layout.addStretch(1)
+
+        content_width = max(200, max_row_width)
+        content_height = max(40, len(chains) * (row_height + 2) + 6)
+        if hasattr(self, "sequence_content_widget"):
+            self.sequence_content_widget.setMinimumSize(content_width, content_height)
+            self.sequence_content_widget.resize(content_width, content_height)
+            self.sequence_content_widget.adjustSize()
+
+    def _sequence_residue_number_text(self, residue):
+        return f"{residue['residue_id']}{residue['icode']}"
+
+    def _sequence_residue_cell_text(self, residue):
+        return f"{residue['one_letter']}\n{self._sequence_residue_number_text(residue)}"
+
+    def _sequence_residue_tooltip(self, residue):
+        chain = residue["chain"].strip() or "(blank)"
+        resi = self._sequence_residue_number_text(residue)
+        ss = {"H": "helix", "E": "sheet", "C": "coil"}.get(residue["secondary_structure"], "coil")
+        atom_count = int(residue.get("atom_count", len(residue.get("atom_indices", []))))
+        status = "\nDeleted from current display/simulation; right-click to restore" if residue.get("deleted") else ""
+        return (
+            f"{residue['residue_name']} {resi} / Chain {chain}\n"
+            f"{atom_count} atoms, {ss}{status}\n"
+            "Click to select residue"
+        )
+
+    def _style_sequence_button(self, button, selected, residue):
+        if residue.get("deleted"):
+            bg = "#555555"
+            border = "#ff4d4d" if selected else "#2f2f2f"
+            color = "#fff"
+        elif selected:
+            bg = "#ff4d4d"
+            border = "#b00000"
+            color = "#fff"
+        else:
+            ss = residue.get("secondary_structure", "C")
+            if ss == "H":
+                bg = "#ffe1df"
+            elif ss == "E":
+                bg = "#dfeeff"
+            else:
+                bg = "#f4f4f4"
+            border = "#b8b8b8"
+            color = "#222"
+        button.setStyleSheet(
+            f"background-color: {bg}; border-color: {border}; color: {color};"
+        )
+
+    def _on_sequence_residue_clicked(self, key):
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers & Qt.ShiftModifier and self._last_sequence_key is not None:
+            self.selected_residue_keys = self._sequence_range_keys(self._last_sequence_key, key)
+        elif modifiers & (Qt.ControlModifier | Qt.MetaModifier):
+            if key in self.selected_residue_keys:
+                self.selected_residue_keys.remove(key)
+            else:
+                self.selected_residue_keys.add(key)
+            self._last_sequence_key = key
+        else:
+            self.selected_residue_keys = {key}
+            self._last_sequence_key = key
+        self._update_sequence_selection_ui()
+        self._apply_residue_selection_highlight()
+
+    def _sequence_key_from_widget(self, obj):
+        if obj is None or not hasattr(obj, "property"):
+            return None
+        key = obj.property("sequence_key")
+        if isinstance(key, tuple) and len(key) == 3:
+            return key
+        return None
+
+    def _is_sequence_widget(self, obj):
+        targets = {
+            getattr(self, "sequence_panel", None),
+            getattr(self, "sequence_scroll_area", None),
+            getattr(self, "sequence_content_widget", None),
+        }
+        widget = obj
+        while widget is not None:
+            if widget in targets or self._sequence_key_from_widget(widget) is not None:
+                return True
+            widget = widget.parentWidget() if hasattr(widget, "parentWidget") else None
+        return False
+
+    def _sequence_key_from_global_pos(self, global_pos):
+        widget = QApplication.widgetAt(global_pos)
+        while widget is not None:
+            key = self._sequence_key_from_widget(widget)
+            if key is not None:
+                return key
+            if widget is getattr(self, "sequence_panel", None):
+                break
+            widget = widget.parentWidget()
+        return None
+
+    def _add_sequence_drag_residue(self, key):
+        if key is None or key in self.sequence_drag_seen_keys:
+            return
+        self.sequence_drag_seen_keys.add(key)
+        self.selected_residue_keys.add(key)
+        self._last_sequence_key = key
+        self._update_sequence_selection_ui()
+        self._schedule_residue_selection_highlight()
+
+    def _schedule_residue_selection_highlight(self, delay_ms=45):
+        if self.sequence_highlight_timer is None:
+            self.sequence_highlight_timer = QTimer(self)
+            self.sequence_highlight_timer.setSingleShot(True)
+            self.sequence_highlight_timer.timeout.connect(self._apply_residue_selection_highlight)
+        self.sequence_highlight_timer.start(delay_ms)
+
+    def _finish_sequence_drag_selection(self):
+        self.sequence_drag_selecting = False
+        self.sequence_drag_seen_keys = set()
+        grab_widget = getattr(self, "sequence_drag_grab_widget", None)
+        if grab_widget is not None:
+            try:
+                grab_widget.releaseMouse()
+            except Exception:
+                pass
+        self.sequence_drag_grab_widget = None
+        if self.sequence_highlight_timer is not None and self.sequence_highlight_timer.isActive():
+            self.sequence_highlight_timer.stop()
+        self._apply_residue_selection_highlight()
+
+    def _handle_sequence_button_event(self, obj, event):
+        """Allow press-and-drag selection across residue cells."""
+        key = self._sequence_key_from_widget(obj)
+        if key is None:
+            return False
+
+        etype = event.type()
+        if etype == QEvent.ContextMenu:
+            if key not in self.selected_residue_keys:
+                self.selected_residue_keys = {key}
+                self._last_sequence_key = key
+                self._update_sequence_selection_ui()
+                self._apply_residue_selection_highlight()
+            self._show_sequence_context_menu(event.globalPos())
+            event.accept()
+            return True
+
+        if etype == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            self.sequence_drag_selecting = True
+            self.sequence_drag_seen_keys = {key}
+            self.sequence_drag_grab_widget = obj
+            try:
+                obj.grabMouse()
+            except Exception:
+                pass
+            self._on_sequence_residue_clicked(key)
+            event.accept()
+            return True
+
+        if etype in (QEvent.Enter, QEvent.MouseMove):
+            if self.sequence_drag_selecting and (QApplication.mouseButtons() & Qt.LeftButton):
+                drag_key = key
+                if etype == QEvent.MouseMove and hasattr(event, "globalPos"):
+                    drag_key = self._sequence_key_from_global_pos(event.globalPos()) or key
+                self._add_sequence_drag_residue(drag_key)
+                event.accept()
+                return True
+
+        if etype == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+            if self.sequence_drag_selecting:
+                self._finish_sequence_drag_selection()
+                event.accept()
+                return True
+
+        return False
+
+    def _show_sequence_context_menu(self, global_pos):
+        menu = QMenu(self)
+        duplicate_action = menu.addAction("Duplicate Selected Residues")
+        transform_action = menu.addAction(
+            "Stop Block Mouse Transform"
+            if self._is_block_transform_active()
+            else "Move/Rotate Selected Block"
+        )
+        delete_action = menu.addAction("Delete Selected Residues")
+        restore_action = menu.addAction("Restore Selected Residues")
+        clear_selection_action = menu.addAction("Clear Residue Selection")
+        reset_edits_action = menu.addAction("Reset All Residue Edits")
+        has_selection = bool(self.selected_residue_keys)
+        active_keys = self._selected_active_residue_keys()
+        deleted_keys = self._selected_deleted_residue_keys()
+        duplicate_action.setEnabled(bool(active_keys))
+        transform_action.setEnabled(bool(active_keys) or self._is_block_transform_active())
+        delete_action.setEnabled(bool(active_keys))
+        restore_action.setEnabled(bool(deleted_keys))
+        clear_selection_action.setEnabled(has_selection or self._is_block_transform_active())
+        reset_edits_action.setEnabled(self._has_residue_edits())
+
+        action = menu.exec_(global_pos)
+        if action is duplicate_action:
+            self.duplicate_selected_residues()
+        elif action is transform_action:
+            if self._is_block_transform_active():
+                self._deactivate_block_transform()
+            else:
+                self._activate_block_transform(active_keys)
+        elif action is delete_action:
+            self.delete_selected_residues()
+        elif action is restore_action:
+            self.restore_selected_residues()
+        elif action is clear_selection_action:
+            self.clear_residue_selection()
+        elif action is reset_edits_action:
+            self.reset_all_residue_edits()
+
+    def clear_residue_selection(self):
+        """Clear Sequence residue selection and any active block-transform state."""
+        if self.sequence_highlight_timer is not None and self.sequence_highlight_timer.isActive():
+            self.sequence_highlight_timer.stop()
+        if self.sequence_drag_selecting:
+            self._finish_sequence_drag_selection()
+        if self._is_block_transform_active():
+            self._deactivate_block_transform()
+        self.selected_residue_keys = set()
+        self._last_sequence_key = None
+        self._update_sequence_selection_ui()
+        self._clear_residue_selection_highlight()
+
+    def _mark_in_memory_structure_edited(self, force_pymol_reload=True):
+        self.in_memory_structure_edited = True
+        self.pymol_structure_temp_dirty = True
+        if force_pymol_reload and self._is_pymol_active():
+            self.pymol_loaded_path = None
+
+    def _snapshot_atoms_data(self):
+        if getattr(self, "atoms_data", None) is None:
+            return None
+        snapshot = {}
+        for name, values in self.atoms_data.items():
+            try:
+                snapshot[name] = np.array(values, copy=True)
+            except Exception:
+                pass
+        return snapshot
+
+    def _store_original_atoms_data(self):
+        self.original_atoms_data = self._snapshot_atoms_data()
+
+    def _has_residue_edits(self):
+        if bool(getattr(self, "in_memory_structure_edited", False)):
+            return True
+        if bool(getattr(self, "deleted_sequence_residues", {})):
+            return True
+        original = getattr(self, "original_atoms_data", None)
+        if original is None or getattr(self, "atoms_data", None) is None:
+            return False
+        try:
+            return len(self.atoms_data.get("x", [])) != len(original.get("x", []))
+        except Exception:
+            return False
+
+    def reset_all_residue_edits(self):
+        original = getattr(self, "original_atoms_data", None)
+        if original is None:
+            return
+        if not self._has_residue_edits():
+            return
+        reply = QMessageBox.question(
+            self,
+            "Reset All Residue Edits",
+            (
+                "Reset all duplicated, deleted, moved, and rotated residue-block edits?\n\n"
+                "The original structure file will not be modified."
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.atoms_data = {name: np.array(values, copy=True) for name, values in original.items()}
+        self.deleted_sequence_residues = {}
+        self.sequence_residue_order = []
+        self.sequence_duplicate_counter = 0
+        self.selected_residue_keys = set()
+        self._last_sequence_key = None
+        self._deactivate_block_transform()
+        self.in_memory_structure_edited = False
+        self._clear_pymol_structure_temp_file()
+        self.pymol_loaded_path = None
+        self._clear_residue_selection_highlight()
+        self.update_statistics()
+        self._rebuild_sequence_panel()
+        self._update_sequence_control()
+        self.display_molecule()
+        self.fit_view_to_contents()
+
+        if hasattr(self, "interactive_update_check") and self.interactive_update_check.isChecked():
+            self.trigger_interactive_simulation()
+
+    def _is_block_transform_active(self):
+        return bool(self.block_transform_active and self.block_transform_keys and self._has_sequence_data())
+
+    def _activate_block_transform(self, keys=None, show_message=True):
+        keys = set(keys or self._selected_active_residue_keys())
+        if not keys:
+            return False
+        self.block_transform_active = True
+        self.block_transform_keys = keys
+        self.selected_residue_keys = set(keys)
+        self._last_sequence_key = next(iter(keys), None)
+        self._update_sequence_selection_ui()
+        self._apply_residue_selection_highlight()
+        self._sync_pymol_block_transform_selection()
+        return True
+
+    def _sync_pymol_block_transform_selection(self):
+        """Create one PyMOL named selection for repeated block transforms."""
+        self.block_transform_pymol_selection_ready = False
+        if not self._is_block_transform_active() or not self._is_pymol_active() or self.pymol_cmd is None:
+            return None
+        selection = self._pymol_selection_for_residue_keys(self.block_transform_keys)
+        if not selection:
+            return None
+        name = self.pymol_block_transform_selection_name
+        try:
+            self.pymol_cmd.delete(name)
+        except Exception:
+            pass
+        try:
+            self.pymol_cmd.select(name, selection)
+            try:
+                if int(self.pymol_cmd.count_atoms(name)) <= 0:
+                    self.pymol_cmd.delete(name)
+                    return None
+            except Exception:
+                pass
+            self.block_transform_pymol_selection_ready = True
+            return name
+        except Exception as e:
+            print(f"[WARNING] PyMOL block transform selection failed: {e}")
+            return None
+
+    def _begin_block_transform_fast_render(self):
+        """Temporarily use cheaper PyMOL drawing while a copied residue block moves."""
+        try:
+            if self.block_transform_fast_restore_timer is not None:
+                self.block_transform_fast_restore_timer.stop()
+        except Exception:
+            pass
+        if self.block_transform_fast_render_active:
+            return
+        if not self._is_block_transform_active() or not self._is_pymol_active() or self.pymol_cmd is None:
+            return
+        selection = self._block_transform_selection()
+        if not selection:
+            return
+
+        saved = {}
+        for setting in (
+            "cartoon_sampling",
+            "cartoon_fancy_helices",
+            "cartoon_smooth_loops",
+            "stick_quality",
+            "sphere_quality",
+            "antialias",
+        ):
+            try:
+                saved[setting] = self.pymol_cmd.get(setting)
+            except Exception:
+                pass
+        self.block_transform_saved_pymol_settings = saved
+
+        for setting, value in (
+            ("cartoon_sampling", 3),
+            ("cartoon_fancy_helices", 0),
+            ("cartoon_smooth_loops", 0),
+            ("stick_quality", 2),
+            ("sphere_quality", 0),
+            ("antialias", 0),
+        ):
+            try:
+                self.pymol_cmd.set(setting, value)
+            except Exception:
+                pass
+
+        try:
+            self.pymol_cmd.hide("spheres", selection)
+            self.pymol_cmd.hide("sticks", selection)
+            self.pymol_cmd.hide("cartoon", selection)
+            self.pymol_cmd.hide("surface", selection)
+            self.pymol_cmd.show("lines", selection)
+        except Exception:
+            pass
+        self.block_transform_fast_render_active = True
+        self.request_render()
+
+    def _end_block_transform_fast_render(self, restore_display=True):
+        if not self.block_transform_fast_render_active:
+            return
+        for setting, value in getattr(self, "block_transform_saved_pymol_settings", {}).items():
+            try:
+                self.pymol_cmd.set(setting, value)
+            except Exception:
+                pass
+        self.block_transform_saved_pymol_settings = {}
+        self.block_transform_fast_render_active = False
+        if restore_display and self._is_pymol_active():
+            self._display_molecule_pymol()
+
+    def _schedule_block_transform_fast_render_restore(self):
+        if self.block_transform_fast_restore_timer is None:
+            self.block_transform_fast_restore_timer = QTimer(self)
+            self.block_transform_fast_restore_timer.setSingleShot(True)
+            self.block_transform_fast_restore_timer.timeout.connect(
+                lambda: self._end_block_transform_fast_render(restore_display=True)
+            )
+        self.block_transform_fast_restore_timer.start(300)
+
+    def _cancel_pending_block_transform_simulation(self):
+        """Keep AFM simulation from starting while a residue block is being positioned."""
+        try:
+            if hasattr(self, "high_res_timer") and self.high_res_timer.isActive():
+                self.high_res_timer.stop()
+        except Exception:
+            pass
+
+    def _schedule_block_transform_final_simulation(self):
+        """Debounced AFM update after residue-block move/rotate stops."""
+        if not (hasattr(self, "interactive_update_check") and self.interactive_update_check.isChecked()):
+            return
+        self.schedule_high_res_simulation()
+
+    def _deactivate_block_transform(self):
+        self._end_block_transform_fast_render(restore_display=True)
+        self.block_transform_active = False
+        self.block_transform_keys = set()
+        self.block_transform_dragging = False
+        self.block_transform_drag_mode = None
+        self.block_transform_last_pos = None
+        self.block_transform_pending_dx = 0.0
+        self.block_transform_pending_dy = 0.0
+        self.block_transform_last_apply_ts = 0.0
+        self.block_transform_pymol_selection_ready = False
+        try:
+            if self._is_pymol_active() and self.pymol_cmd is not None:
+                self.pymol_cmd.delete(self.pymol_block_transform_selection_name)
+        except Exception:
+            pass
+
+    def _next_duplicate_chain_id(self):
+        used = set()
+        if self._has_sequence_data():
+            try:
+                used.update(str(v).strip() for v in self.atoms_data["chain_id"])
+            except Exception:
+                pass
+        for key in getattr(self, "deleted_sequence_residues", {}):
+            used.add(str(key[0]).strip())
+        candidates = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        start = int(getattr(self, "sequence_duplicate_counter", 0) or 0)
+        for offset in range(len(candidates)):
+            chain = candidates[(start + offset) % len(candidates)]
+            if chain not in used:
+                self.sequence_duplicate_counter = start + offset + 1
+                return chain
+        self.sequence_duplicate_counter = start + 1
+        return candidates[start % len(candidates)]
+
+    def duplicate_selected_residues(self):
+        if not self.selected_residue_keys or not self._has_sequence_data():
+            return
+        active_keys = self._selected_active_residue_keys()
+        if not active_keys:
+            return
+        mask = self._mask_for_residue_keys(active_keys)
+        if mask is None or not np.any(mask):
+            return
+
+        new_chain = self._next_duplicate_chain_id()
+        selected_x = np.asarray(self.atoms_data["x"])[mask]
+        selected_span = float(np.max(selected_x) - np.min(selected_x)) if selected_x.size else 0.0
+        offset_x = max(3.0, selected_span + 1.0)
+
+        new_keys = set()
+        original_len = len(self.atoms_data["x"])
+        for name, values in list(self.atoms_data.items()):
+            arr = np.asarray(values)
+            if arr.shape[0] != original_len:
+                continue
+            copied = np.array(arr[mask], copy=True)
+            if name == "x":
+                copied = copied + offset_x
+            elif name == "chain_id":
+                copied = np.array([new_chain] * len(copied), dtype=arr.dtype)
+            self.atoms_data[name] = np.concatenate([arr, copied])
+
+        if "residue_id" in self.atoms_data:
+            residue_ids = np.asarray(self.atoms_data["residue_id"])[original_len:]
+            icodes = (
+                np.asarray(self.atoms_data["icode"])[original_len:]
+                if "icode" in self.atoms_data
+                else np.array([""] * len(residue_ids))
+            )
+            for residue_id, icode in zip(residue_ids, icodes):
+                new_keys.add((new_chain, str(residue_id).strip(), str(icode).strip()))
+
+        self.selected_residue_keys = new_keys
+        self._last_sequence_key = next(iter(new_keys), None)
+        self._mark_in_memory_structure_edited()
+        self._activate_block_transform(new_keys, show_message=False)
+        self.update_statistics()
+        self._rebuild_sequence_panel()
+        self._update_sequence_control()
+        self.display_molecule()
+        self.fit_view_to_contents()
+        self._sync_pymol_block_transform_selection()
+
+        self._schedule_block_transform_final_simulation()
+
+    def _selected_deleted_residue_keys(self):
+        deleted = getattr(self, "deleted_sequence_residues", {})
+        return {key for key in self.selected_residue_keys if key in deleted}
+
+    def _selected_active_residue_keys(self):
+        deleted = getattr(self, "deleted_sequence_residues", {})
+        return {key for key in self.selected_residue_keys if key not in deleted}
+
+    def _mask_for_residue_keys(self, keys):
+        if not keys or not self._has_sequence_data():
+            return None
+        mask = np.zeros(len(self.atoms_data["x"]), dtype=bool)
+        chains = np.array([str(v).strip() or " " for v in self.atoms_data["chain_id"]])
+        residues = np.array([str(v).strip() for v in self.atoms_data["residue_id"]])
+        if "icode" in self.atoms_data:
+            icodes = np.array([str(v).strip() for v in self.atoms_data["icode"]])
+        else:
+            icodes = np.array([""] * len(mask))
+        for chain, residue_id, icode in keys:
+            mask |= (chains == chain) & (residues == str(residue_id)) & (icodes == icode)
+        return mask
+
+    def _block_transform_mask(self):
+        if not self._is_block_transform_active():
+            return None
+        return self._mask_for_residue_keys(self.block_transform_keys)
+
+    def _block_transform_selection(self):
+        if not self._is_block_transform_active():
+            return None
+        if (
+            self._is_pymol_active()
+            and self.pymol_cmd is not None
+            and getattr(self, "block_transform_pymol_selection_ready", False)
+        ):
+            return self.pymol_block_transform_selection_name
+        return self._pymol_selection_for_residue_keys(self.block_transform_keys)
+
+    def _block_transform_center_nm(self, mask=None):
+        mask = mask if mask is not None else self._block_transform_mask()
+        if mask is None or not np.any(mask):
+            return None
+        return np.array([
+            float(np.mean(np.asarray(self.atoms_data["x"])[mask])),
+            float(np.mean(np.asarray(self.atoms_data["y"])[mask])),
+            float(np.mean(np.asarray(self.atoms_data["z"])[mask])),
+        ], dtype=float)
+
+    def _pymol_view_basis(self):
+        """Return approximate screen right/up/view axes in model coordinates."""
+        right = np.array([1.0, 0.0, 0.0], dtype=float)
+        up = np.array([0.0, 1.0, 0.0], dtype=float)
+        view_dir = np.array([0.0, 0.0, 1.0], dtype=float)
+        dist_angstrom = 100.0
+        if self._is_pymol_active() and self.pymol_cmd is not None:
+            try:
+                view = list(self.pymol_cmd.get_view())
+                if len(view) >= 18:
+                    rot = np.array(view[:9], dtype=float).reshape((3, 3))
+                    # PyMOL stores the model-space camera basis as columns in
+                    # the flattened 3x3 view rotation.
+                    right = rot[:, 0]
+                    up = rot[:, 1]
+                    view_dir = rot[:, 2]
+                    dist_angstrom = max(1.0, abs(float(view[11])))
+            except Exception:
+                pass
+        elif hasattr(self, "renderer") and self.renderer is not None:
+            try:
+                camera = self.renderer.GetActiveCamera()
+                pos = np.array(camera.GetPosition(), dtype=float)
+                focal = np.array(camera.GetFocalPoint(), dtype=float)
+                up_vec = np.array(camera.GetViewUp(), dtype=float)
+                view_dir = focal - pos
+                vn = float(np.linalg.norm(view_dir))
+                if vn > 1e-9:
+                    view_dir = view_dir / vn
+                un = float(np.linalg.norm(up_vec))
+                if un > 1e-9:
+                    up = up_vec / un
+                right = np.cross(view_dir, up)
+                rn = float(np.linalg.norm(right))
+                if rn > 1e-9:
+                    right = right / rn
+                up = np.cross(right, view_dir)
+                dist_angstrom = max(1.0, float(np.linalg.norm(focal - pos)) * 10.0)
+            except Exception:
+                pass
+
+        def _norm(v, fallback):
+            n = float(np.linalg.norm(v))
+            if n < 1e-9:
+                return fallback
+            return v / n
+
+        right = _norm(right, np.array([1.0, 0.0, 0.0], dtype=float))
+        up = _norm(up, np.array([0.0, 1.0, 0.0], dtype=float))
+        view_dir = _norm(view_dir, np.array([0.0, 0.0, 1.0], dtype=float))
+        return right, up, view_dir, dist_angstrom
+
+    def _translate_block_nm(self, vector_nm, request_render=True):
+        mask = self._block_transform_mask()
+        if mask is None or not np.any(mask):
+            return False
+        vec = np.asarray(vector_nm, dtype=float)
+        if vec.shape != (3,) or not np.all(np.isfinite(vec)):
+            return False
+        self.atoms_data["x"][mask] = np.asarray(self.atoms_data["x"])[mask] + vec[0]
+        self.atoms_data["y"][mask] = np.asarray(self.atoms_data["y"])[mask] + vec[1]
+        self.atoms_data["z"][mask] = np.asarray(self.atoms_data["z"])[mask] + vec[2]
+        self._mark_in_memory_structure_edited(force_pymol_reload=False)
+
+        if self._is_pymol_active():
+            selection = self._block_transform_selection()
+            if selection:
+                try:
+                    self.pymol_cmd.translate((vec * 10.0).tolist(), selection, state=0, camera=0)
+                except Exception as e:
+                    print(f"[WARNING] PyMOL block translate failed: {e}")
+        if request_render:
+            self.request_render()
+        return True
+
+    def _rotation_matrix_from_axis(self, axis, angle_deg):
+        axis = np.asarray(axis, dtype=float)
+        n = float(np.linalg.norm(axis))
+        if n < 1e-9:
+            return np.eye(3)
+        axis = axis / n
+        x, y, z = axis
+        a = np.radians(float(angle_deg))
+        c = float(np.cos(a))
+        s = float(np.sin(a))
+        C = 1.0 - c
+        return np.array([
+            [c + x*x*C, x*y*C - z*s, x*z*C + y*s],
+            [y*x*C + z*s, c + y*y*C, y*z*C - x*s],
+            [z*x*C - y*s, z*y*C + x*s, c + z*z*C],
+        ], dtype=float)
+
+    def _rotate_block_degrees(self, axis, angle_deg, request_render=True):
+        if abs(float(angle_deg)) < 1e-9:
+            return False
+        mask = self._block_transform_mask()
+        center = self._block_transform_center_nm(mask)
+        if center is None:
+            return False
+        R = self._rotation_matrix_from_axis(axis, angle_deg)
+        coords = np.column_stack([
+            np.asarray(self.atoms_data["x"])[mask],
+            np.asarray(self.atoms_data["y"])[mask],
+            np.asarray(self.atoms_data["z"])[mask],
+        ])
+        rotated = (coords - center) @ R.T + center
+        if not np.all(np.isfinite(rotated)):
+            return False
+        self.atoms_data["x"][mask] = rotated[:, 0]
+        self.atoms_data["y"][mask] = rotated[:, 1]
+        self.atoms_data["z"][mask] = rotated[:, 2]
+        self._mark_in_memory_structure_edited(force_pymol_reload=False)
+
+        if self._is_pymol_active():
+            selection = self._block_transform_selection()
+            if selection:
+                try:
+                    self.pymol_cmd.rotate(
+                        np.asarray(axis, dtype=float).tolist(),
+                        float(angle_deg),
+                        selection,
+                        state=0,
+                        camera=0,
+                        origin=(center * 10.0).tolist(),
+                    )
+                except Exception as e:
+                    print(f"[WARNING] PyMOL block rotate failed: {e}")
+        if request_render:
+            self.request_render()
+        return True
+
+    def _apply_block_transform_drag_delta(self, dx, dy, mode):
+        if not self._is_block_transform_active():
+            return False
+        right, up, _view_dir, dist_angstrom = self._pymol_view_basis()
+        if mode == "rotate":
+            sensitivity = 0.45
+            changed = False
+            changed |= self._rotate_block_degrees(up, float(dx) * sensitivity, request_render=False)
+            changed |= self._rotate_block_degrees(right, float(dy) * sensitivity, request_render=False)
+            if changed:
+                self.request_render()
+            return changed
+        scale_nm = max(0.002, min(0.2, dist_angstrom * 0.00015))
+        vector_nm = (right * float(dx) - up * float(dy)) * scale_nm
+        return self._translate_block_nm(vector_nm)
+
+    def _flush_block_transform_pending(self, force=False):
+        dx = float(getattr(self, "block_transform_pending_dx", 0.0) or 0.0)
+        dy = float(getattr(self, "block_transform_pending_dy", 0.0) or 0.0)
+        if dx == 0.0 and dy == 0.0:
+            return False
+        now = time.monotonic()
+        if not force:
+            last = float(getattr(self, "block_transform_last_apply_ts", 0.0) or 0.0)
+            interval = float(getattr(self, "block_transform_min_apply_interval_s", 1.0 / 30.0))
+            if last and (now - last) < interval:
+                return False
+
+        self.block_transform_pending_dx = 0.0
+        self.block_transform_pending_dy = 0.0
+        self.block_transform_last_apply_ts = now
+        return self._apply_block_transform_drag_delta(dx, dy, self.block_transform_drag_mode)
+
+    def _apply_block_transform_wheel_delta(self, delta_y):
+        if not self._is_block_transform_active():
+            return False
+        _right, _up, view_dir, dist_angstrom = self._pymol_view_basis()
+        steps = float(delta_y) / 120.0
+        if abs(steps) < 1e-9:
+            return False
+        step_nm = max(0.02, min(0.5, dist_angstrom * 0.0005))
+        return self._translate_block_nm(view_dir * steps * step_nm)
+
+    def _start_block_transform_drag_from_event(self, event):
+        if not self._is_block_transform_active():
+            return False
+        if event.type() != QEvent.MouseButtonPress or event.button() != Qt.LeftButton:
+            return False
+        modifiers = event.modifiers()
+        if modifiers & (Qt.ControlModifier | Qt.MetaModifier):
+            return False
+        self.block_transform_dragging = True
+        self.block_transform_drag_mode = "rotate" if (modifiers & Qt.ShiftModifier) else "translate"
+        self.block_transform_last_pos = event.pos()
+        self.block_transform_pending_dx = 0.0
+        self.block_transform_pending_dy = 0.0
+        self.block_transform_last_apply_ts = 0.0
+        self.actor_rotating = False
+        self._cancel_pending_block_transform_simulation()
+        self._sync_pymol_block_transform_selection()
+        self._begin_block_transform_fast_render()
+        self._mark_pymol_interaction()
+        event.accept()
+        return True
+
+    def _continue_block_transform_drag_from_event(self, event):
+        if not self.block_transform_dragging:
+            return False
+        if event.type() != QEvent.MouseMove:
+            return False
+        if not (event.buttons() & Qt.LeftButton):
+            self._finish_block_transform_drag()
+            event.accept()
+            return True
+        if self.block_transform_last_pos is None:
+            self.block_transform_last_pos = event.pos()
+            event.accept()
+            return True
+        dx = event.pos().x() - self.block_transform_last_pos.x()
+        dy = event.pos().y() - self.block_transform_last_pos.y()
+        self.block_transform_last_pos = event.pos()
+        if dx or dy:
+            self.block_transform_pending_dx += float(dx)
+            self.block_transform_pending_dy += float(dy)
+            if self._flush_block_transform_pending(force=False):
+                self._mark_pymol_interaction()
+        event.accept()
+        return True
+
+    def _finish_block_transform_drag_from_event(self, event):
+        if not self.block_transform_dragging:
+            return False
+        if event.type() != QEvent.MouseButtonRelease or event.button() != Qt.LeftButton:
+            return False
+        self._finish_block_transform_drag()
+        event.accept()
+        return True
+
+    def _finish_block_transform_drag(self):
+        self._flush_block_transform_pending(force=True)
+        self.block_transform_dragging = False
+        self.block_transform_drag_mode = None
+        self.block_transform_last_pos = None
+        self.block_transform_pending_dx = 0.0
+        self.block_transform_pending_dy = 0.0
+        self._mark_in_memory_structure_edited(force_pymol_reload=False)
+        self._end_block_transform_fast_render(restore_display=True)
+        self._mark_pymol_interaction()
+        self._schedule_block_transform_final_simulation()
+
+    def _handle_block_transform_wheel_from_event(self, event):
+        if not self._is_block_transform_active() or event.type() != QEvent.Wheel:
+            return False
+        try:
+            delta_y = int(event.angleDelta().y())
+        except Exception:
+            delta_y = 0
+        if delta_y == 0:
+            try:
+                delta_y = int(event.pixelDelta().y())
+            except Exception:
+                delta_y = 0
+        if delta_y == 0:
+            return False
+        self._begin_block_transform_fast_render()
+        self._apply_block_transform_wheel_delta(delta_y)
+        self._schedule_block_transform_fast_render_restore()
+        self._schedule_block_transform_final_simulation()
+        self._mark_pymol_interaction()
+        event.accept()
+        return True
+
+    def _store_deleted_residues(self, keys):
+        """Keep enough atom data to restore soft-deleted residues later."""
+        if not keys or not self._has_sequence_data():
+            return
+        residue_by_key = {residue["key"]: residue for residue in (self.sequence_residues or self._build_sequence_model())}
+        for key in keys:
+            mask = self._mask_for_residue_keys({key})
+            if mask is None or not np.any(mask):
+                continue
+            indices = np.flatnonzero(mask)
+            source = residue_by_key.get(key)
+            if source is None:
+                first = int(indices[0])
+                chain, residue_id, icode = key
+                res_name = str(self.atoms_data["residue_name"][first]).strip().upper() or "UNK"
+                try:
+                    residue_int = int(residue_id)
+                except Exception:
+                    residue_int = residue_id
+                source = {
+                    "key": key,
+                    "chain": chain,
+                    "residue_id": str(residue_id),
+                    "icode": icode,
+                    "residue_name": res_name,
+                    "one_letter": self._residue_one_letter(res_name),
+                    "secondary_structure": self.secondary_structure.get((chain.strip(), residue_int), "C"),
+                }
+            atom_data = {}
+            for name, values in self.atoms_data.items():
+                arr = np.asarray(values)
+                if arr.shape[0] == mask.shape[0]:
+                    atom_data[name] = np.array(arr[mask], copy=True)
+            record = {
+                "key": key,
+                "chain": source["chain"],
+                "residue_id": str(source["residue_id"]),
+                "icode": source.get("icode", ""),
+                "residue_name": source["residue_name"],
+                "one_letter": source["one_letter"],
+                "secondary_structure": source.get("secondary_structure", "C"),
+                "deleted": True,
+                "atom_indices": [],
+                "atom_count": int(len(indices)),
+                "atom_data": atom_data,
+            }
+            self.deleted_sequence_residues[key] = record
+
+    def delete_selected_residues(self):
+        if not self.selected_residue_keys or not self._has_sequence_data():
+            return
+        active_keys = self._selected_active_residue_keys()
+        if not active_keys:
+            return
+        mask_delete = self._mask_for_residue_keys(active_keys)
+        if mask_delete is None or not np.any(mask_delete):
+            return
+
+        atom_count = int(np.count_nonzero(mask_delete))
+        residue_count = len(active_keys)
+        reply = QMessageBox.question(
+            self,
+            "Delete Selected Residues",
+            (
+                f"Delete {residue_count} selected residues ({atom_count} atoms) from the current in-memory structure?\n\n"
+                "The original structure file will not be modified."
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        keep = ~mask_delete
+        if not np.any(keep):
+            QMessageBox.warning(self, "Delete Selected Residues", "Cannot delete all atoms in the structure.")
+            return
+
+        self._store_deleted_residues(active_keys)
+        for name, values in list(self.atoms_data.items()):
+            try:
+                arr = np.asarray(values)
+                if arr.shape[0] == keep.shape[0]:
+                    self.atoms_data[name] = arr[keep]
+            except Exception:
+                pass
+
+        if self.block_transform_keys & set(active_keys):
+            self._deactivate_block_transform()
+        self._mark_in_memory_structure_edited()
+        self.selected_residue_keys = set()
+        self._last_sequence_key = None
+        self._clear_residue_selection_highlight()
+        self.update_statistics()
+        self._rebuild_sequence_panel()
+        self._update_sequence_control()
+        self.display_molecule()
+        self.fit_view_to_contents()
+
+        if hasattr(self, "interactive_update_check") and self.interactive_update_check.isChecked():
+            self.trigger_interactive_simulation()
+
+    def restore_selected_residues(self):
+        if not self.selected_residue_keys or getattr(self, "atoms_data", None) is None:
+            return
+        deleted_keys = self._selected_deleted_residue_keys()
+        if not deleted_keys:
+            return
+
+        restored = 0
+        for key in list(deleted_keys):
+            record = self.deleted_sequence_residues.pop(key, None)
+            if record is None:
+                continue
+            atom_data = record.get("atom_data", {})
+            if not atom_data:
+                continue
+            for name, values in atom_data.items():
+                arr = np.asarray(values)
+                if name in self.atoms_data:
+                    current = np.asarray(self.atoms_data[name])
+                    self.atoms_data[name] = np.concatenate([current, arr])
+                else:
+                    self.atoms_data[name] = np.array(arr, copy=True)
+            restored += 1
+
+        if restored == 0:
+            return
+
+        self._mark_in_memory_structure_edited()
+        self.selected_residue_keys = set()
+        self._last_sequence_key = None
+        self._clear_residue_selection_highlight()
+        self.update_statistics()
+        self._rebuild_sequence_panel()
+        self._update_sequence_control()
+        self.display_molecule()
+        self.fit_view_to_contents()
+
+        if hasattr(self, "interactive_update_check") and self.interactive_update_check.isChecked():
+            self.trigger_interactive_simulation()
+
+    def _sequence_range_keys(self, start_key, end_key):
+        if start_key[0] != end_key[0]:
+            return {end_key}
+        keys = [residue["key"] for residue in self.sequence_residues if residue["chain"] == start_key[0]]
+        try:
+            i0 = keys.index(start_key)
+            i1 = keys.index(end_key)
+        except ValueError:
+            return {end_key}
+        if i0 > i1:
+            i0, i1 = i1, i0
+        return set(keys[i0:i1 + 1])
+
+    def _update_sequence_selection_ui(self):
+        if hasattr(self, "sequence_summary_label") and self.sequence_residues:
+            chains = []
+            for residue in self.sequence_residues:
+                if residue["chain"] not in chains:
+                    chains.append(residue["chain"])
+            selected = len(self.selected_residue_keys)
+            suffix = f" | selected: {selected}" if selected else ""
+            self.sequence_summary_label.setText(
+                f"Sequence: {len(self.sequence_residues)} residues / {len(chains)} chains"
+                f"  (click: select, Cmd/Ctrl-click: add/remove, Shift-click: range){suffix}"
+            )
+        residue_by_key = {residue["key"]: residue for residue in self.sequence_residues}
+        for key, button in self.sequence_button_by_key.items():
+            residue = residue_by_key.get(key)
+            if residue is not None:
+                self._style_sequence_button(button, key in self.selected_residue_keys, residue)
+
+    def toggle_sequence_panel(self, visible):
+        """Toggle the common sequence panel."""
+        self._set_sequence_panel_visible(visible)
+        if visible:
+            self._rebuild_sequence_panel()
+        else:
+            self.selected_residue_keys = set()
+            self._last_sequence_key = None
+            self._update_sequence_selection_ui()
+            self._clear_residue_selection_highlight()
+
+    def _clear_sequence_panel(self):
+        self.sequence_residues = []
+        self.deleted_sequence_residues = {}
+        self.sequence_residue_order = []
+        self._deactivate_block_transform()
+        self.sequence_button_by_key = {}
+        self.selected_residue_keys = set()
+        self._last_sequence_key = None
+        if hasattr(self, "sequence_content_layout"):
+            self._clear_layout_widgets(self.sequence_content_layout)
+        if hasattr(self, "sequence_summary_label"):
+            self.sequence_summary_label.setText("No sequence loaded")
+        self._set_sequence_panel_visible(False)
+        self._clear_residue_selection_highlight()
+
+    def _selected_residue_mask(self):
+        if not self.selected_residue_keys or not self._has_sequence_data():
+            return None
+        return self._mask_for_residue_keys(self._selected_active_residue_keys())
+
+    def _pymol_selection_for_residue_key(self, key):
+        obj = self.pymol_object_name
+        chain, residue_id, icode = key
+        resi = f"{residue_id}{icode}"
+        terms = [f"model {obj}", f"resi {resi}"]
+        if chain.strip():
+            terms.append(f"chain {chain.strip()}")
+        return "(" + " and ".join(terms) + ")"
+
+    def _pymol_selection_for_residue_keys(self, keys):
+        if not keys:
+            return None
+        parts = [self._pymol_selection_for_residue_key(key) for key in sorted(keys)]
+        return " or ".join(parts) if parts else None
+
+    def _selected_residue_pymol_selection(self):
+        return self._pymol_selection_for_residue_keys(self._selected_active_residue_keys())
+
+    def _apply_pymol_deleted_residues(self):
+        if not self._is_pymol_active() or not getattr(self, "deleted_sequence_residues", None):
+            return
+        selection = self._pymol_selection_for_residue_keys(self.deleted_sequence_residues.keys())
+        if not selection:
+            return
+        try:
+            self.pymol_cmd.remove(selection)
+            self.pymol_cmd.delete(self.pymol_residue_selection_name)
+        except Exception as e:
+            print(f"[WARNING] PyMOL deleted-residue sync failed: {e}")
+
+    def _apply_residue_selection_highlight(self):
+        """Reflect selected Sequence residues in both PyMOL and VTK renderers."""
+        if self._is_pymol_active():
+            self._apply_pymol_residue_highlight()
+        if not self._is_pymol_only():
+            self._apply_vtk_residue_highlight()
+        self.request_render()
+
+    def _apply_pymol_residue_highlight(self):
+        if not self._is_pymol_active() or self.pymol_cmd is None:
+            return
+        try:
+            self.pymol_cmd.delete(self.pymol_residue_selection_name)
+        except Exception:
+            pass
+        if getattr(self, "atoms_data", None) is not None:
+            try:
+                self._pymol_apply_color_scheme(self._pymol_selection_for_atoms())
+            except Exception:
+                pass
+        selection = self._selected_residue_pymol_selection()
+        if not selection:
+            return
+        try:
+            self.pymol_cmd.select(self.pymol_residue_selection_name, selection)
+            self.pymol_cmd.set_color("pynud_residue_selected_red", [1.0, 0.18, 0.18])
+            self.pymol_cmd.color("pynud_residue_selected_red", self.pymol_residue_selection_name)
+        except Exception as e:
+            print(f"[WARNING] PyMOL residue highlight failed: {e}")
+
+    def _apply_vtk_residue_highlight(self):
+        if not hasattr(self, "renderer") or self.renderer is None:
+            return
+        if self.sequence_highlight_actor is not None:
+            try:
+                self.renderer.RemoveActor(self.sequence_highlight_actor)
+            except Exception:
+                pass
+            self.sequence_highlight_actor = None
+
+        mask = self._selected_residue_mask()
+        if mask is None or not np.any(mask):
+            return
+
+        points = vtk.vtkPoints()
+        x = self.atoms_data["x"][mask]
+        y = self.atoms_data["y"][mask]
+        z = self.atoms_data["z"][mask]
+        for i in range(len(x)):
+            points.InsertNextPoint(float(x[i]), float(y[i]), float(z[i]))
+
+        polydata = vtk.vtkPolyData()
+        polydata.SetPoints(points)
+
+        sphere = vtk.vtkSphereSource()
+        sphere.SetRadius(0.22)
+        sphere.SetPhiResolution(12)
+        sphere.SetThetaResolution(12)
+
+        glyph = vtk.vtkGlyph3D()
+        glyph.SetInputData(polydata)
+        glyph.SetSourceConnection(sphere.GetOutputPort())
+        glyph.SetScaleModeToDataScalingOff()
+        glyph.Update()
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(glyph.GetOutputPort())
+        mapper.ScalarVisibilityOff()
+
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        prop = actor.GetProperty()
+        prop.SetColor(1.0, 0.18, 0.18)
+        prop.SetAmbient(0.35)
+        prop.SetDiffuse(0.65)
+        prop.SetSpecular(0.25)
+        prop.SetOpacity(0.95)
+        try:
+            actor.SetUserTransform(self.combined_transform)
+        except Exception:
+            pass
+        self.sequence_highlight_actor = actor
+        self.renderer.AddActor(actor)
+
+    def _clear_residue_selection_highlight(self):
+        if self.sequence_highlight_actor is not None and hasattr(self, "renderer") and self.renderer is not None:
+            try:
+                self.renderer.RemoveActor(self.sequence_highlight_actor)
+            except Exception:
+                pass
+        self.sequence_highlight_actor = None
+        if self.pymol_cmd is not None:
+            try:
+                self.pymol_cmd.delete(self.pymol_residue_selection_name)
+            except Exception:
+                pass
+            if getattr(self, "atoms_data", None) is not None and self._is_pymol_active():
+                try:
+                    self._pymol_apply_color_scheme(self._pymol_selection_for_atoms())
+                except Exception:
+                    pass
+        self.request_render()
 
     def _setup_vtk_legacy(self):
         """VTK環境のセットアップ（フォールバック用）"""
@@ -2961,6 +4805,8 @@ class pyNuD_simulator(QMainWindow):
 
     def _set_render_backend(self, backend):
         """表示バックエンドを切り替える"""
+        if backend == "dual":
+            backend = "pymol" if self.pymol_available and getattr(self, 'current_structure_type', None) != "mrc" else "vtk"
         self.render_backend = backend
         if hasattr(self, 'esp_check'):
             self.esp_check.setEnabled(backend in ("pymol", "dual") and self.pymol_available)
@@ -2985,6 +4831,7 @@ class pyNuD_simulator(QMainWindow):
         self._apply_esp_color_lock()
         self._update_esp_colorbar_visibility()
         self._update_renderer_combo()
+        self._update_sequence_control()
 
     def _apply_view_visibility(self):
         """2ペイン/単一表示の可視性を設定"""
@@ -3009,10 +4856,8 @@ class pyNuD_simulator(QMainWindow):
             self.renderer_combo.clear()
             if self.pymol_available and getattr(self, 'current_structure_type', None) != "mrc":
                 pymol_label = "PyMOL (image)" if self.pymol_force_image_mode else "PyMOL (embedded)"
-                self.renderer_combo.addItems(["Dual (PyMOL + VTK)", pymol_label, "VTK (interactive)"])
-                if self.render_backend == "dual":
-                    self.renderer_combo.setCurrentText("Dual (PyMOL + VTK)")
-                elif self.render_backend == "vtk":
+                self.renderer_combo.addItems([pymol_label, "VTK (interactive)"])
+                if self.render_backend == "vtk":
                     self.renderer_combo.setCurrentText("VTK (interactive)")
                 else:
                     self.renderer_combo.setCurrentText(pymol_label)
@@ -3023,28 +4868,17 @@ class pyNuD_simulator(QMainWindow):
                 self.renderer_combo.setEnabled(False)
         finally:
             self.renderer_combo.blockSignals(False)
+        self._update_sequence_control()
 
     def on_renderer_changed(self, text):
         """Rendererコンボの変更を反映"""
-        if text.startswith("Dual") and self.pymol_available and getattr(self, 'current_structure_type', None) != "mrc":
-            self.user_render_backend_preference = "dual"
-            self._set_render_backend("dual")
-            if self.atoms_data is not None:
-                self.display_molecule()
-            self.request_render()
-            return
-
         if "PyMOL" in text and self.pymol_available:
             self.user_render_backend_preference = "pymol"
             self._set_render_backend("pymol")
             if self.atoms_data is not None:
                 self.display_molecule()
             if hasattr(self, 'show_tip_check') and self.show_tip_check.isChecked():
-                QMessageBox.information(
-                    self, "Tip Display",
-                    "Tip rendering is only available in VTK mode.\n"
-                    "PyMOL (image) mode disables interactive tip display."
-                )
+                self._display_pymol_tip_overlay()
         else:
             self.user_render_backend_preference = "vtk"
             self._set_render_backend("vtk")
@@ -3097,18 +4931,20 @@ class pyNuD_simulator(QMainWindow):
             view = list(self.pymol_cmd.get_view())
             if len(view) < 18:
                 return
+            # Keep this in the same column-major basis convention used by
+            # _sync_pymol_view_from_vtk(): screen-right, screen-up, view axis.
             if view_plane == 'xy':
                 rot = [1, 0, 0,
                        0, 1, 0,
                        0, 0, 1]
             elif view_plane == 'yz':
-                rot = [0, 1, 0,
-                       0, 0, 1,
-                       1, 0, 0]
+                rot = [0, 0, 1,
+                       1, 0, 0,
+                       0, 1, 0]
             elif view_plane == 'zx':
                 rot = [1, 0, 0,
-                       0, 0, 1,
-                       0, -1, 0]
+                       0, 0, -1,
+                       0, 1, 0]
             else:
                 return
             view[:9] = rot
@@ -3123,15 +4959,25 @@ class pyNuD_simulator(QMainWindow):
             if self.pymol_image_mode and self.pymol_image_label is not None:
                 self._schedule_pymol_render()
             else:
-                try:
-                    self.pymol_cmd.refresh()
-                except Exception:
-                    pass
+                self._request_pymol_widget_update()
         if (not self._is_pymol_only()) and hasattr(self, 'vtk_widget') and self.vtk_widget is not None:
             try:
                 self.vtk_widget.GetRenderWindow().Render()
             except Exception:
                 pass
+
+    def _request_pymol_widget_update(self):
+        """Request PyMOL redraw without forcing an immediate draw outside Qt's GL context."""
+        if getattr(self, "pymol_native_widget_active", False) and getattr(self, "pymol_widget", None) is not None:
+            try:
+                self.pymol_widget.update()
+            except Exception:
+                pass
+            return
+        try:
+            self.pymol_cmd.refresh()
+        except Exception:
+            pass
 
     def _render_pymol_image(self):
         """PyMOL描画を画像として取得し、QLabelに反映"""
@@ -3193,14 +5039,32 @@ class pyNuD_simulator(QMainWindow):
         try:
             ambient = self.ambient_slider.value() / 100.0
             specular = self.specular_slider.value() / 100.0
+            if self.pymol_embed_native or self._is_pymol_only():
+                ambient = max(ambient, 0.22)
             ambient = min(1.0, ambient * self.brightness_factor)
-            self.pymol_cmd.set("ambient", ambient)
-            self.pymol_cmd.set("specular", min(1.0, specular))
+            direct = 0.75 if (self.pymol_embed_native or self._is_pymol_only()) else max(0.35, min(1.0, 1.0 - ambient * 0.35))
+            settings = {
+                "ambient": ambient,
+                "specular": min(1.0, specular),
+                "direct": direct,
+                "two_sided_lighting": 1,
+                "depth_cue": 0,
+                "ray_shadow": 0,
+            }
+            for name, value in settings.items():
+                try:
+                    self.pymol_cmd.set(name, value)
+                except Exception:
+                    pass
         except Exception:
             pass
 
     def _on_vtk_camera_modified(self, obj, event):
         """VTKカメラ変更をPyMOLに同期（デバウンス）"""
+        try:
+            self._set_current_standard_view(self.get_current_view_orientation())
+        except Exception:
+            pass
         if not self._is_dual_mode() or not self._is_pymol_active():
             return
         if self._vtk_camera_sync_timer is None:
@@ -3292,20 +5156,17 @@ class pyNuD_simulator(QMainWindow):
             if self.pymol_image_mode:
                 self._schedule_pymol_render()
             else:
-                try:
-                    self.pymol_cmd.refresh()
-                except Exception:
-                    pass
+                self._request_pymol_widget_update()
         except Exception:
             pass
 
     def _sync_pymol_object_ttt_from_vtk(self):
-        """VTKの分子変換（base+local）をPyMOLのオブジェクト変換(TTT)へ反映"""
-        if not self._is_dual_mode() or not self._is_pymol_active():
+        """pyNuDの分子変換（base+local）をPyMOLのオブジェクト変換(TTT)へ反映"""
+        if not self._is_pymol_active():
             return
         if not self.pymol_available or self.pymol_cmd is None:
             return
-        if not self.current_structure_path or self.pymol_loaded_path != self.current_structure_path:
+        if not self.current_structure_path or not self.pymol_loaded_path:
             return
         if not hasattr(self, "combined_transform") or self.combined_transform is None:
             return
@@ -3336,10 +5197,7 @@ class pyNuD_simulator(QMainWindow):
             if self.pymol_image_mode:
                 self._schedule_pymol_render()
             else:
-                try:
-                    self.pymol_cmd.refresh()
-                except Exception:
-                    pass
+                self._request_pymol_widget_update()
         except Exception:
             pass
         
@@ -3405,14 +5263,14 @@ class pyNuD_simulator(QMainWindow):
         left_panel = self.create_control_panel()
         left_scroll_area.setWidget(left_panel)
         left_scroll_area.setWidgetResizable(True)
-        left_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._force_persistent_scrollbars(left_scroll_area, vertical=True, horizontal=False)
         left_scroll_area.setMinimumWidth(280)
         self.main_splitter.addWidget(left_scroll_area)
         
         right_scroll_area = QScrollArea()
         right_scroll_area.setWidgetResizable(True)
-        right_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         right_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._force_persistent_scrollbars(right_scroll_area, vertical=True, horizontal=False)
         right_panel = self.create_vtk_panel()
         right_scroll_area.setWidget(right_panel)
         self.main_splitter.addWidget(right_scroll_area)
@@ -3455,6 +5313,12 @@ class pyNuD_simulator(QMainWindow):
         show_help_action.triggered.connect(self.show_help_window)
         help_menu.addAction(show_help_action)
 
+        help_menu.addSeparator()
+        notices_action = QAction("Third-Party Notices...", self)
+        notices_action.setToolTip("Show third-party copyright, license, and trademark notices")
+        notices_action.triggered.connect(self.show_third_party_notices)
+        help_menu.addAction(notices_action)
+
     def show_help_window(self):
         """ヘルプウィンドウを作成して表示する"""
         # ウィンドウが既に開いている場合は、新しく作らずに最前面に表示
@@ -3465,6 +5329,50 @@ class pyNuD_simulator(QMainWindow):
         else:
             self.help_window.activateWindow()
             self.help_window.raise_()
+
+    def show_third_party_notices(self):
+        """Display bundled third-party license and trademark notices."""
+        notice_path = get_bundled_file_path(THIRD_PARTY_NOTICES_FILENAME)
+        if notice_path is None:
+            QMessageBox.warning(
+                self,
+                "Third-Party Notices",
+                f"{THIRD_PARTY_NOTICES_FILENAME} was not found.",
+            )
+            return
+
+        try:
+            notice_text = notice_path.read_text(encoding='utf-8')
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Third-Party Notices",
+                f"Could not read {notice_path}:\n{exc}",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Third-Party Notices")
+        dialog.resize(780, 640)
+
+        layout = QVBoxLayout(dialog)
+        source_label = QLabel(f"Source: {notice_path}")
+        source_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        text_view = QTextBrowser(dialog)
+        text_view.setPlainText(notice_text)
+        text_view.setLineWrapMode(QTextEdit.WidgetWidth)
+
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.accept)
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        button_row.addWidget(close_button)
+
+        layout.addWidget(source_label)
+        layout.addWidget(text_view, 1)
+        layout.addLayout(button_row)
+        dialog.exec_()
 
     def _ensure_afm_appearance_window(self, show=False):
         """Create (if needed) and optionally show AFM Appearance window."""
@@ -3675,11 +5583,13 @@ class pyNuD_simulator(QMainWindow):
         color_layout.addWidget(QLabel("Brightness:"), 1, 0)
         self.brightness_slider = QSlider(Qt.Horizontal)
         self.brightness_slider.setRange(20, 200)
-        self.brightness_slider.setValue(100)
+        initial_brightness = 100
+        self.brightness_slider.setValue(initial_brightness)
+        self.brightness_factor = initial_brightness / 100.0
         self.brightness_slider.valueChanged.connect(self.update_brightness)
         color_layout.addWidget(self.brightness_slider, 1, 1)
         
-        self.brightness_label = QLabel("100%")
+        self.brightness_label = QLabel(f"{initial_brightness}%")
         self.brightness_label.setMinimumWidth(40)
         color_layout.addWidget(self.brightness_label, 1, 2)
         
@@ -3705,11 +5615,12 @@ class pyNuD_simulator(QMainWindow):
         color_layout.addWidget(QLabel("Ambient:"), 3, 0)
         self.ambient_slider = QSlider(Qt.Horizontal)
         self.ambient_slider.setRange(0, 50)
-        self.ambient_slider.setValue(10)
+        initial_ambient = 22 if getattr(self, "pymol_embed_native", False) else 10
+        self.ambient_slider.setValue(initial_ambient)
         self.ambient_slider.valueChanged.connect(self.update_lighting)
         color_layout.addWidget(self.ambient_slider, 3, 1)
         
-        self.ambient_label = QLabel("10%")
+        self.ambient_label = QLabel(f"{initial_ambient}%")
         self.ambient_label.setMinimumWidth(40)
         color_layout.addWidget(self.ambient_label, 3, 2)
         
@@ -3725,25 +5636,6 @@ class pyNuD_simulator(QMainWindow):
         self.specular_label.setMinimumWidth(40)
         color_layout.addWidget(self.specular_label, 4, 2)
         
-        # プリセットボタン
-        preset_layout = QHBoxLayout()
-        
-        pymol_btn = QPushButton("PyMOL Style")
-        pymol_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                border: none;
-                border-radius: 3px;
-                padding: 5px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-        """)
-        pymol_btn.clicked.connect(self.apply_pymol_style)
-        preset_layout.addWidget(pymol_btn)
-        
         dark_btn = QPushButton("Dark Theme")
         dark_btn.setStyleSheet("""
             QPushButton {
@@ -3758,9 +5650,7 @@ class pyNuD_simulator(QMainWindow):
             }
         """)
         dark_btn.clicked.connect(self.apply_dark_theme)
-        preset_layout.addWidget(dark_btn)
-        
-        color_layout.addLayout(preset_layout, 5, 0, 1, 3)
+        color_layout.addWidget(dark_btn, 5, 0, 1, 3)
         
         layout.addWidget(color_group)
 
@@ -4227,32 +6117,6 @@ class pyNuD_simulator(QMainWindow):
 
         self._update_noise_ui_states()
         
-        # 表示制御
-        view_group = QGroupBox("View Control")
-        view_layout = QVBoxLayout(view_group)
-        
-        self.show_molecule_check = QCheckBox("Show Molecule")
-        self.show_molecule_check.setChecked(True)
-        self.show_molecule_check.toggled.connect(self.toggle_molecule_visibility)
-        view_layout.addWidget(self.show_molecule_check)
-        
-        self.show_tip_check = QCheckBox("Show AFM Tip")
-        self.show_tip_check.setChecked(True)
-        self.show_tip_check.toggled.connect(self.toggle_tip_visibility)
-        view_layout.addWidget(self.show_tip_check)
-        
-        self.show_bonds_check = QCheckBox("Show Bonds")
-        self.show_bonds_check.setChecked(True)
-        self.show_bonds_check.toggled.connect(self.toggle_bonds_visibility)
-        view_layout.addWidget(self.show_bonds_check)
-        
-        reset_view_btn = QPushButton("Reset View")
-        reset_view_btn.setToolTip("Reset camera to default view\nカメラをデフォルトビューにリセット")
-        reset_view_btn.clicked.connect(self.reset_camera)
-        view_layout.addWidget(reset_view_btn)
-        
-        layout.addWidget(view_group)
-
         #self.update_tip_ui(self.tip_shape_combo.currentText())
         
         return panel
@@ -4593,13 +6457,10 @@ class pyNuD_simulator(QMainWindow):
     def on_load_real_asd(self):
         """Load Real AFM ASD via file dialog."""
         initial_dir = self.last_import_dir if hasattr(self, 'last_import_dir') and self.last_import_dir else ''
-        dialog_options = QFileDialog.Options()
-        if sys.platform != "darwin":
-            dialog_options |= QFileDialog.DontUseNativeDialog
         path, _ = QFileDialog.getOpenFileName(
             self, "Load Real AFM (ASD)", initial_dir,
             "ASD files (*.asd);;All Files (*)",
-            options=dialog_options
+            options=QFileDialog.DontUseNativeDialog
         )
         if not path:
             return
@@ -5142,7 +7003,7 @@ class pyNuD_simulator(QMainWindow):
                 except Exception:
                     pass
 
-    def _run_xy_simulation_blocking(self, coords, scan_x_nm, scan_y_nm, nx, ny, tip_params=None):
+    def _run_xy_simulation_blocking(self, coords, scan_x_nm, scan_y_nm, nx, ny, sim_mode='pdb', tip_params=None):
         """Run one XY AFM simulation synchronously and return raw height map."""
         if coords is None:
             return None
@@ -5682,7 +7543,7 @@ class pyNuD_simulator(QMainWindow):
         btn_pose.clicked.connect(self.estimate_pose_from_real)
         row.addWidget(btn_pose)
         btn_auto_fit = QPushButton("Auto-fit AFM Appearance")
-        btn_auto_fit.setToolTip("Fit probe radius/angle and low-pass cutoff. Noise/artifacts are not changed.")
+        btn_auto_fit.setToolTip("Two-stage fit: probe/low-pass first, then noise/artifacts.")
         btn_auto_fit.clicked.connect(self.auto_fit_appearance)
         row.addWidget(btn_auto_fit)
         outer.addLayout(row)
@@ -5827,7 +7688,7 @@ class pyNuD_simulator(QMainWindow):
             win.activateWindow()
 
     def apply_noise_artifacts_with_params(self, height_nm, pixel_x_nm, pixel_y_nm, params):
-        """Apply noise/artifacts using explicit parameters without changing UI controls."""
+        """Apply noise/artifacts using explicit parameters (for auto-fit)."""
         height = np.array(height_nm, dtype=float, copy=True)
         rng = np.random.default_rng(params.get('seed', 0))
 
@@ -5907,12 +7768,9 @@ class pyNuD_simulator(QMainWindow):
         return height
 
     def auto_fit_appearance(self):
-        """Auto-fit probe radius/angle and low-pass cutoff to the Real AFM appearance."""
+        """Auto-fit AFM appearance in two stages: probe/low-pass, then noise."""
         if self.real_afm_nm is None:
             QMessageBox.information(self, "Auto-fit", "Real AFM is not loaded.")
-            return
-        if self.atoms_data is None:
-            QMessageBox.warning(self, "Auto-fit", "PDB is not loaded.")
             return
 
         if self.is_worker_running(getattr(self, 'sim_worker', None), attr_name='sim_worker') or \
@@ -5932,12 +7790,14 @@ class pyNuD_simulator(QMainWindow):
         scan_x, scan_y, nx, ny = meta
         self._apply_real_afm_scan_to_controls(scan_x, scan_y, nx, ny)
 
-        coords = self.get_rotated_atom_coords()
+        coords, sim_mode = self.get_simulation_coords()
         if coords is None:
-            QMessageBox.warning(self, "Auto-fit", "Failed to get rotated PDB coordinates.")
+            QMessageBox.warning(self, "Auto-fit", "Failed to get simulation coordinates.")
             return
 
         pose = getattr(self, 'pose', None) or {'theta_deg': 0.0, 'dx_px': 0.0, 'dy_px': 0.0}
+        pixel_x_nm = float(scan_x) / max(float(nx), 1e-12)
+        pixel_y_nm = float(scan_y) / max(float(ny), 1e-12)
 
         def _unique_candidates(values, min_value, max_value, decimals=2):
             unique = []
@@ -5982,14 +7842,53 @@ class pyNuD_simulator(QMainWindow):
             decimals=2,
         )
 
+        height_sigma = [0.0, 0.05, 0.1, 0.2]
+        line_sigma = [0.0, 0.05, 0.1]
+        drift_vx = [0.0, 0.05, 0.1]
+        fixed_scan_direction = "L2R"
+        current_lag_tau = float(self.spinLagTauLines.value()) if hasattr(self, 'spinLagTauLines') else 2.0
+        feedback_candidates = [
+            {
+                'feedback_mode': "none",
+                'scan_direction': fixed_scan_direction,
+                'lag_tau_lines': current_lag_tau,
+                'tap_drop_threshold_nm': 1.0,
+                'tap_tau_track_lines': 2.0,
+                'tap_tau_parachute_lines': 15.0,
+                'tap_release_threshold_nm': 0.3,
+            },
+            {
+                'feedback_mode': "linear_lag",
+                'scan_direction': fixed_scan_direction,
+                'lag_tau_lines': current_lag_tau,
+                'tap_drop_threshold_nm': 1.0,
+                'tap_tau_track_lines': 2.0,
+                'tap_tau_parachute_lines': 15.0,
+                'tap_release_threshold_nm': 0.3,
+            },
+        ]
+        for td in (0.6, 1.0):
+            for tp in (5.0, 10.0, 20.0):
+                feedback_candidates.append({
+                    'feedback_mode': "tapping_parachute",
+                    'scan_direction': fixed_scan_direction,
+                    'lag_tau_lines': current_lag_tau,
+                    'tap_drop_threshold_nm': td,
+                    'tap_tau_track_lines': 2.0,
+                    'tap_tau_parachute_lines': tp,
+                    'tap_release_threshold_nm': 0.3,
+                })
+
         total_probe = len(radius_values) * len(angle_values) * len(cutoff_values)
-        total_steps = max(1, total_probe + 1)
+        total_noise = len(height_sigma) * len(line_sigma) * len(drift_vx) * len(feedback_candidates)
+        total_steps = max(1, total_probe + total_noise + 1)
         progress = QProgressDialog("Auto-fitting AFM appearance...", "Cancel", 0, total_steps, self)
         progress.setWindowTitle("Auto-fit AFM Appearance")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
 
         best_probe = {'score': -1e9, 'params': None, 'base': None}
+        best_noise = {'score': -1e9, 'params': None}
         step = 0
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -6002,7 +7901,11 @@ class pyNuD_simulator(QMainWindow):
                         'minitip_radius': current_minitip,
                         'tip_angle': angle,
                     }
-                    raw_xy = self._run_xy_simulation_blocking(coords, scan_x, scan_y, nx, ny, tip_params=tip_params)
+                    raw_xy = self._run_xy_simulation_blocking(
+                        coords, scan_x, scan_y, nx, ny,
+                        sim_mode=sim_mode,
+                        tip_params=tip_params,
+                    )
                     if raw_xy is None:
                         step += len(cutoff_values)
                         progress.setValue(step)
@@ -6043,7 +7946,7 @@ class pyNuD_simulator(QMainWindow):
                         else:
                             best_stage1_text = "Best: n/a"
                         progress.setLabelText(
-                            "Fitting probe radius/angle and low-pass cutoff\n"
+                            "Stage 1/2: fitting probe radius/angle and low-pass cutoff\n"
                             f"Now: R={radius:.2f} nm, Angle={angle:.2f} deg, Cutoff={cutoff_nm:.2f} nm\n"
                             f"{best_stage1_text}"
                         )
@@ -6056,14 +7959,70 @@ class pyNuD_simulator(QMainWindow):
                 QMessageBox.information(self, "Auto-fit", "No valid probe/low-pass candidates.")
                 return
 
+            base = best_probe['base']
+            for hs in height_sigma:
+                for ls in line_sigma:
+                    for dvx in drift_vx:
+                        for feedback_params in feedback_candidates:
+                            if progress.wasCanceled():
+                                return
+                            params = {
+                                'seed': 0,
+                                'height_sigma_nm': hs,
+                                'line_sigma_nm': ls,
+                                'drift_vx_nm_per_line': dvx,
+                            }
+                            params.update(feedback_params)
+                            sim_candidate = self.apply_noise_artifacts_with_params(base, pixel_x_nm, pixel_y_nm, params)
+                            sim_candidate = self.apply_pose_to_image(sim_candidate, pose)
+                            score = self.score_zncc(self.real_afm_nm, sim_candidate)
+                            if score > best_noise['score']:
+                                best_noise = {'score': float(score), 'params': dict(params)}
+
+                            step += 1
+                            progress.setLabelText(
+                                "Stage 2/2: fitting noise and scan artifacts\n"
+                                f"Probe score: {best_probe['score']:.4f}    Best score: {best_noise['score']:.4f}"
+                            )
+                            progress.setValue(step)
+                            QApplication.processEvents()
+
+            if progress.wasCanceled():
+                return
+            if best_noise['params'] is None:
+                QMessageBox.information(self, "Auto-fit", "No valid noise candidates.")
+                return
+
             probe_params = best_probe['params']
+            noise_params = best_noise['params']
             widgets_to_block = [
                 self.tip_radius_spin,
                 self.minitip_radius_spin,
                 self.tip_angle_spin,
                 self.apply_filter_check,
                 self.filter_cutoff_spin,
+                self.chkNoiseEnable,
+                self.chkUseNoiseSeed,
+                self.spinNoiseSeed,
+                self.chkHeightNoise,
+                self.spinHeightNoiseSigmaNm,
+                self.chkLineNoise,
+                self.spinLineNoiseSigmaNm,
+                self.chkDrift,
+                self.spinDriftVxNmPerLine,
+                self.spinDriftVyNmPerLine,
+                self.spinDriftJitterNmPerLine,
+                self.chkFeedbackLag,
+                self.comboFeedbackMode,
+                self.comboScanDirection,
+                self.spinLagTauLines,
+                self.spinTapDropThresholdNm,
+                self.spinTapTauTrackLines,
+                self.spinTapTauParachuteLines,
+                self.spinTapReleaseThresholdNm,
             ]
+            if hasattr(self, 'comboLineNoiseMode'):
+                widgets_to_block.append(self.comboLineNoiseMode)
 
             for widget in widgets_to_block:
                 try:
@@ -6077,6 +8036,38 @@ class pyNuD_simulator(QMainWindow):
                     self.tip_angle_spin.setValue(float(probe_params['tip_angle']))
                 self.apply_filter_check.setChecked(True)
                 self.filter_cutoff_spin.setValue(float(probe_params['lowpass_cutoff_nm']))
+
+                feedback_mode = str(noise_params.get('feedback_mode', 'none'))
+                noise_on = (
+                    noise_params['height_sigma_nm'] > 0 or
+                    noise_params['line_sigma_nm'] > 0 or
+                    noise_params['drift_vx_nm_per_line'] > 0 or
+                    feedback_mode in ("linear_lag", "tapping_parachute")
+                )
+                self.chkNoiseEnable.setChecked(bool(noise_on))
+                self.chkUseNoiseSeed.setChecked(bool(noise_on))
+                self.spinNoiseSeed.setValue(0)
+                self.chkHeightNoise.setChecked(noise_params['height_sigma_nm'] > 0)
+                self.spinHeightNoiseSigmaNm.setValue(float(noise_params['height_sigma_nm']))
+                self.chkLineNoise.setChecked(noise_params['line_sigma_nm'] > 0)
+                self.spinLineNoiseSigmaNm.setValue(float(noise_params['line_sigma_nm']))
+                if hasattr(self, 'comboLineNoiseMode'):
+                    self.comboLineNoiseMode.setCurrentText("offset")
+                self.chkDrift.setChecked(noise_params['drift_vx_nm_per_line'] > 0)
+                self.spinDriftVxNmPerLine.setValue(float(noise_params['drift_vx_nm_per_line']))
+                self.spinDriftVyNmPerLine.setValue(0.0)
+                self.spinDriftJitterNmPerLine.setValue(0.0)
+                self.chkFeedbackLag.setChecked(feedback_mode in ("linear_lag", "tapping_parachute"))
+                if feedback_mode in ("linear_lag", "tapping_parachute"):
+                    self.comboFeedbackMode.setCurrentText(feedback_mode)
+                self.spinLagTauLines.setValue(float(noise_params.get('lag_tau_lines', current_lag_tau)))
+                self.spinTapDropThresholdNm.setValue(float(noise_params.get('tap_drop_threshold_nm', 1.0)))
+                self.spinTapTauTrackLines.setValue(float(noise_params.get('tap_tau_track_lines', 2.0)))
+                self.spinTapTauParachuteLines.setValue(float(noise_params.get('tap_tau_parachute_lines', 15.0)))
+                self.spinTapReleaseThresholdNm.setValue(float(noise_params.get('tap_release_threshold_nm', 0.3)))
+                idx = self.comboScanDirection.findData(fixed_scan_direction)
+                if idx >= 0:
+                    self.comboScanDirection.setCurrentIndex(idx)
             finally:
                 for widget in widgets_to_block:
                     try:
@@ -6085,6 +8076,7 @@ class pyNuD_simulator(QMainWindow):
                         pass
 
             self.filter_cutoff_spin.setEnabled(self.apply_filter_check.isChecked())
+            self._update_noise_ui_states()
             self.create_tip()
             self.update_tip_info()
             self.afm_params.update({
@@ -6112,8 +8104,8 @@ class pyNuD_simulator(QMainWindow):
                 f"Angle: {probe_params['tip_angle']:.2f} deg"
                 f"{' (Cone/Sphere only)' if tip_shape not in ('cone', 'sphere') else ''}\n"
                 f"Low-pass: ON, Cutoff Wavelength: {lowpass_text}\n"
-                f"Score: {best_probe['score']:.4f}\n"
-                "Noise/artifact controls were not changed."
+                f"Stage 1 score: {best_probe['score']:.4f}\n"
+                f"Final score: {best_noise['score']:.4f}"
             )
             if hasattr(self, 'status_label'):
                 self.status_label.setText(
@@ -6121,7 +8113,7 @@ class pyNuD_simulator(QMainWindow):
                     f"R={probe_params['tip_radius']:.2f} nm, "
                     f"Angle={probe_params['tip_angle']:.2f} deg, "
                     f"Low-pass={lowpass_text}, "
-                    f"Score={best_probe['score']:.4f}"
+                    f"Score={best_noise['score']:.4f}"
                 )
         finally:
             try:
@@ -6134,6 +8126,77 @@ class pyNuD_simulator(QMainWindow):
                 pass
         if 'result_message' in locals() and result_message:
             QMessageBox.information(self, "Auto-fit AFM Appearance", result_message)
+
+    def create_structure_view_toolbar(self):
+        """Create compact structure-view controls above the molecular viewer."""
+        toolbar = QFrame()
+        toolbar.setObjectName("structure_view_toolbar")
+        toolbar.setMinimumHeight(30)
+        toolbar.setMaximumHeight(36)
+        toolbar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        toolbar.setStyleSheet("""
+            QFrame#structure_view_toolbar {
+                background-color: #f0f0f0;
+                border-radius: 3px;
+            }
+            QLabel#structure_drop_label {
+                font-weight: bold;
+                font-size: 12px;
+                color: #333;
+                padding: 2px 8px;
+            }
+            QCheckBox {
+                font-size: 11px;
+                spacing: 4px;
+            }
+            QPushButton {
+                font-size: 11px;
+                padding: 3px 10px;
+                min-width: 84px;
+            }
+        """)
+
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(6, 2, 6, 2)
+        toolbar_layout.setSpacing(10)
+
+        self.structure_drop_label = QLabel("Drop PDB, CIF, MRC files here")
+        self.structure_drop_label.setObjectName("structure_drop_label")
+        self.structure_drop_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self.structure_drop_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        toolbar_layout.addWidget(self.structure_drop_label, 1)
+
+        self.show_molecule_check = QCheckBox("Show Molecule")
+        self.show_molecule_check.setChecked(True)
+        self.show_molecule_check.setToolTip("Show or hide the molecular structure\n分子構造の表示/非表示")
+        self.show_molecule_check.toggled.connect(self.toggle_molecule_visibility)
+        toolbar_layout.addWidget(self.show_molecule_check)
+
+        self.show_tip_check = QCheckBox("Show AFM Tip")
+        self.show_tip_check.setChecked(True)
+        self.show_tip_check.setToolTip("Show or hide the AFM tip overlay\nAFM探針表示の表示/非表示")
+        self.show_tip_check.toggled.connect(self.toggle_tip_visibility)
+        toolbar_layout.addWidget(self.show_tip_check)
+
+        self.show_bonds_check = QCheckBox("Show Bonds")
+        self.show_bonds_check.setChecked(True)
+        self.show_bonds_check.setToolTip("Show or hide bond rendering when VTK display is active\nVTK表示時の結合表示の表示/非表示")
+        self.show_bonds_check.toggled.connect(self.toggle_bonds_visibility)
+        toolbar_layout.addWidget(self.show_bonds_check)
+
+        self.show_sequence_check = QCheckBox("Sequence")
+        self.show_sequence_check.setChecked(False)
+        self.show_sequence_check.setEnabled(False)
+        self.show_sequence_check.setToolTip("Show residue sequence panel\n残基配列パネルを表示")
+        self.show_sequence_check.toggled.connect(self.toggle_sequence_panel)
+        toolbar_layout.addWidget(self.show_sequence_check)
+
+        reset_view_btn = QPushButton("Reset View")
+        reset_view_btn.setToolTip("Reset camera to default view\nカメラをデフォルトビューにリセット")
+        reset_view_btn.clicked.connect(self.reset_camera)
+        toolbar_layout.addWidget(reset_view_btn)
+
+        return toolbar
 
     # 既存の create_vtk_panel メソッドを、以下の完全なコードで置き換えてください。
 
@@ -6166,21 +8229,10 @@ class pyNuD_simulator(QMainWindow):
         structure_layout = QVBoxLayout(structure_frame)
         structure_layout.setContentsMargins(2, 2, 2, 2)
         structure_layout.setSpacing(2)
-        # if 
-        structure_label = QLabel("Drop PDB, CIF, MRC files here")
-        structure_label.setStyleSheet("""
-            QLabel {
-                font-weight: bold;
-                font-size: 12px;
-                color: #333;
-                padding: 3px;
-                background-color: #f0f0f0;
-                border-radius: 3px;
-            }
-        """)
-        structure_label.setAlignment(Qt.AlignCenter)
-        structure_label.setMaximumHeight(25)
-        structure_layout.addWidget(structure_label)
+        self.structure_view_toolbar = self.create_structure_view_toolbar()
+        structure_layout.addWidget(self.structure_view_toolbar)
+        self.sequence_panel = self.create_sequence_panel()
+        structure_layout.addWidget(self.sequence_panel)
 
         structure_layout.addWidget(self.progress_container)
         
@@ -6264,7 +8316,16 @@ class pyNuD_simulator(QMainWindow):
         self.structure_view_splitter.addWidget(self.vtk_view_container)
         self.structure_view_splitter.setSizes([600, 600])
         # ドロップを受け付ける
-        for w in (self.pymol_view_container, self.vtk_view_container, self.structure_view_splitter):
+        for w in (
+            self.structure_view_toolbar,
+            self.structure_drop_label,
+            self.sequence_panel,
+            self.sequence_scroll_area,
+            self.pymol_view_container,
+            self.pymol_widget_container,
+            self.vtk_view_container,
+            self.structure_view_splitter,
+        ):
             try:
                 w.setAcceptDrops(True)
                 w.installEventFilter(self)
@@ -6277,7 +8338,7 @@ class pyNuD_simulator(QMainWindow):
         controls_scroll = QScrollArea()
         controls_scroll.setWidgetResizable(True)
         controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._force_persistent_scrollbars(controls_scroll, vertical=True, horizontal=False)
         controls_scroll.setFrameShape(QFrame.NoFrame)
         controls_scroll.setWidget(rotation_controls)
         controls_scroll.setMinimumHeight(80)
@@ -6446,7 +8507,7 @@ class pyNuD_simulator(QMainWindow):
 
     def create_rotation_controls(self):
         """PDB構造回転用コントロールと視点コントロールを作成"""
-        group = QGroupBox("Structure & View Control (CTRL+Drag can rotate the PDB structure)")
+        group = QGroupBox("Structure & View Control (Rotation XYZ sets the simulation pose)")
         group.setStyleSheet("QGroupBox { font-weight: bold; }")
         
         # メインの水平レイアウト
@@ -6528,9 +8589,12 @@ class pyNuD_simulator(QMainWindow):
         save_view_btn.clicked.connect(self.handle_save_3d_view) # 新しいメソッドに接続
         top_button_layout.addWidget(save_view_btn) # 水平レイアウトに追加   
 
-        # Find Initial Plane（XY接触最大）ボタン
+        # Find Initial Plane（接触候補の基板射影面積最大）ボタン
         find_plane_btn = QPushButton("Find Initial Plane")
-        find_plane_btn.setToolTip("Rotate molecule to maximize XY-plane contact\n分子を回転してXY平面接触を最大化")
+        find_plane_btn.setToolTip(
+            "Rotate molecule to maximize the substrate-projected contact patch\n"
+            "接触候補原子の基板面への射影面積が最大になるように分子を回転"
+        )
         find_plane_btn.clicked.connect(self.handle_find_initial_plane)
         top_button_layout.addWidget(find_plane_btn)
 
@@ -6546,7 +8610,7 @@ class pyNuD_simulator(QMainWindow):
         params_scroll = QScrollArea()
         params_scroll.setWidgetResizable(True)
         params_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        params_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._force_persistent_scrollbars(params_scroll, vertical=True, horizontal=False)
         params_scroll.setFrameShape(QFrame.NoFrame)
 
         params_content = QWidget()
@@ -6568,10 +8632,10 @@ class pyNuD_simulator(QMainWindow):
         use_elec_check.setChecked(False)
         use_elec_check.setToolTip(
             "Enable electrostatic term based on residue charges.\n"
-            "When off, only geometric contact and spread are used.\n"
+            "When off, only projected contact area and geometric tie-breaks are used.\n"
             "\n"
             "残基電荷に基づく静電項を有効にします。\n"
-            "OFFの場合は幾何（接触＋広がり）のみで評価します。"
+            "OFFの場合は接触射影面積と幾何的な同点処理のみで評価します。"
         )
         params_layout.addWidget(use_elec_check, 0, 0, 1, 2)
 
@@ -6760,14 +8824,14 @@ class pyNuD_simulator(QMainWindow):
         lambda_spin.setSingleStep(0.01)
         lambda_spin.setValue(0.02)
         lambda_tip = (
-            "Weight for patch spread (variance) in the score.\n"
-            "Score_geo = S_contact + lambda * Var_norm - 0.30 * (Height/delta).\n"
-            "Larger lambda favors wide, stable contact patches.\n"
+            "Tie-break weight for patch spread (variance).\n"
+            "Primary objective is projected occupied contact area.\n"
+            "Larger lambda favors wider patches when projected area is similar.\n"
             "Example: 0.02 (default)\n"
             "\n"
-            "パッチ広がり（分散）の重み。\n"
-            "Score_geo = S_contact + lambda * Var_norm - 0.30 * (Height/delta)。\n"
-            "大きいほど“広く安定に当たる面”を優先します。\n"
+            "パッチ広がり（分散）の同点処理用重み。\n"
+            "主目的は接触候補原子の射影占有面積です。\n"
+            "射影面積が近い場合、大きいほど広いパッチを優先します。\n"
             "例: 0.02（デフォルト）"
         )
         _add_param(11, "lambda:", lambda_spin, lambda_tip)
@@ -6935,6 +8999,32 @@ class pyNuD_simulator(QMainWindow):
         xy_btn = QPushButton("XY")
         yz_btn = QPushButton("YZ")
         zx_btn = QPushButton("ZX")
+        self.view_plane_buttons = {
+            "xy": xy_btn,
+            "yz": yz_btn,
+            "zx": zx_btn,
+        }
+        for btn in self.view_plane_buttons.values():
+            btn.setCheckable(True)
+            btn.setMinimumWidth(48)
+            btn.setStyleSheet("""
+                QPushButton {
+                    padding: 4px 10px;
+                    border: 1px solid #aab2bd;
+                    border-radius: 4px;
+                    background: #f7f9fb;
+                    color: #1f2933;
+                }
+                QPushButton:hover {
+                    background: #edf2f7;
+                }
+                QPushButton:checked {
+                    background: #2563eb;
+                    border-color: #1d4ed8;
+                    color: white;
+                    font-weight: 600;
+                }
+            """)
 
         xy_btn.setToolTip("XY平面が画面に平行になるように視点を変更します (Z軸視点)")
         yz_btn.setToolTip("YZ平面が画面に平行になるように視点を変更します (X軸視点)")
@@ -6955,7 +9045,7 @@ class pyNuD_simulator(QMainWindow):
         # 左右のウィジェットをメインレイアウトに追加
         main_layout.addWidget(left_widget, stretch=3) # 回転コントロールに多くのスペースを割り当てる
         main_layout.addWidget(right_widget, stretch=1)
-                
+
         return group
 
     def handle_reset_button_clicked(self):
@@ -6963,6 +9053,65 @@ class pyNuD_simulator(QMainWindow):
         self.reset_structure_rotation()
         self.reset_tip_position()
         self.reset_camera()
+        self._schedule_reset_all_simulation_update()
+
+    def _schedule_reset_all_simulation_update(self):
+        """Reset All後にSimulator表示を現在の初期姿勢へ追従させる。"""
+        if self.atoms_data is None and not (hasattr(self, 'mrc_data') and self.mrc_data is not None):
+            return
+
+        self._reset_all_sim_update_retries = 0
+        for timer_attr in ('rotation_update_timer', 'interactive_timer', 'high_res_timer'):
+            timer = getattr(self, timer_attr, None)
+            if timer:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+
+        for worker_attr in ('sim_worker_silent', 'sim_worker_high_res'):
+            worker = getattr(self, worker_attr, None)
+            if self.is_worker_running(worker, attr_name=worker_attr):
+                try:
+                    self.stop_worker(worker, timeout_ms=100, allow_terminate=True, worker_name=worker_attr)
+                except Exception as e:
+                    print(f"[WARNING] Error stopping {worker_attr} for reset update: {e}")
+
+        QTimer.singleShot(80, self._run_reset_all_simulation_update)
+
+    def _run_reset_all_simulation_update(self):
+        """Run one simulation update after Reset All state changes have settled."""
+        if self.atoms_data is None and not (hasattr(self, 'mrc_data') and self.mrc_data is not None):
+            return
+
+        worker_running = (
+            self.is_worker_running(getattr(self, 'sim_worker', None), attr_name='sim_worker') or
+            self.is_worker_running(getattr(self, 'sim_worker_silent', None), attr_name='sim_worker_silent') or
+            self.is_worker_running(getattr(self, 'sim_worker_high_res', None), attr_name='sim_worker_high_res')
+        )
+        if worker_running:
+            retries = int(getattr(self, '_reset_all_sim_update_retries', 0))
+            if retries >= 20:
+                self._reset_all_sim_update_retries = 0
+                return
+            self._reset_all_sim_update_retries = retries + 1
+            QTimer.singleShot(150, self._run_reset_all_simulation_update)
+            return
+        self._reset_all_sim_update_retries = 0
+
+        interactive = bool(
+            hasattr(self, 'interactive_update_check') and self.interactive_update_check.isChecked()
+        )
+        has_existing_result = bool(
+            getattr(self, 'simulation_results', None) or getattr(self, 'raw_simulation_results', None)
+        )
+
+        if interactive:
+            self.trigger_interactive_simulation()
+            if hasattr(self, 'schedule_high_res_simulation'):
+                self.schedule_high_res_simulation()
+        elif has_existing_result:
+            self.run_simulation_interactively()
 
     def reset_tip_position(self):
         """探針の位置をUIのデフォルト値にリセットする"""
@@ -6971,10 +9120,29 @@ class pyNuD_simulator(QMainWindow):
             self.tip_y_slider.setValue(0)
             self.tip_z_slider.setValue(25) # UI定義時の初期値
 
+    def _set_current_standard_view(self, view_plane):
+        """Track and highlight the active XY/YZ/ZX standard view button."""
+        view_plane = str(view_plane).lower() if view_plane else None
+        if view_plane not in ("xy", "yz", "zx"):
+            view_plane = None
+        self.current_standard_view = view_plane
+        buttons = getattr(self, "view_plane_buttons", None)
+        if not buttons:
+            return
+        for key, button in buttons.items():
+            try:
+                button.blockSignals(True)
+                button.setChecked(key == view_plane)
+                button.blockSignals(False)
+            except Exception:
+                pass
+
     def set_standard_view(self, view_plane):
         """XY, YZ, ZXの標準視点にカメラをセットする（現在の距離を保持）"""
+        view_plane = str(view_plane).lower()
         if self._is_pymol_active():
             self._pymol_set_standard_view(view_plane)
+            self._set_current_standard_view(view_plane)
             if self._is_pymol_only():
                 return
         if not hasattr(self, 'renderer') or (not self.sample_actor and not (hasattr(self, 'mrc_actor') and self.mrc_actor is not None)):
@@ -7043,6 +9211,7 @@ class pyNuD_simulator(QMainWindow):
         self.request_render()
         if self._is_dual_mode():
             self._sync_pymol_view_from_vtk()
+        self._set_current_standard_view(view_plane)
 
     def _pymol_selection_for_atoms(self):
         """UIの原子選択をPyMOL selectionに変換"""
@@ -7089,24 +9258,44 @@ class pyNuD_simulator(QMainWindow):
         except Exception:
             pass
 
+    def _pymol_visible_color(self, rgb):
+        """Apply pyNuD brightness to PyMOL colors without changing hue balance."""
+        try:
+            factor = max(0.2, float(self.brightness_factor))
+        except Exception:
+            factor = 1.0
+        color = np.array(rgb, dtype=float)
+        return [float(c) for c in np.clip(color * factor, 0.0, 1.0)]
+
+    def _pymol_set_visible_color(self, name, rgb):
+        """Register a PyMOL color after applying pyNuD brightness."""
+        self.pymol_cmd.set_color(name, self._pymol_visible_color(rgb))
+
     def _pymol_apply_color_scheme(self, selection):
         if not self._is_pymol_active():
             return
         color_scheme = self.color_combo.currentText()
         try:
             if color_scheme == "By Element":
-                self.pymol_cmd.color("atomic", selection)
-            elif color_scheme == "By Chain":
+                element_names = [e for e in self.element_colors.keys() if e != 'other']
+                for elem in element_names:
+                    try:
+                        name = f"pynud_elem_{elem}"
+                        self._pymol_set_visible_color(name, self.element_colors[elem])
+                        self.pymol_cmd.color(name, f"({selection}) and elem {elem}")
+                    except Exception:
+                        pass
                 try:
-                    from pymol import util as pymol_util
-                    pymol_util.cbc(selection)
+                    other_name = "pynud_elem_other"
+                    self._pymol_set_visible_color(other_name, self.element_colors.get('other', (0.7, 0.7, 0.7)))
+                    self.pymol_cmd.color(other_name, f"({selection}) and not elem {'+'.join(element_names)}")
                 except Exception:
-                    self.pymol_cmd.color("chainbow", selection)
+                    pass
+            elif color_scheme == "By Chain":
+                self._pymol_apply_chain_colors(selection)
             elif color_scheme == "Single Color":
                 name = "pynud_single_color"
-                self.pymol_cmd.set_color(name, [self.current_single_color[0],
-                                                self.current_single_color[1],
-                                                self.current_single_color[2]])
+                self._pymol_set_visible_color(name, self.current_single_color)
                 self.pymol_cmd.color(name, selection)
             elif color_scheme == "By B-Factor":
                 # B-factor coloring (also used as an ESP colormap when ESP is enabled)
@@ -7125,6 +9314,108 @@ class pyNuD_simulator(QMainWindow):
         except Exception:
             pass
 
+    def _pymol_apply_chain_colors(self, selection):
+        """Apply pyNuD chain colors to PyMOL so brightness is preserved."""
+        if getattr(self, 'atoms_data', None) is None or 'chain_id' not in self.atoms_data:
+            self.pymol_cmd.color("chainbow", selection)
+            return
+        try:
+            chains = []
+            for chain in self.atoms_data['chain_id']:
+                chain_id = str(chain).strip()
+                if chain_id and chain_id not in chains:
+                    chains.append(chain_id)
+            if not chains:
+                self.pymol_cmd.color("chainbow", selection)
+                return
+            for idx, chain_id in enumerate(chains):
+                color = self.chain_colors[idx % len(self.chain_colors)]
+                name = f"pynud_chain_{idx}"
+                self._pymol_set_visible_color(name, color)
+                self.pymol_cmd.color(name, f"({selection}) and chain {chain_id}")
+        except Exception:
+            self.pymol_cmd.color("chainbow", selection)
+
+    def _clear_pymol_structure_temp_file(self):
+        path = getattr(self, "pymol_structure_temp_path", None)
+        if path:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+        self.pymol_structure_temp_path = None
+        self.pymol_structure_temp_dirty = True
+
+    def _pymol_needs_edited_structure_source(self):
+        return bool(getattr(self, "in_memory_structure_edited", False))
+
+    def _pymol_structure_source_path(self):
+        if not self._pymol_needs_edited_structure_source():
+            return self.current_structure_path
+        return self._write_pymol_temp_structure()
+
+    def _format_pdb_atom_name(self, atom_name, element):
+        name = str(atom_name).strip()[:4] or str(element).strip()[:2] or "C"
+        if len(name) < 4:
+            return f"{name:<4}"
+        return name[:4]
+
+    def _write_pymol_temp_structure(self):
+        """Write active in-memory atoms as a temporary PDB for PyMOL display."""
+        if getattr(self, "atoms_data", None) is None:
+            return None
+        path = getattr(self, "pymol_structure_temp_path", None)
+        if path and not getattr(self, "pymol_structure_temp_dirty", True) and os.path.exists(path):
+            return path
+
+        if not path:
+            path = os.path.join(tempfile.gettempdir(), f"pynud_simulator_edited_{id(self)}.pdb")
+            self.pymol_structure_temp_path = path
+
+        required = ("x", "y", "z", "element", "atom_name", "residue_name", "chain_id", "residue_id")
+        if not all(name in self.atoms_data for name in required):
+            return self.current_structure_path
+
+        n_atoms = len(self.atoms_data["x"])
+        try:
+            with open(path, "w", encoding="ascii") as f:
+                for i in range(n_atoms):
+                    serial = (i % 99999) + 1
+                    element = str(self.atoms_data["element"][i]).strip()[:2] or "C"
+                    atom_name = self._format_pdb_atom_name(self.atoms_data["atom_name"][i], element)
+                    res_name = str(self.atoms_data["residue_name"][i]).strip().upper()[:3] or "UNK"
+                    chain = str(self.atoms_data["chain_id"][i]).strip()[:1] or " "
+                    try:
+                        residue_id = int(self.atoms_data["residue_id"][i])
+                    except Exception:
+                        residue_id = 1
+                    residue_id = max(-999, min(9999, residue_id))
+                    icode = ""
+                    if "icode" in self.atoms_data:
+                        icode = str(self.atoms_data["icode"][i]).strip()[:1]
+                    b_factor = 20.0
+                    if "b_factor" in self.atoms_data:
+                        try:
+                            b_factor = float(self.atoms_data["b_factor"][i])
+                        except Exception:
+                            pass
+                    x = float(self.atoms_data["x"][i]) * 10.0
+                    y = float(self.atoms_data["y"][i]) * 10.0
+                    z = float(self.atoms_data["z"][i]) * 10.0
+                    f.write(
+                        f"ATOM  {serial:5d} {atom_name} {res_name:>3} {chain:1}"
+                        f"{residue_id:4d}{icode:1}   "
+                        f"{x:8.3f}{y:8.3f}{z:8.3f}"
+                        f"  1.00{b_factor:6.2f}          {element:>2}\n"
+                    )
+                f.write("END\n")
+            self.pymol_structure_temp_dirty = False
+            return path
+        except Exception as e:
+            print(f"[WARNING] Failed to write edited PyMOL structure: {e}")
+            return self.current_structure_path
+
     def _display_molecule_pymol(self):
         """PyMOLで分子を表示"""
         if not self._is_pymol_active():
@@ -7133,27 +9424,32 @@ class pyNuD_simulator(QMainWindow):
             return
 
         obj = self.pymol_object_name
+        source_path = self._pymol_structure_source_path()
+        if not source_path:
+            return
         try:
-            if self.pymol_loaded_path != self.current_structure_path:
+            if self.pymol_loaded_path != source_path:
                 # 既存オブジェクトを削除して再ロード
                 try:
                     self.pymol_cmd.delete(obj)
                 except Exception:
                     pass
-                self.pymol_cmd.load(self.current_structure_path, obj)
-                self.pymol_loaded_path = self.current_structure_path
+                self.pymol_cmd.load(source_path, obj)
+                self.pymol_loaded_path = source_path
                 self._pymol_last_ttt = None
                 self.pymol_cmd.hide("everything", obj)
-                # VTK側は読み込み時に (max+min)/2 で座標中心を原点へ移動しているため、
-                # PyMOL側も同じ中心化を行って座標系を合わせる。
-                try:
-                    ext = self.pymol_cmd.get_extent(obj)
-                    if ext and len(ext) == 2:
-                        mn, mx = ext
-                        center = [(mn[i] + mx[i]) * 0.5 for i in range(3)]
-                        self.pymol_cmd.translate([-center[0], -center[1], -center[2]], obj, camera=0)
-                except Exception:
-                    pass
+                if not self._pymol_needs_edited_structure_source():
+                    # VTK側は読み込み時に (max+min)/2 で座標中心を原点へ移動しているため、
+                    # 元ファイルを読むPyMOL側も同じ中心化を行って座標系を合わせる。
+                    # 編集後一時PDBはすでにpyNuD座標系で書き出しているので再中心化しない。
+                    try:
+                        ext = self.pymol_cmd.get_extent(obj)
+                        if ext and len(ext) == 2:
+                            mn, mx = ext
+                            center = [(mn[i] + mx[i]) * 0.5 for i in range(3)]
+                            self.pymol_cmd.translate([-center[0], -center[1], -center[2]], obj, camera=0)
+                    except Exception:
+                        pass
                 try:
                     self.pymol_cmd.matrix_reset(obj)
                 except Exception:
@@ -7186,6 +9482,7 @@ class pyNuD_simulator(QMainWindow):
             self.pymol_cmd.hide("everything", obj)
         except Exception:
             pass
+        self._apply_pymol_deleted_residues()
 
         # スタイルに応じた表示
         try:
@@ -7220,6 +9517,9 @@ class pyNuD_simulator(QMainWindow):
         self._pymol_apply_quality(quality)
         self._pymol_apply_color_scheme(selection)
         self._pymol_apply_opacity(opacity)
+        if self.selected_residue_keys:
+            self._apply_pymol_residue_highlight()
+        self._apply_pymol_lighting()
 
         # Electrostatics表示が有効なら再適用
         if hasattr(self, 'esp_check') and self.esp_check.isChecked():
@@ -7470,8 +9770,6 @@ class pyNuD_simulator(QMainWindow):
 
     def update_actor_transform(self):
         """base_transformとlocal_transformを組み合わせてアクターに適用"""
-        if self._is_pymol_only():
-            return
         try:
             # 変換行列を安全に初期化
             self.combined_transform.Identity()
@@ -7497,16 +9795,19 @@ class pyNuD_simulator(QMainWindow):
                 print("[WARNING] Invalid combined_transform, resetting to identity")
                 self.combined_transform.Identity()
             
-            # アクターに適用
-            if self.sample_actor:
-                self.sample_actor.SetUserTransform(self.combined_transform)
-            if self.bonds_actor:
-                self.bonds_actor.SetUserTransform(self.combined_transform)
-            if hasattr(self, 'mrc_actor') and self.mrc_actor is not None:
-                self.mrc_actor.SetUserTransform(self.combined_transform)
-            if hasattr(self, 'vtk_widget'):
-                self.vtk_widget.GetRenderWindow().Render()
-            if self._is_dual_mode() and self._is_pymol_active():
+            if not self._is_pymol_only():
+                # アクターに適用
+                if self.sample_actor:
+                    self.sample_actor.SetUserTransform(self.combined_transform)
+                if self.bonds_actor:
+                    self.bonds_actor.SetUserTransform(self.combined_transform)
+                if self.sequence_highlight_actor is not None:
+                    self.sequence_highlight_actor.SetUserTransform(self.combined_transform)
+                if hasattr(self, 'mrc_actor') and self.mrc_actor is not None:
+                    self.mrc_actor.SetUserTransform(self.combined_transform)
+                if hasattr(self, 'vtk_widget'):
+                    self.vtk_widget.GetRenderWindow().Render()
+            if self._is_pymol_active():
                 self._mark_pymol_interaction()
                 self._sync_pymol_object_ttt_from_vtk()
                 
@@ -7545,41 +9846,19 @@ class pyNuD_simulator(QMainWindow):
         ry = float(self.rotation_widgets['Y']['spin'].value())
         rz = float(self.rotation_widgets['Z']['spin'].value())
 
-        dx = rx - self.prev_rot['x']
-        dy = ry - self.prev_rot['y']
-        dz = rz - self.prev_rot['z']
-
+        # 絶対角から毎回local_transformを再構築する。PyMOL-onlyでもこの行列を
+        # simulation座標とPyMOLオブジェクトTTTの共通ソースにする。
+        self.local_transform.Identity()
+        self.local_transform.PostMultiply()
+        self.local_transform.RotateX(rx)
+        self.local_transform.RotateY(ry)
+        self.local_transform.RotateZ(rz)
+        self.update_actor_transform()
+        if self._is_dual_mode() and self._is_pymol_active():
+            # カメラ同期はModifiedEventで行うが、保険としても呼ぶ
+            self._sync_pymol_view_from_vtk()
         if self._is_pymol_active():
-            # Dual(P yMOL + VTK) では、PyMOL側は VTK の「カメラ回転×オブジェクト回転」を
-            # `_sync_pymol_view_from_vtk()` で反映する。ここで PyMOL を個別に turn/rotate すると
-            # VTKと見た目がズレる（特に Cmd+ドラッグの構造回転）。
-            if not self._is_dual_mode():
-                try:
-                    # PyMOL-only の場合はビュー回転として適用
-                    self.pymol_cmd.turn("x", dx)
-                    self.pymol_cmd.turn("y", dy)
-                    self.pymol_cmd.turn("z", dz)
-                except Exception:
-                    try:
-                        # turnが使えない場合はcamera回転を試す
-                        self.pymol_cmd.rotate("x", dx, self.pymol_object_name, camera=1)
-                        self.pymol_cmd.rotate("y", dy, self.pymol_object_name, camera=1)
-                        self.pymol_cmd.rotate("z", dz, self.pymol_object_name, camera=1)
-                    except Exception:
-                        pass
-                self.request_render()
-
-        if not self._is_pymol_only():
-            # VTK側は絶対角から毎回local_transformを再構築（ドラッグ操作でも安定させる）
-            self.local_transform.Identity()
-            self.local_transform.PostMultiply()
-            self.local_transform.RotateX(rx)
-            self.local_transform.RotateY(ry)
-            self.local_transform.RotateZ(rz)
-            self.update_actor_transform()
-            if self._is_dual_mode() and self._is_pymol_active():
-                # カメラ同期はModifiedEventで行うが、保険としても呼ぶ
-                self._sync_pymol_view_from_vtk()
+            self._display_pymol_tip_overlay()
 
         self.prev_rot['x'], self.prev_rot['y'], self.prev_rot['z'] = rx, ry, rz
         if trigger_simulation:
@@ -7846,8 +10125,80 @@ class pyNuD_simulator(QMainWindow):
             "mask": mask,
         }
 
-    def _eval_geo(self, coordsA, radiiA, n, delta_contact_A, lambda_var):
-        """Evaluate geometric score using atom-based coordinates."""
+    def _projected_contact_area_metrics_A2(self, uv, radiiA, grid_spacing_A):
+        """Estimate projected contact-patch area on the support plane."""
+        uv = np.asarray(uv, dtype=float)
+        radiiA = np.asarray(radiiA, dtype=float)
+        if uv.size == 0 or radiiA.size == 0:
+            return 0.0, 0.0, 0.0, 0.0
+        finite = (
+            np.isfinite(uv[:, 0])
+            & np.isfinite(uv[:, 1])
+            & np.isfinite(radiiA)
+            & (radiiA > 0.0)
+        )
+        if not np.any(finite):
+            return 0.0, 0.0, 0.0, 0.0
+
+        uv = uv[finite]
+        radiiA = radiiA[finite]
+        spacing = max(float(grid_spacing_A), 0.1)
+        min_u = float(np.min(uv[:, 0] - radiiA))
+        max_u = float(np.max(uv[:, 0] + radiiA))
+        min_v = float(np.min(uv[:, 1] - radiiA))
+        max_v = float(np.max(uv[:, 1] + radiiA))
+        width = max(max_u - min_u, spacing)
+        height = max(max_v - min_v, spacing)
+
+        # Keep the occupied-cell set bounded for very large structures.
+        max_cells = 250000
+        estimated_cells = (width / spacing) * (height / spacing)
+        if estimated_cells > max_cells:
+            spacing = max(spacing, float(np.sqrt((width * height) / max_cells)))
+
+        nx = max(1, int(np.ceil(width / spacing)) + 1)
+        occupied = set()
+        for (u_abs, v_abs), radius in zip(uv, radiiA):
+            u = float(u_abs - min_u)
+            v = float(v_abs - min_v)
+            r = max(float(radius), 0.0)
+            ix0 = max(0, int(np.floor((u - r) / spacing)))
+            ix1 = min(nx - 1, int(np.ceil((u + r) / spacing)))
+            iy0 = max(0, int(np.floor((v - r) / spacing)))
+            iy1 = int(np.ceil((v + r) / spacing))
+            r2 = r * r
+            for iy in range(iy0, iy1 + 1):
+                py = (iy + 0.5) * spacing
+                dy2 = (py - v) * (py - v)
+                if dy2 > r2:
+                    continue
+                for ix in range(ix0, ix1 + 1):
+                    px = (ix + 0.5) * spacing
+                    if (px - u) * (px - u) + dy2 <= r2:
+                        occupied.add(iy * nx + ix)
+
+        occupied_area_A2 = float(len(occupied)) * spacing * spacing
+        span_area_A2 = occupied_area_A2
+        if uv.shape[0] >= 3:
+            try:
+                from scipy.spatial import ConvexHull
+                span_area_A2 = max(occupied_area_A2, float(ConvexHull(uv).volume))
+            except Exception:
+                span_area_A2 = occupied_area_A2
+
+        if span_area_A2 <= 0.0:
+            return 0.0, occupied_area_A2, span_area_A2, 0.0
+
+        density = occupied_area_A2 / span_area_A2
+        min_density = 0.05
+        if uv.shape[0] >= 6:
+            contact_area_A2 = min(span_area_A2, occupied_area_A2 / min_density)
+        else:
+            contact_area_A2 = occupied_area_A2
+        return float(contact_area_A2), float(occupied_area_A2), float(span_area_A2), float(density)
+
+    def _eval_geo(self, coordsA, radiiA, n, delta_contact_A, lambda_var, grid_spacing_A=None):
+        """Evaluate support geometry by projected occupied contact area."""
         n = np.asarray(n, dtype=float)
         n_norm = float(np.linalg.norm(n))
         if n_norm < 1e-12:
@@ -7870,8 +10221,11 @@ class pyNuD_simulator(QMainWindow):
                 "n": n,
                 "d": d,
                 "score_geo": -1e300,
+                "contact_area_A2": 0.0,
+                "tie_score": -1e300,
                 "S_contact": 0.0,
                 "var": 0.0,
+                "var_norm": 0.0,
                 "height_A": height_A,
                 "height_norm": height_norm,
                 "Nc": 0,
@@ -7884,8 +10238,11 @@ class pyNuD_simulator(QMainWindow):
                 "n": n,
                 "d": d,
                 "score_geo": -1e300,
+                "contact_area_A2": 0.0,
+                "tie_score": -1e300,
                 "S_contact": 0.0,
                 "var": 0.0,
+                "var_norm": 0.0,
                 "height_A": height_A,
                 "height_norm": height_norm,
                 "Nc": int(np.count_nonzero(mask)),
@@ -7907,11 +10264,24 @@ class pyNuD_simulator(QMainWindow):
             var_norm = var
         else:
             var_norm = var / geom_scale
-        score_geo = float(wsum + lambda_var * var_norm - height_weight * height_norm)
+        if grid_spacing_A is None:
+            grid_spacing_A = max(0.35, min(1.5, float(delta_contact_A) * 0.5))
+        contact_area_A2, occupied_area_A2, span_area_A2, contact_density = self._projected_contact_area_metrics_A2(
+            np.column_stack([u, v]),
+            radiiA[mask],
+            grid_spacing_A,
+        )
+        tie_score = float(wsum + lambda_var * var_norm - height_weight * height_norm)
+        score_geo = float(contact_area_A2)
         return {
             "n": n,
             "d": d,
             "score_geo": score_geo,
+            "contact_area_A2": contact_area_A2,
+            "occupied_area_A2": occupied_area_A2,
+            "span_area_A2": span_area_A2,
+            "contact_density": contact_density,
+            "tie_score": tie_score,
             "S_contact": wsum,
             "var": var,
             "var_norm": var_norm,
@@ -7957,37 +10327,6 @@ class pyNuD_simulator(QMainWindow):
         c = np.asarray(center, dtype=float)
         t = c - R @ c
 
-        def matrix_to_euler_zyx(Rm):
-            sy = np.hypot(Rm[0, 0], Rm[1, 0])
-            singular = sy < 1e-8
-            if not singular:
-                z = np.degrees(np.arctan2(Rm[1, 0], Rm[0, 0]))
-                y = np.degrees(np.arctan2(-Rm[2, 0], sy))
-                x = np.degrees(np.arctan2(Rm[2, 1], Rm[2, 2]))
-            else:
-                z = 0.0
-                y = np.degrees(np.arctan2(-Rm[2, 0], sy))
-                x = np.degrees(np.arctan2(-Rm[1, 2], Rm[1, 1]))
-            def _wrap(a):
-                return (a + 180) % 360 - 180
-            return _wrap(x), _wrap(y), _wrap(z)
-
-        if self._is_pymol_active():
-            rot_x, rot_y, rot_z = matrix_to_euler_zyx(R)
-            if hasattr(self, 'rotation_widgets'):
-                for ax, val in zip(('X', 'Y', 'Z'), (rot_x, rot_y, rot_z)):
-                    self.rotation_widgets[ax]['spin'].blockSignals(True)
-                    self.rotation_widgets[ax]['slider'].blockSignals(True)
-                    self.rotation_widgets[ax]['spin'].setValue(val)
-                    self.rotation_widgets[ax]['slider'].setValue(int(val * 10))
-                    self.rotation_widgets[ax]['spin'].blockSignals(False)
-                    self.rotation_widgets[ax]['slider'].blockSignals(False)
-            self.prev_rot = {'x': 0.0, 'y': 0.0, 'z': 0.0}
-            self.apply_structure_rotation()
-            if hasattr(self, 'trigger_interactive_simulation'):
-                self.trigger_interactive_simulation()
-            return
-
         M = vtk.vtkMatrix4x4()
         for i in range(3):
             for j in range(3):
@@ -8003,6 +10342,7 @@ class pyNuD_simulator(QMainWindow):
         self.base_transform.Identity()
         self.base_transform.SetMatrix(M)
         self.local_transform.Identity()
+        self.local_transform.PostMultiply()
         self.prev_rot = {'x': 0.0, 'y': 0.0, 'z': 0.0}
 
         if hasattr(self, 'rotation_widgets'):
@@ -8026,7 +10366,7 @@ class pyNuD_simulator(QMainWindow):
     def handle_find_initial_plane(self):
         """
         XY平面への"寝かせ"を自動化：
-        - PDB: 支持面の接触パッチを広く・安定に当てる法線探索
+        - PDB: 支持面へ射影した接触パッチ占有面積を最大化する法線探索
         - MRC: 既存の厚み最小化ロジックを使用
         """
         # PDBデータまたはMRCデータのどちらかが読み込まれているかチェック
@@ -8085,6 +10425,7 @@ class pyNuD_simulator(QMainWindow):
             step_deg_list = [s for s in step_deg_list if s > 0.0]
             if not step_deg_list:
                 step_deg_list = [3.0, 1.0, 0.3]
+            projection_grid_A = max(0.35, min(1.5, float(delta_contact) * 0.5))
 
             # atom-based geometry (always)
             coords_nm = np.column_stack([
@@ -8146,7 +10487,12 @@ class pyNuD_simulator(QMainWindow):
             heap_counter = 0
 
             def _geo_key(res):
-                return (float(res["score_geo"]), -float(res.get("height_norm", np.inf)))
+                return (
+                    float(res.get("contact_area_A2", res.get("score_geo", 0.0))),
+                    float(res.get("tie_score", 0.0)),
+                    float(res.get("S_contact", 0.0)),
+                    -float(res.get("height_norm", np.inf)),
+                )
 
             def _geo_better(a, b):
                 if b is None:
@@ -8155,7 +10501,7 @@ class pyNuD_simulator(QMainWindow):
 
             best_geo = None
             for n in directions:
-                res_geo = self._eval_geo(coordsA, radiiA, n, delta_contact, lambda_var)
+                res_geo = self._eval_geo(coordsA, radiiA, n, delta_contact, lambda_var, projection_grid_A)
                 if res_geo is None:
                     continue
                 key_geo = _geo_key(res_geo)
@@ -8175,7 +10521,7 @@ class pyNuD_simulator(QMainWindow):
                 return
 
             def refine_direction_geo(n0):
-                best = self._eval_geo(coordsA, radiiA, n0, delta_contact, lambda_var)
+                best = self._eval_geo(coordsA, radiiA, n0, delta_contact, lambda_var, projection_grid_A)
                 if best is None:
                     return None
                 n = best["n"]
@@ -8190,7 +10536,7 @@ class pyNuD_simulator(QMainWindow):
                                 continue
                             n2 = n + (step * (a * e1 + b * e2))
                             n2 = n2 / max(1e-12, float(np.linalg.norm(n2)))
-                            res2 = self._eval_geo(coordsA, radiiA, n2, delta_contact, lambda_var)
+                            res2 = self._eval_geo(coordsA, radiiA, n2, delta_contact, lambda_var, projection_grid_A)
                             if res2 is None:
                                 continue
                             if _geo_better(res2, best):
@@ -8210,37 +10556,43 @@ class pyNuD_simulator(QMainWindow):
                 QMessageBox.warning(self, "Warning", "最適法線の探索に失敗しました。")
                 return
 
-            refined_results.sort(key=lambda r: (float(r["score_geo"]), -float(r.get("height_norm", np.inf))), reverse=True)
+            refined_results.sort(key=_geo_key, reverse=True)
             K_geom = min(K_geom, len(refined_results))
             candidates = refined_results[:K_geom]
             best_geo_candidate = candidates[0]
 
             # Stage 2: electrostatics re-ranking (optional)
-            best_final = best_geo_candidate
-            best_final_score = best_geo_candidate["score_geo"]
-            best_S_contact = max(c["S_contact"] for c in candidates) if candidates else 0.0
+            best_final = None
+            best_final_key = None
+            best_contact_area = max(c.get("contact_area_A2", 0.0) for c in candidates) if candidates else 0.0
             for c in candidates:
                 c["Qshell"] = 0.0
                 c["S_elec"] = 0.0
                 c["Nr"] = 0
                 c["score_final"] = c["score_geo"]
+                final_key = _geo_key(c)
                 if use_elec:
+                    area = float(c.get("contact_area_A2", 0.0))
                     elec = self._eval_elec(coordsR, qR, c["n"], c["d"], delta_elec_A, lambdaD_A, A_sub, s_sub)
-                    if best_S_contact > 0.0 and c["S_contact"] < 0.8 * best_S_contact:
+                    near_best_area = best_contact_area > 0.0 and area >= 0.95 * best_contact_area
+                    if not near_best_area:
                         elec = {"Qshell": 0.0, "S_elec": 0.0, "Nr": 0}
                     c["Qshell"] = elec["Qshell"]
                     c["S_elec"] = elec["S_elec"]
                     c["Nr"] = elec["Nr"]
                     c["score_final"] = c["score_geo"] + alpha_elec * c["S_elec"]
-                if (
-                    c["score_final"] > best_final_score
-                    or (
-                        abs(c["score_final"] - best_final_score) <= 1e-12
-                        and float(c.get("height_norm", np.inf)) < float(best_final.get("height_norm", np.inf))
+                    area_rank = best_contact_area if near_best_area else area
+                    final_key = (
+                        float(area_rank),
+                        float(c.get("score_final", 0.0)),
+                        float(c.get("tie_score", 0.0)),
+                        -float(c.get("height_norm", np.inf)),
                     )
-                ):
-                    best_final_score = c["score_final"]
+                if best_final_key is None or final_key > best_final_key:
+                    best_final_key = final_key
                     best_final = c
+            if best_final is None:
+                best_final = best_geo_candidate
 
             # store result for reference (final)
             patch_indices = index_map[np.where(best_final["mask"])[0]] if best_final.get("mask") is not None else np.array([], dtype=int)
@@ -8249,6 +10601,12 @@ class pyNuD_simulator(QMainWindow):
                 "d_best": best_final["d"],
                 "score_geo": best_final["score_geo"],
                 "score_final": best_final["score_final"],
+                "contact_area_A2": best_final.get("contact_area_A2", 0.0),
+                "occupied_area_A2": best_final.get("occupied_area_A2", 0.0),
+                "span_area_A2": best_final.get("span_area_A2", 0.0),
+                "contact_density": best_final.get("contact_density", 0.0),
+                "projection_grid_A": projection_grid_A,
+                "tie_score": best_final.get("tie_score", 0.0),
                 "S_contact": best_final["S_contact"],
                 "var": best_final["var"],
                 "height_A": best_final.get("height_A", 0.0),
@@ -8266,6 +10624,11 @@ class pyNuD_simulator(QMainWindow):
             print(
                 "[FindInitialPlane][best-geo]",
                 "Score_geo:", f"{best_geo_candidate['score_geo']:.4f}",
+                "A_contact[A^2]:", f"{best_geo_candidate.get('contact_area_A2', 0.0):.4f}",
+                "A_span[A^2]:", f"{best_geo_candidate.get('span_area_A2', 0.0):.4f}",
+                "A_occ[A^2]:", f"{best_geo_candidate.get('occupied_area_A2', 0.0):.4f}",
+                "Density:", f"{best_geo_candidate.get('contact_density', 0.0):.4f}",
+                "Tie:", f"{best_geo_candidate.get('tie_score', 0.0):.4f}",
                 "S_contact:", f"{best_geo_candidate['S_contact']:.4f}",
                 "Var:", f"{best_geo_candidate['var']:.4f}",
                 "Var_norm:", f"{best_geo_candidate.get('var_norm', 0.0):.4f}",
@@ -8277,6 +10640,11 @@ class pyNuD_simulator(QMainWindow):
                 "[FindInitialPlane][best-final]",
                 "Score_final:", f"{best_final['score_final']:.4f}",
                 "Score_geo:", f"{best_final['score_geo']:.4f}",
+                "A_contact[A^2]:", f"{best_final.get('contact_area_A2', 0.0):.4f}",
+                "A_span[A^2]:", f"{best_final.get('span_area_A2', 0.0):.4f}",
+                "A_occ[A^2]:", f"{best_final.get('occupied_area_A2', 0.0):.4f}",
+                "Density:", f"{best_final.get('contact_density', 0.0):.4f}",
+                "Tie:", f"{best_final.get('tie_score', 0.0):.4f}",
                 "S_contact:", f"{best_final['S_contact']:.4f}",
                 "Var:", f"{best_final['var']:.4f}",
                 "Var_norm:", f"{best_final.get('var_norm', 0.0):.4f}",
@@ -8596,24 +10964,27 @@ class pyNuD_simulator(QMainWindow):
         # prev_rotをリセット
         self.prev_rot = {'x': 0.0, 'y': 0.0, 'z': 0.0}
 
-        if self._is_pymol_only():
-            try:
-                self.pymol_cmd.reset()
-            except Exception:
-                pass
-            self.request_render()
-            return
-
-        # 回転変換をリセット（VTK）
-        self.base_transform.Identity()
-        self.local_transform.Identity()
-        self.combined_transform.Identity()
-        self.molecule_transform.Identity()
+        # 回転変換をリセット。PyMOL-onlyでもcombined_transformを姿勢の
+        # single source of truthにしているため、ここで必ずidentityへ戻す。
+        for transform_name in ("base_transform", "local_transform", "combined_transform", "molecule_transform"):
+            transform = getattr(self, transform_name, None)
+            if transform is not None:
+                transform.Identity()
+        if getattr(self, "local_transform", None) is not None:
+            self.local_transform.PostMultiply()
+        if getattr(self, "combined_transform", None) is not None:
+            self.combined_transform.PostMultiply()
+        if self._is_pymol_active():
+            # キャッシュが古いとidentity再同期がskipされ、PyMOL object側だけ
+            # 以前のTTT姿勢を保持するため、Reset時は強制的に再適用する。
+            self._pymol_last_ttt = None
         
         # アクターの変換を更新
         self.update_actor_transform()
         if self._is_dual_mode() and self._is_pymol_active():
             self._sync_pymol_view_from_vtk()
+        elif self._is_pymol_only():
+            self.request_render()
 
     def get_current_view_orientation(self):
         """現在のカメラの向きから視点方向を判定"""
@@ -8940,8 +11311,8 @@ class pyNuD_simulator(QMainWindow):
                 self.pymol_cmd.reset()
             except Exception:
                 pass
-            self.request_render()
             if self._is_pymol_only():
+                self.set_standard_view('xy')
                 return
         self.renderer.ResetCamera()
         camera = self.renderer.GetActiveCamera()
@@ -8955,6 +11326,7 @@ class pyNuD_simulator(QMainWindow):
         self.request_render()
         if self._is_dual_mode():
             self._sync_pymol_view_from_vtk()
+        self._set_current_standard_view('xy')
 
     def fit_view_to_contents(self):
         """現在の構造が画面内に収まるように自動調整（PDB/CIFロード直後用）"""
@@ -9251,13 +11623,10 @@ Check console for detailed information."""
     def import_file(self):
         """統合ファイルインポート（PDB/CIF/MRC）"""
         initial_dir = self.last_import_dir if hasattr(self, 'last_import_dir') and self.last_import_dir else ""
-        dialog_options = QFileDialog.Options()
-        if sys.platform != "darwin":
-            dialog_options |= QFileDialog.DontUseNativeDialog
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Select Structure File", initial_dir,
             "Structure Files (*.pdb *.cif *.mmcif *.mrc);;PDB files (*.pdb);;mmCIF files (*.cif *.mmcif);;MRC Files (*.mrc);;All Files (*)",
-            options=dialog_options)
+            options=QFileDialog.DontUseNativeDialog)
         
         if not file_path:
             return
@@ -9275,8 +11644,44 @@ Check console for detailed information."""
             QMessageBox.warning(self, "Unsupported Format", 
                               f"File format '{ext}' is not supported.\nSupported formats: .pdb, .cif, .mmcif, .mrc")
 
+    def _structure_path_from_mime(self, mime_data):
+        """Return first supported local structure path from a Qt mime payload."""
+        if mime_data is None or not mime_data.hasUrls():
+            return None
+        allowed = ('.pdb', '.cif', '.mmcif', '.mrc')
+        try:
+            for url in mime_data.urls():
+                if not url.isLocalFile():
+                    continue
+                path = url.toLocalFile()
+                if os.path.isfile(path) and os.path.splitext(path)[1].lower() in allowed:
+                    return path
+        except Exception:
+            pass
+        return None
+
     def eventFilter(self, obj, event):
         """Filter events for vtk_widget: accept drag & drop of PDB/CIF/MRC files on PDB Structure area."""
+        if (
+            event.type() == QEvent.KeyPress
+            and hasattr(event, "key")
+            and event.key() == Qt.Key_Escape
+            and (self.selected_residue_keys or self._is_block_transform_active())
+            and self._is_sequence_widget(obj)
+        ):
+            self.clear_residue_selection()
+            event.accept()
+            return True
+        if self._handle_sequence_button_event(obj, event):
+            return True
+        if (
+            self.sequence_drag_selecting
+            and event.type() == QEvent.MouseButtonRelease
+            and hasattr(event, "button")
+            and event.button() == Qt.LeftButton
+        ):
+            self._finish_sequence_drag_selection()
+
         if self._handle_pymol_mouse_interaction(obj, event):
             return True
 
@@ -9288,37 +11693,32 @@ Check console for detailed information."""
             target = True
         if hasattr(self, 'pymol_image_label') and obj is self.pymol_image_label:
             target = True
+        if hasattr(self, 'structure_drop_label') and obj is self.structure_drop_label:
+            target = True
+        if hasattr(self, 'structure_view_toolbar') and obj is self.structure_view_toolbar:
+            target = True
+        if hasattr(self, 'sequence_panel') and obj is self.sequence_panel:
+            target = True
+        if hasattr(self, 'sequence_scroll_area') and obj is self.sequence_scroll_area:
+            target = True
         if hasattr(self, 'pymol_view_container') and obj is self.pymol_view_container:
+            target = True
+        if hasattr(self, 'pymol_widget_container') and obj is self.pymol_widget_container:
             target = True
         if hasattr(self, 'vtk_view_container') and obj is self.vtk_view_container:
             target = True
         if hasattr(self, 'structure_view_splitter') and obj is self.structure_view_splitter:
             target = True
         if target:
-            if event.type() == QEvent.DragEnter:
-                if event.mimeData().hasUrls():
-                    urls = event.mimeData().urls()
-                    allowed = ('.pdb', '.cif', '.mmcif', '.mrc')
-                    if urls and urls[0].isLocalFile():
-                        path = urls[0].toLocalFile()
-                        if os.path.isfile(path) and os.path.splitext(path)[1].lower() in allowed:
-                            event.acceptProposedAction()
-                            return True
+            if event.type() in (QEvent.DragEnter, QEvent.DragMove):
+                if self._structure_path_from_mime(event.mimeData()):
+                    event.acceptProposedAction()
+                    return True
             elif event.type() == QEvent.Drop:
-                urls = event.mimeData().urls()
-                if urls and urls[0].isLocalFile():
-                    path = urls[0].toLocalFile()
-                    if os.path.isfile(path):
-                        self.last_import_dir = os.path.dirname(path)
-                        ext = os.path.splitext(path)[1].lower()
-                        if ext == '.pdb':
-                            self._import_pdb_internal(path)
-                        elif ext in ['.cif', '.mmcif']:
-                            self._import_cif_internal(path)
-                        elif ext == '.mrc':
-                            self._import_mrc_internal(path)
-                        event.acceptProposedAction()
-                        return True
+                path = self._structure_path_from_mime(event.mimeData())
+                if path and self._load_structure_file(path):
+                    event.acceptProposedAction()
+                    return True
         return super().eventFilter(obj, event)
 
     def _is_pymol_mouse_target(self, obj):
@@ -9341,6 +11741,15 @@ Check console for detailed information."""
             return False
 
         etype = event.type()
+        if self._handle_block_transform_wheel_from_event(event):
+            return True
+        if self._start_block_transform_drag_from_event(event):
+            return True
+        if self._continue_block_transform_drag_from_event(event):
+            return True
+        if self._finish_block_transform_drag_from_event(event):
+            return True
+
         if etype == QEvent.MouseButtonPress:
             if event.button() == Qt.LeftButton:
                 modifiers = event.modifiers()
@@ -9436,6 +11845,8 @@ Check console for detailed information."""
             return True
 
         if etype == QEvent.Leave:
+            if self.block_transform_dragging:
+                self._finish_block_transform_drag()
             if self._pymol_mouse_dragging:
                 self._pymol_mouse_dragging = False
                 self._pymol_mouse_panning = False
@@ -9493,6 +11904,7 @@ Check console for detailed information."""
 
     def _pymol_view_rotate_from_drag(self, dx, dy):
         """Rotate camera/view (not object) to mimic VTK left-drag behavior."""
+        self._set_current_standard_view(None)
         if self._is_dual_mode():
             if not hasattr(self, 'renderer') or self.renderer is None:
                 return
@@ -9560,13 +11972,20 @@ Check console for detailed information."""
             # 現在の構造ファイル情報を保持
             self.current_structure_path = file_path
             self.current_structure_type = "pdb"
+            self.deleted_sequence_residues = {}
+            self.sequence_residue_order = []
+            self.sequence_duplicate_counter = 0
+            self._deactivate_block_transform()
+            self.in_memory_structure_edited = False
+            self._clear_pymol_structure_temp_file()
+            self.pymol_loaded_path = None
             # Apply renderer preference (protein structures)
             if not self.pymol_available:
                 self._set_render_backend("vtk")
             else:
-                pref = getattr(self, "user_render_backend_preference", "dual")
-                if pref not in ("dual", "pymol", "vtk"):
-                    pref = "dual"
+                pref = getattr(self, "user_render_backend_preference", "pymol")
+                if pref not in ("pymol", "vtk"):
+                    pref = "pymol"
                 self._set_render_backend(pref)
             if hasattr(self, 'esp_check'):
                 self.esp_check.setChecked(False)
@@ -9578,10 +11997,15 @@ Check console for detailed information."""
             QApplication.processEvents()
             
             self.read_pdb_file(file_path)
+            self._store_original_atoms_data()
             self.progress_bar.setValue(50)
             QApplication.processEvents()
             
             self.update_statistics()
+            self.selected_residue_keys = set()
+            self._last_sequence_key = None
+            self._rebuild_sequence_panel()
+            self._update_sequence_control()
             self.progress_bar.setValue(70)
             QApplication.processEvents()
             
@@ -9591,6 +12015,7 @@ Check console for detailed information."""
 
             # ロード直後にモデルが画面内に収まるように調整
             self.fit_view_to_contents()
+            self.set_standard_view('xy')
             
             self.create_tip()
              # ★★★ ここから追加 ★★★
@@ -9610,7 +12035,6 @@ Check console for detailed information."""
                 # スライダーの値を設定 (これによりupdate_tip_positionが自動で呼ばれる)
                 self.tip_z_slider.setValue(slider_value)
             # ★★★ ここまで追加 ★★★
-
             self.progress_bar.setValue(100)
             QApplication.processEvents()
             
@@ -9661,13 +12085,20 @@ Check console for detailed information."""
             # 現在の構造ファイル情報を保持
             self.current_structure_path = file_path
             self.current_structure_type = "cif"
+            self.deleted_sequence_residues = {}
+            self.sequence_residue_order = []
+            self.sequence_duplicate_counter = 0
+            self._deactivate_block_transform()
+            self.in_memory_structure_edited = False
+            self._clear_pymol_structure_temp_file()
+            self.pymol_loaded_path = None
             # Apply renderer preference (protein structures)
             if not self.pymol_available:
                 self._set_render_backend("vtk")
             else:
-                pref = getattr(self, "user_render_backend_preference", "dual")
-                if pref not in ("dual", "pymol", "vtk"):
-                    pref = "dual"
+                pref = getattr(self, "user_render_backend_preference", "pymol")
+                if pref not in ("pymol", "vtk"):
+                    pref = "pymol"
                 self._set_render_backend(pref)
             if hasattr(self, 'esp_check'):
                 self.esp_check.setChecked(False)
@@ -9679,10 +12110,15 @@ Check console for detailed information."""
             QApplication.processEvents()
 
             self.read_cif_file(file_path)
+            self._store_original_atoms_data()
             self.progress_bar.setValue(50)
             QApplication.processEvents()
 
             self.update_statistics()
+            self.selected_residue_keys = set()
+            self._last_sequence_key = None
+            self._rebuild_sequence_panel()
+            self._update_sequence_control()
             self.progress_bar.setValue(70)
             QApplication.processEvents()
 
@@ -9692,6 +12128,7 @@ Check console for detailed information."""
 
             # ロード直後にモデルが画面内に収まるように調整
             self.fit_view_to_contents()
+            self.set_standard_view('xy')
 
             self.create_tip()
             # 分子の最高点から2nm上に探針の初期位置を設定
@@ -10294,6 +12731,8 @@ Check console for detailed information."""
         if self._is_pymol_active():
             self._display_molecule_pymol()
             if self._is_pymol_only():
+                self.apply_structure_rotation(trigger_simulation=False)
+                self._display_pymol_tip_overlay()
                 return
 
         # VTK側を使う場合は初期化を保証
@@ -10374,6 +12813,8 @@ Check console for detailed information."""
         
         # 現在の回転設定をアクターに適用
         self.apply_structure_rotation()
+        if self.selected_residue_keys:
+            self._apply_vtk_residue_highlight()
         
         # 初期回転角度を保存（Reset Allで使用）
         if hasattr(self, 'rotation_widgets'):
@@ -10922,9 +13363,241 @@ Check console for detailed information."""
             
             self.renderer.AddActor(self.bonds_actor)
         
+    def _get_tip_position_nm(self):
+        """Return current tip position in pyNuD/simulation coordinates (nm)."""
+        x = self.tip_x_slider.value() / 5.0 if hasattr(self, 'tip_x_slider') else 0.0
+        y = self.tip_y_slider.value() / 5.0 if hasattr(self, 'tip_y_slider') else 0.0
+        z = self.tip_z_slider.value() / 5.0 if hasattr(self, 'tip_z_slider') else 0.0
+        return float(x), float(y), float(z)
+
+    def _delete_pymol_tip_overlay(self):
+        """Remove the PyMOL CGO tip object if it exists."""
+        if not self._is_pymol_active() or self.pymol_cmd is None:
+            return
+        view = self._capture_pymol_view()
+        try:
+            self.pymol_cmd.delete(self.pymol_tip_object_name)
+        except Exception:
+            pass
+        self._restore_pymol_view(view)
+
+    def _capture_pymol_view(self):
+        """Capture the current PyMOL camera/view tuple."""
+        if not self._is_pymol_active() or self.pymol_cmd is None:
+            return None
+        try:
+            view = list(self.pymol_cmd.get_view())
+            if len(view) >= 18:
+                return view
+        except Exception:
+            pass
+        return None
+
+    def _restore_pymol_view(self, view):
+        """Restore a captured PyMOL camera/view tuple."""
+        if view is None or not self._is_pymol_active() or self.pymol_cmd is None:
+            return
+        try:
+            self.pymol_cmd.set_view(view)
+        except Exception:
+            pass
+
+    def _current_molecule_depth_nm(self):
+        """Return current molecule Z extent in nm for sizing the visual tip."""
+        try:
+            coords = self.get_rotated_atom_coords()
+            if coords is not None and len(coords) > 0:
+                z_vals = np.asarray(coords[:, 2], dtype=float)
+                z_vals = z_vals[np.isfinite(z_vals)]
+                if z_vals.size:
+                    depth = float(np.max(z_vals) - np.min(z_vals))
+                    if np.isfinite(depth) and depth > 0.0:
+                        return depth
+        except Exception:
+            pass
+        try:
+            if getattr(self, 'atoms_data', None) is not None:
+                z_vals = np.asarray(self.atoms_data['z'], dtype=float)
+                z_vals = z_vals[np.isfinite(z_vals)]
+                if z_vals.size:
+                    depth = float(np.max(z_vals) - np.min(z_vals))
+                    if np.isfinite(depth) and depth > 0.0:
+                        return depth
+        except Exception:
+            pass
+        return 5.0
+
+    def _tip_profile_height_nm(self, r_nm, shape, tip_radius_nm, minitip_radius_nm, angle_rad):
+        """Match AFMSimulationWorker.create_igor_style_tip radial profile."""
+        r_nm = np.asarray(r_nm, dtype=float)
+        tip_radius_nm = max(float(tip_radius_nm), 0.01)
+        minitip_radius_nm = max(float(minitip_radius_nm), 0.01)
+        angle_rad = float(np.clip(angle_rad, np.radians(1.0), np.radians(89.0)))
+
+        if shape == "paraboloid":
+            return (r_nm ** 2) / (2.0 * tip_radius_nm)
+
+        r_crit = tip_radius_nm * np.cos(angle_rad)
+        z_offset = (tip_radius_nm / np.sin(angle_rad)) - tip_radius_nm
+        sphere_height = tip_radius_nm - np.sqrt(
+            np.maximum(0.0, tip_radius_nm ** 2 - r_nm ** 2)
+        )
+        cone_height = (r_nm / np.tan(angle_rad)) - z_offset
+        height = np.where(r_nm <= r_crit, sphere_height, cone_height)
+
+        if shape == "sphere":
+            height = height + 2.0 * minitip_radius_nm
+            mini_mask = r_nm < minitip_radius_nm
+            mini_height = minitip_radius_nm - np.sqrt(
+                np.maximum(0.0, minitip_radius_nm ** 2 - r_nm ** 2)
+            )
+            height = np.where(mini_mask, mini_height, height)
+
+        return height
+
+    def _tip_visual_radius_nm(self, shape, tip_radius_nm, minitip_radius_nm, angle_rad, mol_depth_nm):
+        """Use the same active footprint radius logic as the simulator."""
+        tip_radius_nm = max(float(tip_radius_nm), 0.01)
+        mol_depth_nm = max(float(mol_depth_nm), 0.05)
+        angle_rad = float(np.clip(angle_rad, np.radians(1.0), np.radians(89.0)))
+
+        if shape in ("cone", "sphere"):
+            r_crit = tip_radius_nm * np.cos(angle_rad)
+            z_offset = (tip_radius_nm / np.sin(angle_rad)) - tip_radius_nm
+            z_crit_related = tip_radius_nm - r_crit / np.tan(angle_rad)
+            if z_crit_related > mol_depth_nm:
+                radius_nm = np.sqrt(
+                    max(0.0, tip_radius_nm ** 2 - (tip_radius_nm - mol_depth_nm) ** 2)
+                )
+            else:
+                radius_nm = (mol_depth_nm + z_offset) * np.tan(angle_rad)
+        else:
+            radius_nm = np.sqrt(max(0.0, 2.0 * tip_radius_nm * mol_depth_nm))
+
+        return max(float(radius_nm), 0.05)
+
+    def _build_pymol_tip_cgo(self):
+        """Build a PyMOL CGO tip mesh using the simulator's tip profile."""
+        try:
+            from pymol.cgo import ALPHA, BEGIN, COLOR, END, TRIANGLES, VERTEX
+        except Exception:
+            return None
+
+        try:
+            x_nm, y_nm, z_nm = self._get_tip_position_nm()
+            tip_radius_nm = max(float(self.tip_radius_spin.value()), 0.01)
+            tip_angle_deg = float(self.tip_angle_spin.value()) if hasattr(self, 'tip_angle_spin') else 20.0
+            minitip_radius_nm = (
+                max(float(self.minitip_radius_spin.value()), 0.01)
+                if hasattr(self, 'minitip_radius_spin')
+                else tip_radius_nm
+            )
+            shape = self.tip_shape_combo.currentText().strip().lower()
+        except Exception:
+            return None
+
+        nm_to_angstrom = 10.0
+        x0 = x_nm * nm_to_angstrom
+        y0 = y_nm * nm_to_angstrom
+        z0 = z_nm * nm_to_angstrom
+        angle_rad = np.radians(np.clip(tip_angle_deg, 1.0, 89.0))
+        mol_depth_nm = max(self._current_molecule_depth_nm(), 0.05)
+        r_max_nm = self._tip_visual_radius_nm(
+            shape, tip_radius_nm, minitip_radius_nm, angle_rad, mol_depth_nm
+        )
+        gold = (1.0, 0.76, 0.05)
+
+        radial_steps = 24
+        angular_steps = 48
+        radii_nm = np.linspace(0.0, r_max_nm, radial_steps + 1)
+        heights_nm = self._tip_profile_height_nm(
+            radii_nm, shape, tip_radius_nm, minitip_radius_nm, angle_rad
+        )
+        heights_nm = np.maximum(heights_nm - float(np.min(heights_nm)), 0.0)
+        angles = np.linspace(0.0, 2.0 * np.pi, angular_steps, endpoint=False)
+
+        vertices = []
+        for r_nm, h_nm in zip(radii_nm, heights_nm):
+            r_a = float(r_nm) * nm_to_angstrom
+            z_a = z0 + float(h_nm) * nm_to_angstrom
+            ring = []
+            for theta in angles:
+                ring.append((
+                    x0 + r_a * np.cos(theta),
+                    y0 + r_a * np.sin(theta),
+                    z_a,
+                ))
+            vertices.append(ring)
+
+        cgo = [ALPHA, 0.58, COLOR, *gold, BEGIN, TRIANGLES]
+        for radial_idx in range(radial_steps):
+            ring0 = vertices[radial_idx]
+            ring1 = vertices[radial_idx + 1]
+            for angular_idx in range(angular_steps):
+                next_idx = (angular_idx + 1) % angular_steps
+                p00 = ring0[angular_idx]
+                p01 = ring0[next_idx]
+                p10 = ring1[angular_idx]
+                p11 = ring1[next_idx]
+                if radial_idx == 0:
+                    cgo.extend([VERTEX, *p00, VERTEX, *p10, VERTEX, *p11])
+                else:
+                    cgo.extend([VERTEX, *p00, VERTEX, *p10, VERTEX, *p11])
+                    cgo.extend([VERTEX, *p00, VERTEX, *p11, VERTEX, *p01])
+
+        top_center = (x0, y0, z0 + float(heights_nm[-1]) * nm_to_angstrom)
+        top_ring = vertices[-1]
+        for angular_idx in range(angular_steps):
+            next_idx = (angular_idx + 1) % angular_steps
+            cgo.extend([VERTEX, *top_center, VERTEX, *top_ring[next_idx], VERTEX, *top_ring[angular_idx]])
+
+        cgo.extend([END])
+        return cgo
+
+    def _display_pymol_tip_overlay(self):
+        """Draw the AFM tip in PyMOL as a fixed lab-frame overlay object."""
+        if not self._is_pymol_active() or self.pymol_cmd is None:
+            return
+        visible = True
+        if hasattr(self, 'show_tip_check'):
+            visible = bool(self.show_tip_check.isChecked())
+        if not visible:
+            self._delete_pymol_tip_overlay()
+            self.request_render()
+            return
+
+        cgo = self._build_pymol_tip_cgo()
+        if not cgo:
+            return
+        view = self._capture_pymol_view()
+        auto_zoom = None
+        try:
+            try:
+                auto_zoom = self.pymol_cmd.get("auto_zoom")
+                self.pymol_cmd.set("auto_zoom", 0)
+            except Exception:
+                pass
+            self.pymol_cmd.delete(self.pymol_tip_object_name)
+        except Exception:
+            pass
+        try:
+            self.pymol_cmd.load_cgo(cgo, self.pymol_tip_object_name, zoom=0)
+        except Exception as e:
+            print(f"[WARNING] PyMOL tip overlay failed: {e}")
+            return
+        finally:
+            if auto_zoom is not None:
+                try:
+                    self.pymol_cmd.set("auto_zoom", auto_zoom)
+                except Exception:
+                    pass
+            self._restore_pymol_view(view)
+        self.request_render()
+
     def create_tip(self):
         """AFM探針の作成（実際のパラメーターに基づく）"""
         if self._is_pymol_only():
+            self.update_tip_position()
             return
         self._ensure_vtk_initialized()
         if not hasattr(self, 'renderer') or self.renderer is None:
@@ -10955,6 +13628,8 @@ Check console for detailed information."""
             self._update_tip_visual_state(
                 self.show_tip_check.isChecked() if hasattr(self, 'show_tip_check') else True
             )
+        if self._is_pymol_active():
+            self._display_pymol_tip_overlay()
 
     # +++ この関数で既存のcreate_cone_tipを置き換えてください +++
     def create_cone_tip(self, tip_radius, half_angle):
@@ -11225,6 +13900,8 @@ Check console for detailed information."""
         """インタラクティブモードがONの場合にシミュレーションを実行する汎用トリガー"""
         if getattr(self, '_pose_estimation_running', False):
             return
+        if getattr(self, 'block_transform_dragging', False):
+            return
 
         # スライダー操作中は実行しない
         if hasattr(self, 'tip_slider_pressed') and self.tip_slider_pressed:
@@ -11357,19 +14034,18 @@ Check console for detailed information."""
     
     def update_tip_position(self):
         """探針位置の更新（適切な範囲）"""
-        if not self.tip_actor:
-            return
-            
         # スライダー値をnm単位に変換（範囲を調整）
-        x = self.tip_x_slider.value() / 5.0  # -10 to +10 nm
-        y = self.tip_y_slider.value() / 5.0  # -10 to +10 nm
-        z = self.tip_z_slider.value() / 5.0  # 2 to 20 nm
+        x, y, z = self._get_tip_position_nm()
         
-        self.tip_actor.SetPosition(x, y, z)
+        if getattr(self, 'tip_actor', None):
+            self.tip_actor.SetPosition(x, y, z)
         
-        self.tip_x_label.setText(f"{x:.1f}")
-        self.tip_y_label.setText(f"{y:.1f}")
-        self.tip_z_label.setText(f"{z:.1f}")
+        if hasattr(self, 'tip_x_label'):
+            self.tip_x_label.setText(f"{x:.1f}")
+        if hasattr(self, 'tip_y_label'):
+            self.tip_y_label.setText(f"{y:.1f}")
+        if hasattr(self, 'tip_z_label'):
+            self.tip_z_label.setText(f"{z:.1f}")
         
         # AFMパラメーターも更新
         self.afm_params.update({
@@ -11377,6 +14053,8 @@ Check console for detailed information."""
             'tip_y': y,
             'tip_z': z,
         })
+        if self._is_pymol_active():
+            self._display_pymol_tip_overlay()
         
         self.request_render()
         
@@ -11403,6 +14081,8 @@ Check console for detailed information."""
             
     def _update_tip_visual_state(self, visible=None):
         """Apply tip visibility and opacity based on checkbox and current view."""
+        if self._is_pymol_active():
+            self._display_pymol_tip_overlay()
         if self._is_pymol_only():
             return
         if not self.tip_actor:
@@ -11434,6 +14114,8 @@ Check console for detailed information."""
 
     def toggle_tip_visibility(self, visible):
         """探針表示の切り替え"""
+        if self._is_pymol_active():
+            self._display_pymol_tip_overlay()
         self._update_tip_visual_state(visible)
             
     def toggle_bonds_visibility(self, visible):
@@ -11443,8 +14125,7 @@ Check console for detailed information."""
         if self.bonds_actor:
             self.bonds_actor.SetVisibility(visible)
             self.vtk_widget.GetRenderWindow().Render()
-            
-   
+
     def get_rotated_atom_coords(self):
         """Applies the current rotation transform to the base atom coordinates."""
         if self.atoms_data is None:
@@ -11455,23 +14136,6 @@ Check console for detailed information."""
         y = self.atoms_data['y']
         z = self.atoms_data['z']
         num_atoms = len(x)
-
-        # PyMOL-only の場合は PyMOLビュー回転を優先して反映（VTK transformが未使用のため）
-        if self._is_pymol_only():
-            coords = np.column_stack([x, y, z])
-            try:
-                view = self.pymol_cmd.get_view()
-                if view and len(view) >= 18:
-                    rot = np.array(view[:9], dtype=float).reshape((3, 3))
-                    origin = np.array(view[12:15], dtype=float)
-                    # 原点を中心に回転
-                    centered = coords - origin
-                    rotated = centered @ rot.T
-                    rotated = rotated + origin
-                    if np.all(np.isfinite(rotated)):
-                        return rotated
-            except Exception as e:
-                print(f"[WARNING] PyMOL view rotation failed: {e}, using fallback transform")
 
         # 変換行列が存在しない場合は元の座標を返す
         if not hasattr(self, 'combined_transform') or self.combined_transform is None:
@@ -12307,6 +14971,7 @@ Check console for detailed information."""
         # PDBデータをクリア
         if hasattr(self, 'atoms_data'):
             self.atoms_data = None
+        self._clear_sequence_panel()
         if hasattr(self, 'pdb_name'):
             self.pdb_name = None
             self.pdb_id = ""
@@ -12316,6 +14981,7 @@ Check console for detailed information."""
         self.current_structure_path = None
         self.current_structure_type = None
         self.pymol_esp_object = None
+        self.original_atoms_data = None
         
         # PDBラベルをリセット
         if hasattr(self, 'file_label'):
@@ -12336,6 +15002,10 @@ Check console for detailed information."""
         if self._is_pymol_active():
             try:
                 self.pymol_cmd.delete(self.pymol_object_name)
+            except Exception:
+                pass
+            try:
+                self.pymol_cmd.delete(self.pymol_tip_object_name)
             except Exception:
                 pass
             self.pymol_loaded_path = None
@@ -12407,6 +15077,8 @@ Check console for detailed information."""
         # ライティングを更新
         if self._is_pymol_active():
             self._apply_pymol_lighting()
+            if getattr(self, 'atoms_data', None) is not None:
+                self._pymol_apply_color_scheme(self._pymol_selection_for_atoms())
         if not self._is_pymol_only():
             self.update_lighting_intensity()
         self.request_render()
@@ -12470,68 +15142,6 @@ Check console for detailed information."""
         if self.tip_actor and hasattr(self.tip_actor, 'GetProperty'):
             self.tip_actor.GetProperty().SetSpecular(min(0.9, specular_factor * 1.5))
     
-    def apply_pymol_style(self):
-        """PyMOLスタイルプリセット適用"""
-        # 背景を黒に
-        self.current_bg_color = (0.0, 0.0, 0.0)
-        if self.pymol_available and self.pymol_cmd is not None:
-            self._pymol_set_background(self.current_bg_color)
-        if not self._is_pymol_only():
-            self.renderer.SetBackground(*self.current_bg_color)
-        
-        # ボタンの色を更新
-        self.bg_color_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #000000;
-                color: white;
-                border: 2px solid #555;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                border-color: #777;
-            }
-        """)
-        
-        # 明るさを120%に
-        self.brightness_slider.setValue(120)
-        self.brightness_factor = 1.2
-        self.brightness_label.setText("120%")
-        
-        # 環境光を5%に
-        self.ambient_slider.setValue(5)
-        self.ambient_label.setText("5%")
-        if not self._is_pymol_only():
-            self.renderer.SetAmbient(0.05, 0.05, 0.05)
-        
-        # スペキュラを80%に
-        self.specular_slider.setValue(80)
-        self.specular_label.setText("80%")
-        
-        # 設定を適用
-        if self._is_pymol_active():
-            self._apply_pymol_lighting()
-        if not self._is_pymol_only():
-            self.update_lighting_intensity()
-            self.update_actor_materials()
-        
-        # PyMOLライクな元素カラーに変更
-        self.element_colors.update({
-            'C': (0.565, 0.565, 0.565),  # PyMOLのカーボングレー
-            'O': (1.0, 0.051, 0.051),    # 鮮やかな赤
-            'N': (0.188, 0.314, 0.973),  # 鮮やかな青
-            'H': (0.9, 0.9, 0.9),        # 白
-            'S': (1.0, 1.0, 0.188),      # 鮮やかな黄色
-            'P': (1.0, 0.502, 0.0),      # オレンジ
-        })
-        
-        # 表示を更新
-        if self.atoms_data is not None:
-            self.update_display()
-
-        self.request_render()
-        
-        QMessageBox.information(self, "Style Applied", "PyMOL style applied successfully!")
-    
     def apply_dark_theme(self):
         """ダークテーマプリセット適用"""
         # 背景をダークグレーに
@@ -12582,7 +15192,7 @@ Check console for detailed information."""
 
         self.request_render()
         
-        QMessageBox.information(self, "Style Applied", "Dark theme applied successfully!")
+        QMessageBox.information(self, "Theme Applied", "Dark theme applied successfully!")
     
     def load_settings(self):
         """起動時にウィンドウの位置、サイズ、スプリッターの状態を復元する"""
@@ -13337,13 +15947,10 @@ Check console for detailed information."""
                 if not loaded:
                     # prompt user
                     initial_dir = os.path.dirname(json_path)
-                    dialog_options = QFileDialog.Options()
-                    if sys.platform != "darwin":
-                        dialog_options |= QFileDialog.DontUseNativeDialog
                     file_path, _ = QFileDialog.getOpenFileName(
                         self, 'Select Structure File', initial_dir,
                         'Structure Files (*.pdb *.cif *.mmcif);;All Files (*)',
-                        options=dialog_options
+                        options=QFileDialog.DontUseNativeDialog
                     )
                     if file_path:
                         loaded = self._load_structure_file(file_path)
@@ -13382,13 +15989,10 @@ Check console for detailed information."""
         default_id = self.get_active_dataset_id() if hasattr(self, 'get_active_dataset_id') else 'session'
         default_name = f"{default_id}.json"
         default_path = os.path.join(initial_dir, default_name) if initial_dir else default_name
-        dialog_options = QFileDialog.Options()
-        if sys.platform != "darwin":
-            dialog_options |= QFileDialog.DontUseNativeDialog
         save_path, _ = QFileDialog.getSaveFileName(
             self, 'Save Params as JSON', default_path,
             'JSON files (*.json);;All Files (*)',
-            options=dialog_options
+            options=QFileDialog.DontUseNativeDialog
         )
         if not save_path:
             return
@@ -13401,13 +16005,10 @@ Check console for detailed information."""
     def handle_load_params_json(self):
         """Load params from JSON via dialog."""
         initial_dir = self.last_import_dir if hasattr(self, 'last_import_dir') and self.last_import_dir else ''
-        dialog_options = QFileDialog.Options()
-        if sys.platform != "darwin":
-            dialog_options |= QFileDialog.DontUseNativeDialog
         load_path, _ = QFileDialog.getOpenFileName(
             self, 'Load Params from JSON', initial_dir,
             'JSON files (*.json);;All Files (*)',
-            options=dialog_options
+            options=QFileDialog.DontUseNativeDialog
         )
         if not load_path:
             return
@@ -13512,13 +16113,10 @@ Check console for detailed information."""
         
         # ファイル名と安全なディレクトリを結合して、最終的なデフォルトパスを作成
         default_save_path = os.path.join(directory, default_filename)
-        dialog_options = QFileDialog.Options()
-        if sys.platform != "darwin":
-            dialog_options |= QFileDialog.DontUseNativeDialog
 
         save_path, _ = QFileDialog.getSaveFileName(
             self, "Save Simulation as ASD", default_save_path, "ASD files (*.asd)",
-            options=dialog_options
+            options=QFileDialog.DontUseNativeDialog
         )
 
         if not save_path:
@@ -13718,12 +16316,9 @@ Check console for detailed information."""
         
         # ユーザーにファイル名と保存形式を選択させる
         filters = "PNG Image (*.png);;TIFF Image (*.tif)"
-        dialog_options = QFileDialog.Options()
-        if sys.platform != "darwin":
-            dialog_options |= QFileDialog.DontUseNativeDialog
         save_path, selected_filter = QFileDialog.getSaveFileName(
             self, "Save 3D View As...", default_save_path, filters,
-            options=dialog_options
+            options=QFileDialog.DontUseNativeDialog
         )
 
         if not save_path:
@@ -14218,6 +16813,9 @@ Check console for detailed information."""
         """
         if not self.interactive_update_check.isChecked():
             return
+        if getattr(self, 'block_transform_dragging', False):
+            self.schedule_high_res_simulation()
+            return
         
         # UI上の解像度表示は変更せず、内部で高解像度計算を実行
         if hasattr(self, 'user_selected_resolution') and self.user_selected_resolution:
@@ -14524,6 +17122,7 @@ Check console for detailed information."""
         
         # 回転状態をリセット（MRCファイル読み込み時）
         self.reset_structure_rotation()
+        self.set_standard_view('xy')
         
         # Interactive Updateが有効な場合は初期シミュレーションを実行
         if hasattr(self, 'interactive_update_check') and self.interactive_update_check.isChecked():
@@ -14890,19 +17489,52 @@ class AFMSimulator(pyNuD_simulator):
         self._pynud_real_refresh_timer = None
         self._pynud_last_file_path = None
         self._pynud_trimmed_real_window_ref = None
+        self._bridge_seq = 0
+        self._headless_bridge_mode = False
         super().__init__()
         self.setWindowTitle(PLUGIN_NAME)
-        # Plugin default: start in VTK mode even if PyMOL is available.
-        self.user_render_backend_preference = "vtk"
-        try:
-            self._set_render_backend("vtk")
-            self._update_renderer_combo()
-        except Exception:
-            pass
+        # Inside pyNuD the plugin is intentionally VTK-only and lightweight.
+        # It publishes the currently displayed frame to a shared bridge that a
+        # separately-running standalone "pyNuD Simulator" pulls from. When the
+        # standalone is installed, opening the plugin offers to launch it and
+        # run this plugin headless (as the data feeder only).
         self._connect_main_window_signals()
         self._load_real_afm_from_pynud(frame_index=None, sync=False, show=False)
-        if not bool(getattr(self, "pymol_available", False)):
+        # Heartbeat so the standalone can reliably detect that pyNuD is still
+        # connected even when frames are not changing.
+        self._bridge_heartbeat_timer = QTimer(self)
+        self._bridge_heartbeat_timer.setInterval(2000)
+        self._bridge_heartbeat_timer.timeout.connect(self._touch_bridge_state)
+        self._bridge_heartbeat_timer.start()
+        self._offer_standalone_on_open()
+
+    def show(self):
+        # In headless bridge mode the plugin window is never shown; it only
+        # feeds data to the standalone. Re-triggering it relaunches/refocuses
+        # the standalone instead of showing the VTK window.
+        if getattr(self, "_headless_bridge_mode", False):
+            self.hide()
+            self._ensure_standalone_running()
+            return
+        super().show()
+
+    def setup_pymol(self):
+        """VTK-only, lightweight setup for the in-pyNuD plugin.
+
+        The plugin never imports or launches PyMOL: that keeps startup fast
+        and avoids the fragile native PyMOL dependency inside pyNuD's runtime.
+        All non-PyMOL features are identical to the standalone pyNuD Simulator.
+        """
+        self.render_backend = "vtk"
+        self.pymol_available = False
+        self.user_render_backend_preference = "vtk"
+        if hasattr(self, "esp_check"):
+            self.esp_check.setEnabled(False)
+        self._setup_vtk_legacy()
+        try:
             self.on_pymol_unavailable(phase="startup")
+        except Exception:
+            pass
 
     def on_pymol_unavailable(self, detail="", phase="runtime"):
         """Hook called by core simulator when PyMOL is not usable.
@@ -14916,6 +17548,279 @@ class AFMSimulator(pyNuD_simulator):
             self._update_renderer_combo()
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Live bridge to the standalone "pyNuD Simulator" (pull model)
+    #
+    # The plugin publishes the currently displayed (processed) pyNuD frame to a
+    # shared temp location. A separately-running pyNuD Simulator polls it and
+    # pulls the data in. No process launching or install detection is needed.
+    # ------------------------------------------------------------------
+    def _bridge_dir(self):
+        # Fixed home-based path so both processes agree regardless of how each
+        # app is launched (macOS per-process TMPDIR would otherwise differ).
+        return os.path.join(os.path.expanduser("~"), ".pyNuD", "simulator_bridge")
+
+    def _publish_bridge_frame(self):
+        """Publish the current processed frame + metadata to the shared bridge.
+
+        Reuses the data already fetched by ``_load_real_afm_from_pynud`` (the
+        height map shown in pyNuD, in nm). Writes are atomic so a polling
+        Simulator never reads a half-written file.
+        """
+        arr = getattr(self, "real_afm_nm_full", None)
+        meta = getattr(self, "real_meta_full", None)
+        if arr is None or meta is None:
+            return
+        try:
+            arr = np.asarray(arr, dtype=np.float64)
+            if arr.ndim != 2 or arr.size == 0:
+                return
+            bdir = self._bridge_dir()
+            os.makedirs(bdir, exist_ok=True)
+            # np.savez always appends ".npz", so the temp name must already end
+            # with ".npz" to keep the os.replace target path stable.
+            npz_path = os.path.join(bdir, "frame.npz")
+            npz_tmp = os.path.join(bdir, "frame.tmp.npz")
+            np.savez(
+                npz_tmp,
+                height_nm=arr,
+                scan_x_nm=float(meta.get("scan_x_nm", 0.0)),
+                scan_y_nm=float(meta.get("scan_y_nm", 0.0)),
+                scan_direction=str(meta.get("scan_direction", "L2R")),
+                frame_index=int(getattr(self, "real_asd_frame_index", 0) or 0),
+            )
+            os.replace(npz_tmp, npz_path)
+            self._bridge_seq = int(getattr(self, "_bridge_seq", 0)) + 1
+            src = str(getattr(self, "real_asd_path", "") or "")
+            state = {
+                "seq": self._bridge_seq,
+                "frame_index": int(getattr(self, "real_asd_frame_index", 0) or 0),
+                "label": os.path.basename(src) or "pyNuD-current",
+                "pid": os.getpid(),
+                "ts": time.time(),
+                "active": True,
+                "npz": "frame.npz",
+            }
+            state_path = os.path.join(bdir, "state.json")
+            state_tmp = state_path + ".tmp"
+            with open(state_tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(state_tmp, state_path)
+        except Exception:
+            pass
+
+    def _touch_bridge_state(self):
+        """Refresh the bridge heartbeat so the standalone can tell pyNuD is alive.
+
+        Only refreshes an already-published state (i.e. a real frame has been
+        sent at least once); does not fabricate a connection when no data has
+        been published yet.
+        """
+        try:
+            state_path = os.path.join(self._bridge_dir(), "state.json")
+            if not os.path.isfile(state_path):
+                return
+            with open(state_path) as f:
+                state = json.load(f)
+            if not state.get("active", False):
+                return
+            state["ts"] = time.time()
+            state_tmp = state_path + ".tmp"
+            with open(state_tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(state_tmp, state_path)
+        except Exception:
+            pass
+
+    def _mark_bridge_inactive(self):
+        """Flag the bridge as inactive (e.g. on close) for connected viewers."""
+        try:
+            state_path = os.path.join(self._bridge_dir(), "state.json")
+            if not os.path.isfile(state_path):
+                return
+            with open(state_path) as f:
+                state = json.load(f)
+            state["active"] = False
+            state["ts"] = time.time()
+            state_tmp = state_path + ".tmp"
+            with open(state_tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(state_tmp, state_path)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Launch / prefer the standalone "pyNuD Simulator" (PyMOL) on open
+    # ------------------------------------------------------------------
+    def _simulator_settings(self):
+        return QSettings("pyNuD", "AFMSimulatorPlugin")
+
+    def _standalone_candidate_prefixes(self):
+        """Return install prefixes where the standalone simulator may live."""
+        prefixes = []
+        env_home = os.environ.get("PYNUD_SIMULATOR_HOME")
+        if env_home:
+            prefixes.append(env_home)
+        home = os.path.expanduser("~")
+        if sys.platform.startswith("darwin"):
+            prefixes.extend([
+                "/Applications/pyNuD-Simulator",
+                os.path.join(home, "Applications", "pyNuD-Simulator"),
+                os.path.join(home, "pyNuD-Simulator"),
+            ])
+        elif os.name == "nt":
+            local = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
+            programdata = os.environ.get("ProgramData", r"C:\ProgramData")
+            prefixes.extend([
+                os.path.join(home, "pyNuD-Sim"),
+                os.path.join(local, "pyNuD-Sim"),
+                os.path.join(programdata, "pyNuD-Simulator"),
+            ])
+        else:
+            prefixes.extend([
+                os.path.join(home, "pyNuD-Simulator"),
+                "/opt/pyNuD-Simulator",
+            ])
+        return prefixes
+
+    def _standalone_appbundle_prefixes(self):
+        """Resolve install prefixes via the macOS launcher .app symlinks."""
+        if not sys.platform.startswith("darwin"):
+            return []
+        home = os.path.expanduser("~")
+        app_links = [
+            "/Applications/pyNuD Simulator.app",
+            os.path.join(home, "Applications", "pyNuD Simulator.app"),
+            os.path.join(home, "Desktop", "pyNuD Simulator.app"),
+        ]
+        prefixes = []
+        for app in app_links:
+            try:
+                if os.path.exists(app):
+                    prefixes.append(os.path.dirname(os.path.realpath(app)))
+            except Exception:
+                continue
+        return prefixes
+
+    def _detect_standalone_simulator(self):
+        """Locate an installed standalone pyNuD Simulator.
+
+        Returns {python, script, cwd} or None. The pkg installs into a
+        versioned sub-folder under /Applications/pyNuD-Simulator, so each
+        candidate root is checked directly and one level deep.
+        """
+        py_rel = "python.exe" if os.name == "nt" else os.path.join("bin", "python")
+        script_rel = os.path.join("opt", "pynud-simulator", "pyNuD_simulator.py")
+
+        def _check(prefix):
+            if not prefix:
+                return None
+            script = os.path.join(prefix, script_rel)
+            python_bin = os.path.join(prefix, py_rel)
+            if os.path.isfile(script) and os.path.isfile(python_bin):
+                return {"python": python_bin, "script": script,
+                        "cwd": os.path.dirname(script)}
+            return None
+
+        roots = list(self._standalone_candidate_prefixes())
+        roots.extend(self._standalone_appbundle_prefixes())
+        seen = set()
+        for root in roots:
+            if not root or root in seen:
+                continue
+            seen.add(root)
+            found = _check(root)
+            if found:
+                return found
+            try:
+                for name in sorted(os.listdir(root), reverse=True):
+                    sub = os.path.join(root, name)
+                    if os.path.isdir(sub):
+                        found = _check(sub)
+                        if found:
+                            return found
+            except Exception:
+                continue
+        return None
+
+    def _standalone_is_running(self):
+        """True if a standalone Simulator recently wrote a consumer heartbeat."""
+        try:
+            hb = os.path.join(self._bridge_dir(), "consumer.json")
+            if not os.path.isfile(hb):
+                return False
+            with open(hb) as f:
+                data = json.load(f)
+            return (time.time() - float(data.get("ts", 0) or 0)) < 4.0
+        except Exception:
+            return False
+
+    def _launch_standalone(self):
+        install = self._detect_standalone_simulator()
+        if install is None:
+            return
+        try:
+            subprocess.Popen([install["python"], install["script"]], cwd=install["cwd"])
+        except Exception as e:
+            QMessageBox.critical(
+                self, "pyNuD Simulator", f"Failed to launch pyNuD Simulator:\n{e}"
+            )
+
+    def _ensure_standalone_running(self):
+        if not self._standalone_is_running():
+            self._launch_standalone()
+
+    def _enter_headless_standalone_mode(self):
+        """Run as a hidden data feeder and (re)launch the standalone Simulator."""
+        self._headless_bridge_mode = True
+        self._publish_bridge_frame()
+        self._ensure_standalone_running()
+
+    def _offer_standalone_on_open(self):
+        """If the standalone is installed, offer to use it instead of the VTK view."""
+        if self._detect_standalone_simulator() is None:
+            return
+        try:
+            pref = str(self._simulator_settings().value("prefer_standalone", "ask"))
+        except Exception:
+            pref = "ask"
+        if pref == "no":
+            return
+        if pref == "yes":
+            self._enter_headless_standalone_mode()
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("pyNuD Simulator (PyMOL)")
+        box.setTextFormat(Qt.RichText)
+        box.setText(
+            "<b>PyMOL 対応の standalone「pyNuD Simulator」が見つかりました。</b><br><br>"
+            "そちらを起動しますか？ 起動する場合、このプラグインの VTK 表示は開かず、"
+            "pyNuD で表示中のフレームを standalone へ送る役だけを行います。<br>"
+            "<span style='color:#555;'>Launch the standalone pyNuD Simulator (native "
+            "PyMOL) instead of this VTK plugin window? The plugin will stay hidden and "
+            "just feed the displayed frame to it.</span>"
+        )
+        launch_btn = box.addButton("pyNuD Simulator を起動 / Launch", QMessageBox.AcceptRole)
+        box.addButton("このプラグイン (VTK) / Use plugin", QMessageBox.RejectRole)
+        box.setDefaultButton(launch_btn)
+        cb = QCheckBox("今後この選択を記憶する / Remember my choice")
+        box.setCheckBox(cb)
+        try:
+            box.exec_()
+        except Exception:
+            return
+        chose_standalone = box.clickedButton() is launch_btn
+        if cb.isChecked():
+            try:
+                self._simulator_settings().setValue(
+                    "prefer_standalone", "yes" if chose_standalone else "no"
+                )
+            except Exception:
+                pass
+        if chose_standalone:
+            self._enter_headless_standalone_mode()
 
     def _has_pynud_real_source(self):
         return bool(
@@ -15032,6 +17937,8 @@ class AFMSimulator(pyNuD_simulator):
         self._update_real_afm_frame_controls()
         if sync:
             self.sync_sim_params_to_real()
+        # Publish to the shared bridge so a running pyNuD Simulator can pull it.
+        self._publish_bridge_frame()
         return True
 
     def _connect_main_window_signals(self):
@@ -15060,7 +17967,16 @@ class AFMSimulator(pyNuD_simulator):
     def _on_main_window_frame_changed(self, frame_index):
         if not self._has_pynud_real_source():
             return
-        if getattr(self, "real_afm_window", None) is None and getattr(self, "real_afm_nm", None) is None:
+        # Follow frames whenever the data is actually needed: the Real AFM view
+        # is open, we run headless as the standalone's feeder, or a standalone
+        # consumer is currently listening on the bridge.
+        need = (
+            getattr(self, "_headless_bridge_mode", False)
+            or getattr(self, "real_afm_window", None) is not None
+            or getattr(self, "real_afm_nm", None) is not None
+            or self._standalone_is_running()
+        )
+        if not need:
             return
         try:
             self._pynud_pending_frame_index = int(frame_index)
@@ -15139,6 +18055,7 @@ class AFMSimulator(pyNuD_simulator):
 
     def closeEvent(self, event):
         self._disconnect_main_window_signals()
+        self._mark_bridge_inactive()
         try:
             if self.main_window is not None and hasattr(self.main_window, "plugin_actions"):
                 action = self.main_window.plugin_actions.get(PLUGIN_NAME)
@@ -15150,13 +18067,31 @@ class AFMSimulator(pyNuD_simulator):
 
 
 def main():
+    # アプリケーション作成前にHighDPI設定
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    QApplication.setAttribute(Qt.AA_UseDesktopOpenGL, True)
+    # macOSでもウィンドウ内にメニューを表示する
     QApplication.setAttribute(Qt.AA_DontUseNativeMenuBar, True)
+
     app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setOrganizationName("pyNuD")
+    try:
+        app.setApplicationDisplayName(APP_NAME)
+    except Exception:
+        pass
+    icon, icon_path = load_app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
+        apply_macos_dock_icon(icon_path)
+
+    # VTKのエラー出力を抑制
     vtk.vtkObject.GlobalWarningDisplayOff()
+
     window = AFMSimulator()
     window.show()
+
     sys.exit(app.exec_())
 
 
@@ -15165,7 +18100,7 @@ def create_plugin(main_window):
     return AFMSimulator(main_window=main_window)
 
 
-__all__ = ["PLUGIN_NAME", "create_plugin", "AFMSimulator", "pyNuD_simulator"]
+__all__ = ["PLUGIN_NAME", "create_plugin", "AFMSimulator", "pyNuD_simulator", "APP_NAME"]
 
 
 if __name__ == "__main__":
