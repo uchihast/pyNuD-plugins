@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 # type: ignore
 """
-pyNuD Simulator - Standalone application for AFM image simulation from PDB/CIF/MRC.
-Uses native PyMOL rendering with VTK fallback for speed and reliability.
+pyNuD Simulator - AFM image simulation from PDB/CIF/MRC.
 
-Version: 1.2.1
+- pyNuD plugin (AFM Simulator): VTK-only interactive 3D view.
+- Standalone pyNuD Simulator: PyMOL + VTK (launch via __main__).
+
+Version: 1.2.2
 """
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 import sys
 import numpy as np
 import os
-import json 
+import json
 import html
 import re
 import struct  # ★★★ 追加 ★★★
@@ -23,8 +25,8 @@ import subprocess
 import math
 from pathlib import Path
 from types import SimpleNamespace
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                            QHBoxLayout, QGridLayout, QLabel, QPushButton, 
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                            QHBoxLayout, QGridLayout, QLabel, QPushButton,
                             QSlider, QComboBox, QSpinBox, QDoubleSpinBox,
                             QGroupBox, QFileDialog, QMessageBox, QTextEdit,
                             QSplitter, QFrame, QCheckBox, QScrollArea,
@@ -32,7 +34,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QTreeWidget, QTextBrowser, QTreeWidgetItem, QSpacerItem, QSizePolicy, QLineEdit, QDialog, QProgressDialog,
                             QStackedLayout, QMenu)
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QTime, QSettings, QEventLoop, QEvent, QObject, QRect
-from PyQt5.QtGui import QFont, QColor, QPixmap, QIcon
+from PyQt5.QtGui import QFont, QColor, QPixmap, QIcon, QPaintEvent
 from PyQt5.QtCore import QThread, pyqtSignal
 
 # Support plugin launch: use globalvals when run from pyNuD, else minimal stub.
@@ -89,6 +91,7 @@ try:
         vtkTransformPolyDataFilter=vtkFiltersGeneral.vtkTransformPolyDataFilter,
         vtkActor=vtkRenderingCore.vtkActor,
         vtkRenderer=vtkRenderingCore.vtkRenderer,
+        vtkRenderWindow=vtkRenderingCore.vtkRenderWindow,
         vtkPolyDataMapper=vtkRenderingCore.vtkPolyDataMapper,
         vtkLight=vtkRenderingCore.vtkLight,
         vtkWindowToImageFilter=vtkRenderingCore.vtkWindowToImageFilter,
@@ -182,6 +185,297 @@ except ImportError:
         return decorator
 
 
+def _rotation_matrix_from_rotvec(rotvec):
+    """Return a 3x3 rotation matrix from a rotation vector in radians."""
+    vec = np.asarray(rotvec, dtype=float).reshape(3)
+    angle = float(np.linalg.norm(vec))
+    if angle < 1e-12:
+        return np.eye(3, dtype=float)
+    axis = vec / angle
+    x, y, z = axis
+    c = float(np.cos(angle))
+    s = float(np.sin(angle))
+    C = 1.0 - c
+    return np.array([
+        [c + x*x*C, x*y*C - z*s, x*z*C + y*s],
+        [y*x*C + z*s, c + y*y*C, y*z*C - x*s],
+        [z*x*C - y*s, z*y*C + x*s, c + z*z*C],
+    ], dtype=float)
+
+
+def apply_domain_transforms(base_coords, domain_ids, global_pose, domain_params):
+    """Apply global and per-domain rigid transforms without mutating inputs.
+
+    ``rotvec3`` values are radians. Each domain rotates around its centroid in
+    ``base_coords`` and then translates. ``domain_ids == -1`` atoms are fixed
+    for local transforms but still receive the global transform.
+    """
+    coords = np.asarray(base_coords, dtype=float)
+    if coords.ndim != 2 or coords.shape[1] != 3:
+        raise ValueError("base_coords must be an (N, 3) array")
+    out = np.array(coords, dtype=float, copy=True)
+
+    ids = np.asarray(domain_ids, dtype=int)
+    if ids.shape[0] != out.shape[0]:
+        raise ValueError("domain_ids length must match base_coords")
+
+    domain_params = list(domain_params or [])
+    for domain_idx, params in enumerate(domain_params):
+        mask = ids == int(domain_idx)
+        if not np.any(mask):
+            continue
+        rotvec, trans = params
+        R = _rotation_matrix_from_rotvec(rotvec)
+        t = np.asarray(trans, dtype=float).reshape(3)
+        center = np.mean(coords[mask], axis=0)
+        out[mask] = (coords[mask] - center) @ R.T + center + t
+
+    if global_pose is None:
+        return out
+
+    rotvec, trans = global_pose
+    Rg = _rotation_matrix_from_rotvec(rotvec)
+    tg = np.asarray(trans, dtype=float).reshape(3)
+    center = np.mean(out, axis=0) if out.size else np.zeros(3, dtype=float)
+    return (out - center) @ Rg.T + center + tg
+
+
+def _kmeans_numpy(features, n_clusters, max_iter=80, seed=0):
+    X = np.asarray(features, dtype=float)
+    n = X.shape[0]
+    k = int(max(1, min(n_clusters, n)))
+    if n == 0:
+        return np.array([], dtype=int)
+    if k == 1:
+        return np.zeros(n, dtype=int)
+
+    rng = np.random.default_rng(seed)
+    centers = [int(rng.integers(0, n))]
+    sq_dist = np.sum((X - X[centers[0]]) ** 2, axis=1)
+    for _ in range(1, k):
+        idx = int(np.argmax(sq_dist))
+        centers.append(idx)
+        sq_dist = np.minimum(sq_dist, np.sum((X - X[idx]) ** 2, axis=1))
+    centers = X[np.array(centers, dtype=int)].copy()
+    labels = np.zeros(n, dtype=int)
+
+    for _ in range(int(max_iter)):
+        dist2 = np.sum((X[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+        new_labels = np.argmin(dist2, axis=1)
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
+        for cluster in range(k):
+            mask = labels == cluster
+            if np.any(mask):
+                centers[cluster] = np.mean(X[mask], axis=0)
+            else:
+                centers[cluster] = X[int(np.argmax(np.min(dist2, axis=1)))]
+    return labels.astype(int)
+
+
+def _mean_silhouette(features, labels, sample_limit=500):
+    X = np.asarray(features, dtype=float)
+    labels = np.asarray(labels, dtype=int)
+    if X.shape[0] < 3 or len(np.unique(labels)) < 2:
+        return -1.0
+    if X.shape[0] > int(sample_limit):
+        idx = np.linspace(0, X.shape[0] - 1, int(sample_limit), dtype=int)
+        X = X[idx]
+        labels = labels[idx]
+    try:
+        from scipy.spatial.distance import cdist
+        dist = cdist(X, X)
+    except Exception:
+        diff = X[:, None, :] - X[None, :, :]
+        dist = np.sqrt(np.sum(diff * diff, axis=2))
+
+    scores = []
+    for i in range(X.shape[0]):
+        same = labels == labels[i]
+        same[i] = False
+        a = float(np.mean(dist[i, same])) if np.any(same) else 0.0
+        b = None
+        for other in np.unique(labels):
+            if other == labels[i]:
+                continue
+            mask = labels == other
+            if np.any(mask):
+                val = float(np.mean(dist[i, mask]))
+                b = val if b is None else min(b, val)
+        if b is None:
+            continue
+        denom = max(a, b, 1e-12)
+        scores.append((b - a) / denom)
+    return float(np.mean(scores)) if scores else -1.0
+
+
+def _anm_modes_with_prody(ca_coords_nm, cutoff_nm, n_modes):
+    """Optional ProDy ANM path. Raises on any issue so fallback remains simple."""
+    import importlib
+    prody = importlib.import_module("prody")
+    if hasattr(prody, "confProDy"):
+        try:
+            prody.confProDy(verbosity="none")
+        except Exception:
+            pass
+    anm = prody.ANM("pynud_afm_domains")
+    anm.buildHessian(np.asarray(ca_coords_nm, dtype=float) * 10.0, cutoff=float(cutoff_nm) * 10.0)
+    anm.calcModes(n_modes=int(n_modes) + 6)
+    eigvals = np.asarray(anm.getEigvals(), dtype=float)
+    eigvecs = np.asarray(anm.getEigvecs(), dtype=float)
+    return eigvals, eigvecs, "prody"
+
+
+def _anm_modes_numpy(ca_coords_nm, cutoff_nm, n_modes):
+    coords = np.asarray(ca_coords_nm, dtype=float)
+    n = coords.shape[0]
+    if n < 2:
+        return np.zeros(0, dtype=float), np.zeros((3 * n, 0), dtype=float), "numpy"
+
+    from scipy.spatial import cKDTree
+    pairs = list(cKDTree(coords).query_pairs(float(cutoff_nm)))
+    if not pairs:
+        # Disconnected structures cannot define ANM modes; connect neighbors as
+        # a conservative fallback so clustering still has a geometric signal.
+        order = np.argsort(coords[:, 0], kind="mergesort")
+        pairs = [(int(order[i]), int(order[i + 1])) for i in range(n - 1)]
+
+    requested = int(min(max(1, n_modes) + 6, max(1, 3 * n - 1)))
+    if n <= 1500:
+        H = np.zeros((3 * n, 3 * n), dtype=float)
+        for i, j in pairs:
+            rij = coords[j] - coords[i]
+            d2 = float(np.dot(rij, rij))
+            if d2 < 1e-12:
+                continue
+            unit = rij / math.sqrt(d2)
+            off = -np.outer(unit, unit)
+            si = slice(3 * i, 3 * i + 3)
+            sj = slice(3 * j, 3 * j + 3)
+            H[si, sj] += off
+            H[sj, si] += off
+            H[si, si] -= off
+            H[sj, sj] -= off
+        eigvals, eigvecs = np.linalg.eigh(H)
+    else:
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.linalg import eigsh
+        rows = []
+        cols = []
+        vals = []
+
+        def add_block(row_atom, col_atom, block):
+            for a in range(3):
+                for b in range(3):
+                    rows.append(3 * row_atom + a)
+                    cols.append(3 * col_atom + b)
+                    vals.append(float(block[a, b]))
+
+        diag = {}
+        for i, j in pairs:
+            rij = coords[j] - coords[i]
+            d2 = float(np.dot(rij, rij))
+            if d2 < 1e-12:
+                continue
+            unit = rij / math.sqrt(d2)
+            off = -np.outer(unit, unit)
+            add_block(i, j, off)
+            add_block(j, i, off)
+            diag[i] = diag.get(i, np.zeros((3, 3), dtype=float)) - off
+            diag[j] = diag.get(j, np.zeros((3, 3), dtype=float)) - off
+        for atom, block in diag.items():
+            add_block(atom, atom, block)
+        H = coo_matrix((vals, (rows, cols)), shape=(3 * n, 3 * n)).tocsr()
+        try:
+            eigvals, eigvecs = eigsh(H, k=requested, sigma=0.0, which="LM")
+        except Exception:
+            eigvals, eigvecs = eigsh(H, k=requested, which="SM")
+
+    order = np.argsort(eigvals)
+    eigvals = np.asarray(eigvals, dtype=float)[order]
+    eigvecs = np.asarray(eigvecs, dtype=float)[:, order]
+    return eigvals[:requested], eigvecs[:, :requested], "numpy"
+
+
+def _features_from_anm_modes(ca_coords_nm, eigvals, eigvecs, n_modes):
+    coords = np.asarray(ca_coords_nm, dtype=float)
+    n = coords.shape[0]
+    eigvals = np.asarray(eigvals, dtype=float)
+    eigvecs = np.asarray(eigvecs, dtype=float)
+    start = min(6, eigvecs.shape[1])
+    stop = min(eigvecs.shape[1], start + int(max(1, n_modes)))
+    chunks = []
+    for mode_idx in range(start, stop):
+        lam = max(float(abs(eigvals[mode_idx])) if mode_idx < eigvals.size else 1.0, 1e-8)
+        chunks.append(eigvecs[:, mode_idx].reshape(n, 3) / math.sqrt(lam))
+    if chunks:
+        features = np.concatenate(chunks, axis=1)
+    else:
+        features = coords - np.mean(coords, axis=0)
+
+    norms = np.linalg.norm(features, axis=1, keepdims=True)
+    if np.any(norms > 1e-12):
+        features = features / np.maximum(norms, 1e-12)
+    else:
+        features = coords - np.mean(coords, axis=0)
+    return features
+
+
+def detect_domains_enm(ca_coords, cutoff_nm=1.3, n_modes=8, n_domains=None):
+    """Detect likely flexible ENM domains from C-alpha/P coordinates.
+
+    Scientific note: ENM domains are a prediction of where the structure can
+    bend, not a ground truth segmentation. Judge validity by whether fitting
+    improves with physically reasonable transforms and penalties.
+    """
+    coords = np.asarray(ca_coords, dtype=float)
+    if coords.ndim != 2 or coords.shape[1] != 3:
+        raise ValueError("ca_coords must be an (N, 3) array")
+    n = coords.shape[0]
+    if n == 0:
+        return np.array([], dtype=int), 0, {"method": "none", "reason": "no_nodes"}
+    if n == 1:
+        return np.zeros(1, dtype=int), 1, {"method": "single", "reason": "one_node"}
+
+    method = "numpy"
+    try:
+        eigvals, eigvecs, method = _anm_modes_with_prody(coords, cutoff_nm, n_modes)
+    except Exception as prody_error:
+        eigvals, eigvecs, method = _anm_modes_numpy(coords, cutoff_nm, n_modes)
+        prody_message = str(prody_error)
+    else:
+        prody_message = ""
+
+    features = _features_from_anm_modes(coords, eigvals, eigvecs, n_modes)
+    max_d = int(max(1, min(12, n)))
+    if n_domains is not None:
+        suggested = int(max(1, min(max_d, n_domains)))
+        labels = _kmeans_numpy(features, suggested)
+        sil = _mean_silhouette(features, labels) if suggested > 1 else 0.0
+    else:
+        best = (1, np.zeros(n, dtype=int), -1.0)
+        for d in range(2, max(3, min(8, n) + 1)):
+            labels_d = _kmeans_numpy(features, d)
+            sil_d = _mean_silhouette(features, labels_d)
+            if sil_d > best[2]:
+                best = (d, labels_d, sil_d)
+        suggested, labels, sil = best
+
+    info = {
+        "method": method,
+        "n_nodes": int(n),
+        "cutoff_nm": float(cutoff_nm),
+        "n_modes": int(n_modes),
+        "suggested_D": int(suggested),
+        "silhouette": float(sil),
+        "eigvals": np.asarray(eigvals[: min(len(eigvals), int(n_modes) + 6)], dtype=float).tolist(),
+    }
+    if prody_message:
+        info["prody_fallback"] = prody_message
+    return np.asarray(labels, dtype=int), int(suggested), info
+
+
 class _EspGradientBar(QWidget):
     """Small horizontal red-white-blue gradient bar for ESP legend."""
 
@@ -231,6 +525,10 @@ class _AspectPixmapView(QWidget):
         self._roi_start_pos = None
         self._roi_end_pos = None
         self._roi_last_rect = None
+        # Model overlay: a simulated-AFM image (with per-pixel alpha) drawn on the same grid.
+        self._overlay_pixmap = None   # QPixmap (RGBA), aligned to the source-pixmap grid
+        self._overlay_visible = False
+        self._overlay_opacity = 0.6
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(1, 1)
 
@@ -260,6 +558,26 @@ class _AspectPixmapView(QWidget):
 
     def clearRoiOverlay(self):
         self._roi_last_rect = None
+        self.update()
+
+    def setModelOverlayPixmap(self, pixmap):
+        """Set the model overlay image (QPixmap with alpha), aligned to the source grid."""
+        self._overlay_pixmap = pixmap
+        self.update()
+
+    def setModelOverlayVisible(self, visible):
+        self._overlay_visible = bool(visible)
+        self.update()
+
+    def setModelOverlayOpacity(self, opacity):
+        try:
+            self._overlay_opacity = min(max(float(opacity), 0.0), 1.0)
+        except Exception:
+            pass
+        self.update()
+
+    def clearModelOverlay(self):
+        self._overlay_pixmap = None
         self.update()
 
     def _target_rect(self):
@@ -322,39 +640,67 @@ class _AspectPixmapView(QWidget):
         from PyQt5.QtCore import QRect
 
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-        painter.fillRect(self.rect(), QColor(0, 0, 0))
+        try:
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            painter.fillRect(self.rect(), QColor(0, 0, 0))
 
+            if self._source_pixmap is None or self._source_pixmap.isNull():
+                return
+
+            rect = self.rect()
+            if rect.width() <= 0 or rect.height() <= 0:
+                return
+
+            if self._display_aspect_ratio is None:
+                # Keep pixmap aspect ratio
+                scaled = self._source_pixmap.scaled(rect.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                x0 = rect.x() + (rect.width() - scaled.width()) // 2
+                y0 = rect.y() + (rect.height() - scaled.height()) // 2
+                painter.drawPixmap(x0, y0, scaled)
+            else:
+                # Letterbox to target ratio, then stretch content into that box.
+                target_rect = self._target_rect()
+                painter.drawPixmap(target_rect, self._source_pixmap)
+
+            # ROI overlay
+            roi_rect = None
+            if self._roi_dragging and self._roi_start_pos is not None and self._roi_end_pos is not None:
+                roi_rect = QRect(self._roi_start_pos, self._roi_end_pos).normalized()
+            elif self._roi_last_rect is not None:
+                roi_rect = self._roi_last_rect
+            if roi_rect is not None and not roi_rect.isNull():
+                painter.setRenderHint(QPainter.Antialiasing, False)
+                pen = QPen(QColor(80, 180, 255), 1, Qt.DashLine)
+                painter.setPen(pen)
+                painter.drawRect(roi_rect)
+                painter.fillRect(roi_rect, QColor(80, 180, 255, 40))
+
+            # Model overlay (projected atoms)
+            self._paint_model_overlay(painter)
+        finally:
+            painter.end()
+
+    def _paint_model_overlay(self, painter):
+        from PyQt5.QtGui import QPainter
+        if not self._overlay_visible:
+            return
+        overlay = self._overlay_pixmap
+        if overlay is None or overlay.isNull():
+            return
         if self._source_pixmap is None or self._source_pixmap.isNull():
             return
-
-        rect = self.rect()
-        if rect.width() <= 0 or rect.height() <= 0:
+        target_rect = self._target_rect()
+        if target_rect.isNull():
             return
 
-        if self._display_aspect_ratio is None:
-            # Keep pixmap aspect ratio
-            scaled = self._source_pixmap.scaled(rect.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            x0 = rect.x() + (rect.width() - scaled.width()) // 2
-            y0 = rect.y() + (rect.height() - scaled.height()) // 2
-            painter.drawPixmap(x0, y0, scaled)
-        else:
-            # Letterbox to target ratio, then stretch content into that box.
-            target_rect = self._target_rect()
-            painter.drawPixmap(target_rect, self._source_pixmap)
-
-        # ROI overlay
-        roi_rect = None
-        if self._roi_dragging and self._roi_start_pos is not None and self._roi_end_pos is not None:
-            roi_rect = QRect(self._roi_start_pos, self._roi_end_pos).normalized()
-        elif self._roi_last_rect is not None:
-            roi_rect = self._roi_last_rect
-        if roi_rect is not None and not roi_rect.isNull():
-            painter.setRenderHint(QPainter.Antialiasing, False)
-            pen = QPen(QColor(80, 180, 255), 1, Qt.DashLine)
-            painter.setPen(pen)
-            painter.drawRect(roi_rect)
-            painter.fillRect(roi_rect, QColor(80, 180, 255, 40))
+        painter.save()
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.setOpacity(self._overlay_opacity)
+        # Overlay PNG: scale to the same nm-framed display box as the AFM image.
+        # The PNG may be higher resolution than the AFM pixels; Qt scales it to match.
+        painter.drawPixmap(target_rect, overlay)
+        painter.restore()
 
     def mousePressEvent(self, event):  # type: ignore[override]
         if not self._roi_enabled or event.button() != Qt.LeftButton:
@@ -599,82 +945,55 @@ def apply_low_pass_filter(image, scan_x_nm, scan_y_nm, cutoff_wl_nm):
     # FFT
     img_fft = fft2(image)
     filtered_fft = img_fft * h_f
-    
+
     # 逆FFT
     filtered_image = np.real(ifft2(filtered_fft))
     return filtered_image
-    
-@jit(nopython=True)
-def _calculate_dilation_row(r_out, sample_surface, tip_footprint):
-    """
-    形態学的ダイレーションの1行分だけを計算するNumba高速化関数。
-    """
-    s_rows, s_cols = sample_surface.shape
-    t_rows, t_cols = tip_footprint.shape
-    t_center_r, t_center_c = t_rows // 2, t_cols // 2
 
-    output_row = np.full(s_cols, -1e9, dtype=np.float64)
-
-    for c_out in range(s_cols):
-        max_h = -1e9
-        for r_tip in range(t_rows):
-            for c_tip in range(t_cols):
-                s_r = r_out + r_tip - t_center_r
-                s_c = c_out + c_tip - t_center_c
-
-                if 0 <= s_r < s_rows and 0 <= s_c < s_cols:
-                    h = sample_surface[s_r, s_c] - tip_footprint[r_tip, c_tip]
-                    if h > max_h:
-                        max_h = h
-        output_row[c_out] = max_h
-
-    return output_row
-
-
-#@jit(nopython=True)
 def _create_vdw_surface_loop(nx, ny, pixel_x, pixel_y, x_start, y_start, min_z, atom_coords, atom_radii):
-    """
-    原子のファンデルワールス半径を考慮して表面マップを生成するNumba高速化関数。
-    """
     surface_map = np.full((ny, nx), min_z - 5.0, dtype=np.float64)
     px_coords = x_start + (np.arange(nx) + 0.5) * pixel_x
     py_coords = y_start + (np.arange(ny) + 0.5) * pixel_y
-    
-    for i in range(len(atom_coords)):
-        ax, ay, az = atom_coords[i]
-        az -= min_z
+
+    atom_coords = np.ascontiguousarray(atom_coords, dtype=np.float64)
+    atom_radii = np.ascontiguousarray(atom_radii, dtype=np.float64)
+
+    for i in range(atom_coords.shape[0]):
+        ax = atom_coords[i, 0]
+        ay = atom_coords[i, 1]
+        azr = atom_coords[i, 2] - min_z
         r = atom_radii[i]
-        r_sq = r**2
+        r_sq = r * r
 
         ix_min = int(np.floor((ax - r - x_start) / pixel_x))
-        ix_max = int(np.ceil((ax + r - x_start) / pixel_x))
+        ix_max = int(np.ceil ((ax + r - x_start) / pixel_x))
         iy_min = int(np.floor((ay - r - y_start) / pixel_y))
-        iy_max = int(np.ceil((ay + r - y_start) / pixel_y))
-        
-        ix_min, ix_max = max(0, ix_min), min(nx, ix_max)
-        iy_min, iy_max = max(0, iy_min), min(ny, iy_max)
+        iy_max = int(np.ceil ((ay + r - y_start) / pixel_y))
+        ix_min = max(0, ix_min)
+        ix_max = min(nx, ix_max)
+        iy_min = max(0, iy_min)
+        iy_max = min(ny, iy_max)
+        if ix_min >= ix_max or iy_min >= iy_max:
+            continue
 
-        for iy in range(iy_min, iy_max):
-            py = py_coords[iy]
-            dy_sq = (py - ay)**2
-            if dy_sq > r_sq: continue
-            
-            for ix in range(ix_min, ix_max):
-                px = px_coords[ix]
-                d_sq = (px - ax)**2 + dy_sq
-                
-                if d_sq <= r_sq:
-                    h = az + np.sqrt(r_sq - d_sq)
-                    if h > surface_map[iy, ix]:
-                        surface_map[iy, ix] = h
-                        
+        dx2 = (px_coords[ix_min:ix_max] - ax) ** 2
+        dy2 = (py_coords[iy_min:iy_max] - ay) ** 2
+        d2 = dy2[:, None] + dx2[None, :]
+        within = d2 <= r_sq
+        if not within.any():
+            continue
+        cap = np.sqrt(np.maximum(r_sq - d2, 0.0))
+        h = np.where(within, azr + cap, -np.inf)
+        block = surface_map[iy_min:iy_max, ix_min:ix_max]
+        np.maximum(block, h, out=block)
+
     surface_map[surface_map < min_z - 4.0] = 0.0
     return surface_map
 
 DETAILED_MANUAL_MD_JA = """
 # pyNuD Simulator Manual (Detailed)
 
-このマニュアルは `pyNuD_simulator.py` の現行実装に基づき、主要機能・パラメータ・操作手順をできるだけ詳細にまとめたものです。  
+このマニュアルは `pyNuD_simulator.py` の現行実装に基づき、主要機能・パラメータ・操作手順をできるだけ詳細にまとめたものです。
 UI表示名は実際のラベル（英語）をそのまま記載しています。
 
 ## 1. アプリの目的 {#ja-sec1}
@@ -879,10 +1198,13 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 - 左: `Real AFM (ASD)`
   - `Frame: i / N` とフレームスライダー
   - ASD多フレームを切替
-- 右: `Sim Aligned`
+- 中央: `Sim Aligned`
   - `Scan X/Y` と `Pixel X/Y` の情報表示
+- 右: `Difference (Real − Sim)`
+  - 実像とシミュレーション像の差分を発散カラーマップ(seismic, 0が白)で表示
+  - `RMSD`(nm) と `ZNCC` の定量指標を表示
 
-左右の画像描画領域は同サイズになるように揃えられます。
+各画像描画領域は同サイズになるように揃えられます。
 
 ### 8.3 ASD読み込み {#ja-sec8-3}
 - Real AFM側パネルへ `.asd` をドラッグ&ドロップ
@@ -916,6 +1238,17 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
   - Auto-fit成功時は `Apply Low-pass Filter` をONにする
   - 2段階目でノイズ/アーティファクト条件を探索してReal AFMへ見た目を寄せる
   - 反映結果は Sim Aligned 側にも適用
+- `Impose model`（チェックボックス）
+  - ONにすると、Simulation と同じ PDB（回転・Style/Color/Size）を **AFM スキャン窓と同じ nm 範囲** で高解像度 PNG 化し、Real AFM 像の上に重ねる
+  - AFM 像のピクセル数に合わせて再サンプリングせず、nm スケールを揃えて表示領域にスケールして被せる
+  - `Estimate Pose` 後の並進残差(Dx/Dy)を反映
+  - `Opacity` スライダーで不透明度を調整
+- `Difference (Real − Sim)` パネル（右端、自動更新）
+  - 実像とSim Alignedの差分を表示。両者の平均(オフセット)を揃えてから nm 単位で引き算
+  - `Estimate Pose` の並進残差(Dx/Dy)があれば、シミュレーション像を実像の特徴に合わせてシフトしてから差分を計算
+  - 発散カラーマップ(seismic): 0=白、正(実像が高い)=赤、負(シミュが高い)=青。スケールは差分絶対値の99パーセンタイルで対称
+  - `RMSD`(nm) と `ZNCC`(相関係数) を表示
+  - `Get Simulated image` 未実行時はプレースホルダ表示
 
 ---
 
@@ -935,17 +1268,21 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 精度が高いほど探索点が増え、時間は長くなります。
 
 ### 9.3 探索の流れ（実装） {#ja-sec9-3}
-1. 粗探索（seed姿勢 + Z方向グリッド）
-2. XYZ方向の座標降下で段階的に細密化
-3. 最良姿勢で再シミュレーション
-4. 残差平行移動（Dx, Dy）とスコア算出
+1. 現在のRotationをベースラインとして評価
+2. 粗探索（seed姿勢 + Z方向グリッド）
+3. XYZ方向の座標降下で段階的に細密化
+4. 最良姿勢で再シミュレーション
+5. 残差平行移動（Dx, Dy）と **RMSD / ZNCC** 算出
+
+**目的関数:** Difference パネルと同じ **高さRMSD (nm) を最小化**（平均オフセット除去後）。探索中は合成ノイズを付けず構造像（raw + 任意Low-pass）で評価します。ZNCCはタイブレーク用に少量加算されます。
 
 `Pose axes` でチェックを外した軸は、Estimate Pose中に現在のRotation値へ固定されます。例えば `Z` のみONにすると面内回転だけを探索し、`X` / `Y` の傾きは変えません。全軸OFFでは実行できません。
 
 ### 9.4 進捗表示 {#ja-sec9-4}
 - 推定中は `QProgressDialog` を表示
 - `Cancel` 可能
-- 評価回数・ベストスコアを更新表示
+- 評価回数・**Best RMSD**・スコアを更新表示
+- 完了ダイアログに RMSD / ZNCC を表示。RMSDが大きい場合は Auto-fit や Pose axes 限定を案内
 
 ---
 
@@ -1016,14 +1353,14 @@ OFF時:
 
 ## 14. 推奨ワークフロー（実AFM整合） {#ja-sec14}
 
-1. PDB/CIFを読み込む  
-2. `Real AFM image` ウィンドウを開く  
-3. ASDを読み込む（必要ならフレーム選択）  
-4. 必要に応じROIで対象分子を中心化  
-5. `Get Simulated image` でスキャン条件一致シミュレーション  
-6. `Estimate Pose` で方位推定（精度選択）  
+1. PDB/CIFを読み込む
+2. `Real AFM image` ウィンドウを開く
+3. ASDを読み込む（必要ならフレーム選択）
+4. 必要に応じROIで対象分子を中心化
+5. `Get Simulated image` でスキャン条件一致シミュレーション
+6. `Estimate Pose` で方位推定（精度選択）
 7. `Auto-fit AFM Appearance` で探針・Low-pass・ノイズ外観を調整
-8. メイン下段 `Simulated AFM Images` と `Sim Aligned` が一致することを確認  
+8. メイン下段 `Simulated AFM Images` と `Sim Aligned` が一致することを確認
 9. ASD/画像を保存
 
 ---
@@ -1067,7 +1404,7 @@ DETAILED_MANUAL_MD_EN = """
 # pyNuD Simulator Detailed Manual
 
 This manual describes the current implementation in `pyNuD_simulator.py` in detail, including
-features, parameter meanings, and operational workflow.  
+features, parameter meanings, and operational workflow.
 UI labels are written as displayed in the application.
 
 ## 1. Purpose {#en-sec1}
@@ -1269,7 +1606,8 @@ Note:
 
 ### 8.2 Layout {#en-sec8-2}
 - Left: `Real AFM (ASD)` with frame label/slider
-- Right: `Sim Aligned` with scan/pixel metadata row
+- Center: `Sim Aligned` with scan/pixel metadata row
+- Right: `Difference (Real − Sim)` with a diverging colormap (seismic, 0 = white) and `RMSD`/`ZNCC` metrics
 
 Image drawing areas are kept aligned in size.
 
@@ -1304,6 +1642,18 @@ Image drawing areas are kept aligned in size.
   - turns `Apply Low-pass Filter` on when Auto-fit succeeds
   - then searches noise/artifact parameters to visually match Real AFM
   - applies result to aligned preview as well
+- `Impose model` (checkbox)
+  - when on, overlays the **molecular model rendered like the main 3D view** (same Style / Color / Size / Opacity) on top of the Real AFM image
+  - uses an orthographic XY off-screen render framed to the AFM scan window (tip center, Scan X/Y, resolution), scaled to the Real AFM display
+  - if a pose residual (Dx/Dy) exists after `Estimate Pose`, it is applied as a whole-image shift (same as the Difference panel)
+  - the Real AFM window `Opacity` slider controls overall overlay opacity
+  - auto-updates on rotation change, `Estimate Pose`, and display-setting changes (falls back to max-Z atom projection if 3D capture is unavailable)
+- `Difference (Real − Sim)` panel (rightmost, auto-updating)
+  - shows Real minus Sim Aligned after removing each image's mean offset, subtracted in nm
+  - if a pose residual (Dx/Dy) from `Estimate Pose` exists, the simulated image is shifted onto the Real features before differencing
+  - diverging colormap (seismic): 0 = white, positive (real higher) = red, negative (sim higher) = blue; range is symmetric at the 99th percentile of |diff|
+  - displays `RMSD` (nm) and `ZNCC` (correlation)
+  - shows a placeholder until `Get Simulated image` has been run
 
 ---
 
@@ -1322,17 +1672,21 @@ Image drawing areas are kept aligned in size.
 Higher precision increases search evaluations and runtime.
 
 ### 9.3 Search Flow {#en-sec9-3}
-1. coarse seeding + Z scan
-2. coordinate-descent refinement in XYZ
-3. final simulation at best orientation
-4. residual translation and final score calculation
+1. evaluate the current Rotation as a baseline
+2. coarse seeding + Z scan
+3. coordinate-descent refinement in XYZ
+4. final simulation at best orientation
+5. residual translation (Dx, Dy) and **RMSD / ZNCC** calculation
+
+**Objective:** minimize the same height **RMSD (nm)** as the Difference panel (after mean-offset removal). Pose search uses the structural map (raw + optional low-pass) without synthetic noise. ZNCC is added in small weight for tie-breaking.
 
 Axes disabled in `Pose axes` are fixed at their current Rotation values during Estimate Pose. For example, enabling only `Z` searches in-plane rotation while keeping X/Y tilt unchanged. Estimate Pose cannot run when all axes are disabled.
 
 ### 9.4 Progress UI {#en-sec9-4}
 - Uses `QProgressDialog`
 - Supports cancel
-- Displays evaluation count and best score during search
+- Displays evaluation count, **Best RMSD**, and score during search
+- Completion dialog shows RMSD / ZNCC; suggests Auto-fit or limiting Pose axes when RMSD remains large
 
 ---
 
@@ -1396,14 +1750,14 @@ When OFF:
 
 ## 14. Recommended Real-AFM Alignment Workflow {#en-sec14}
 
-1. Load PDB/CIF  
-2. Open `Real AFM image` window  
-3. Load ASD and select frame  
-4. Optionally define ROI around target molecule  
-5. Run `Get Simulated image`  
-6. Run `Estimate Pose` with selected precision  
+1. Load PDB/CIF
+2. Open `Real AFM image` window
+3. Load ASD and select frame
+4. Optionally define ROI around target molecule
+5. Run `Get Simulated image`
+6. Run `Estimate Pose` with selected precision
 7. Run `Auto-fit AFM Appearance`
-8. Confirm consistency between main XY and Sim Aligned  
+8. Confirm consistency between main XY and Sim Aligned
 9. Save ASD/image outputs
 
 ---
@@ -1461,7 +1815,7 @@ class HelpContentManager:
         if page_id != "detailed_manual":
             page_id = "detailed_manual"
         return self._wrap_content(self._embedded_detailed_manual_page())
-            
+
     def get_ui_text(self, key):
         return self.content[self.current_language]['ui_text'].get(key, '')
 
@@ -1798,10 +2152,10 @@ class HelpContentManager:
         }
     </style>
     """
-    
+
     def _initialize_content(self):
         self.current_language = 'en'
-        
+
         # --- 英語コンテンツ ---
         toc_structure_en = [("Manual", self._build_detailed_manual_toc_items('en'))]
         pages_en = {
@@ -2040,7 +2394,7 @@ class HelpWindow(QWidget):
         splitter.addWidget(self.help_viewer)
         splitter.setSizes([220, 580])
         layout.addWidget(splitter)
-    
+
     def switch_language(self, lang_code):
         self.content_manager.set_language(lang_code)
         self.setWindowTitle(self.content_manager.get_ui_text('window_title'))
@@ -2086,17 +2440,17 @@ class HelpWindow(QWidget):
             self.toc_tree.addTopLevelItem(category_item)
             add_items(category_item, items, 1)
         self.toc_tree.expandAll()
-    
+
     def onTocItemClicked(self, item, column):
         item_id = item.data(0, Qt.UserRole)
         if item_id: self.showHelpPage(item_id)
-    
+
     def showHelpPage(self, page_id):
         base_id, anchor = (page_id.split('#', 1) + [None])[:2] if '#' in page_id else (page_id, None)
         self.help_viewer.setHtml(self.content_manager.get_content(base_id))
         if anchor:
             QTimer.singleShot(0, lambda: self.help_viewer.scrollToAnchor(anchor))
-    
+
     def showHomePage(self):
         self.showHelpPage('detailed_manual')
 class AFMSimulationWorker(QThread):
@@ -2118,7 +2472,7 @@ class AFMSimulationWorker(QThread):
 
     def cancel(self):
         self._is_cancelled = True
-    
+
     def __del__(self):
         """
         デストラクタではwait/terminateしない。
@@ -2140,7 +2494,7 @@ class AFMSimulationWorker(QThread):
             for i, task in enumerate(self.tasks):
                 start_progress = int((i / total_tasks) * 100)
                 end_progress = int(((i + 1) / total_tasks) * 100)
-                
+
                 task_name = task["name"]
                 scan_coords = task["coords"]
                 target_panel = task["panel"]
@@ -2149,27 +2503,27 @@ class AFMSimulationWorker(QThread):
                 if not self.silent_mode:
                     self.progress.emit(start_progress)
                 if self._is_cancelled: break
-                
+
                 self.rotated_atom_coords = scan_coords
                 if self._is_cancelled: break
-                
+
                 if self.sim_params.get('use_vdw', False) and self.element_symbols is not None:
                     sample_surface = self.create_vdw_surface()
                 else:
                     sample_surface = self.create_atom_center_surface()
-                
+
                 if not self.silent_mode:
                     self.progress.emit(start_progress + int((end_progress - start_progress) * 0.1))
                 if self._is_cancelled: break
-                
+
                 nx = self.sim_params.get('nx', self.sim_params.get('resolution', 64))
                 ny = self.sim_params.get('ny', self.sim_params.get('resolution', 64))
                 scan_x = self.sim_params.get('scan_x_nm', self.sim_params.get('scan_size', 20.0))
                 scan_y = self.sim_params.get('scan_y_nm', self.sim_params.get('scan_size', 20.0))
-                
+
                 dx = scan_x / nx
                 dy = scan_y / ny
-                
+
                 z_coords = scan_coords[:, 2]
                 mol_depth = np.max(z_coords) - np.min(z_coords) if z_coords.size > 0 else 0
                 tip_footprint = self.create_igor_style_tip(dx, dy, mol_depth)
@@ -2178,21 +2532,17 @@ class AFMSimulationWorker(QThread):
                     self.progress.emit(start_progress + int((end_progress - start_progress) * 0.2))
                 if self._is_cancelled: break
 
-                afm_image = np.zeros((ny, nx), dtype=np.float64)
-                
-                last_emitted_progress = -1
+                if not self.silent_mode:
+                    self.progress.emit(start_progress + int((end_progress - start_progress) * 0.5))
+                if self._is_cancelled:
+                    break
 
-                for r in range(ny):
-                    if self._is_cancelled: break
-                    afm_image[r, :] = _calculate_dilation_row(r, sample_surface, tip_footprint)
-                    
-                    if not self.silent_mode:
-                        task_progress_fraction = 0.2 + (((r + 1) / ny) * 0.8)
-                        current_overall_progress = start_progress + int(task_progress_fraction * (end_progress - start_progress))
-                        
-                        if current_overall_progress > last_emitted_progress:
-                            self.progress.emit(current_overall_progress)
-                            last_emitted_progress = current_overall_progress
+                afm_image = scipy.ndimage.grey_dilation(
+                    sample_surface,
+                    structure=-tip_footprint,
+                    mode='constant',
+                    cval=-np.inf,
+                ).astype(np.float64, copy=False)
 
                 if self._is_cancelled: break
                 self.task_done.emit(afm_image, target_panel)
@@ -2205,7 +2555,7 @@ class AFMSimulationWorker(QThread):
                 # ★★★ 削除：ステータス表示を無効化 ★★★
                 # self.status_update.emit("All tasks completed!")
                 pass
-            
+
             if not self.silent_mode:
                 self.progress.emit(100)
             self.done.emit(None)
@@ -2213,35 +2563,35 @@ class AFMSimulationWorker(QThread):
         except Exception as e:
             print(f"An error occurred during the AFM simulation: {e}")
             self.done.emit(None)
-    
+
     def create_vdw_surface(self):
         """ファンデルワールス半径を考慮した表面マップを作成する。"""
         nx = self.sim_params.get('nx', self.sim_params.get('resolution', 64))
         ny = self.sim_params.get('ny', self.sim_params.get('resolution', 64))
         scan_x = self.sim_params.get('scan_x_nm', self.sim_params.get('scan_size', 20.0))
         scan_y = self.sim_params.get('scan_y_nm', self.sim_params.get('scan_size', 20.0))
-        
+
         center_x = self.sim_params['center_x']
         center_y = self.sim_params['center_y']
-        
+
         pixel_x = scan_x / nx
         pixel_y = scan_y / ny
-        
+
         x_start = center_x - scan_x / 2.0
         y_start = center_y - scan_y / 2.0
-        
+
         min_z = np.min(self.rotated_atom_coords[:, 2]) if self.rotated_atom_coords.size > 0 else 0
-        
+
         if self.rotated_atom_coords.size == 0:
             return np.zeros((ny, nx), dtype=np.float64)
 
         atom_radii = np.array([self.vdw_radii.get(e, self.vdw_radii['other']) for e in self.element_symbols], dtype=np.float64)
-        
+
         surface_map = _create_vdw_surface_loop(
             nx, ny, pixel_x, pixel_y, x_start, y_start, min_z,
             self.rotated_atom_coords, atom_radii
         )
-        
+
         return surface_map
 
 
@@ -2251,16 +2601,16 @@ class AFMSimulationWorker(QThread):
         ny = self.sim_params.get('ny', self.sim_params.get('resolution', 64))
         scan_x = self.sim_params.get('scan_x_nm', self.sim_params.get('scan_size', 20.0))
         scan_y = self.sim_params.get('scan_y_nm', self.sim_params.get('scan_size', 20.0))
-        
+
         center_x = self.sim_params['center_x']
         center_y = self.sim_params['center_y']
-        
+
         pixel_x = scan_x / nx
         pixel_y = scan_y / ny
-        
+
         x_start = center_x - scan_x / 2.0
         y_start = center_y - scan_y / 2.0
-        
+
         min_z = np.min(self.rotated_atom_coords[:, 2]) if self.rotated_atom_coords.size > 0 else 0
         surface_map = np.full((ny, nx), min_z - 5.0, dtype=np.float64)
 
@@ -2275,7 +2625,7 @@ class AFMSimulationWorker(QThread):
         mask = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
         if np.any(mask):
             np.maximum.at(surface_map, (iy[mask], ix[mask]), atom_z[mask])
-        
+
         surface_map[surface_map < min_z - 4.0] = 0.0 # 原子がないピクセルは高さ0とする
 
         return surface_map
@@ -2301,10 +2651,10 @@ class AFMSimulationWorker(QThread):
 
         tip_px = int(np.ceil(max_tip_radius_nm / dx))
         tip_py = int(np.ceil(max_tip_radius_nm / dy))
-        
+
         tip_wave = np.zeros((2 * tip_py + 1, 2 * tip_px + 1), dtype=np.float64)
         y_idx, x_idx = np.indices(tip_wave.shape)
-        
+
         r_i = np.sqrt(((x_idx - tip_px) * dx)**2 + ((y_idx - tip_py) * dy)**2)
         if tip_shape == 'cone':
             r_crit = R * np.cos(alpha_rad)
@@ -2328,7 +2678,7 @@ class AFMSimulationWorker(QThread):
         if np.any(tip_wave):
             tip_wave -= np.min(tip_wave)
         return tip_wave
-    
+
     def simulate_views_blocking(self, desired_keys):
         """
         Run simulation only for desired view keys (['XY_Frame','YZ_Frame','ZX_Frame'])
@@ -2370,11 +2720,11 @@ class AFMSimulationWorker(QThread):
         if not self.simulation_results:
             QMessageBox.warning(self, "No Data", "No simulation data available to save.")
             return
-        
+
         # Build available (only those already simulated)
         available_keys = list(self.simulation_results.keys())
         display_names = {"XY_Frame": "XY View", "YZ_Frame": "YZ View", "ZX_Frame": "ZX View"}
-        
+
         dlg = SaveAFMImageDialog(available_keys, display_names, self.get_active_dataset_id(), self)
         if dlg.exec_() != QDialog.Accepted:
             return
@@ -2382,11 +2732,11 @@ class AFMSimulationWorker(QThread):
         selected_view_keys = result['selected_views']
         rot_inc = result['drot']
         base_name = result['base_name']
-        
+
         if not selected_view_keys:
             QMessageBox.warning(self, "No Selection", "No views selected.")
             return
-        
+
         # Map for filename friendly
         def key_to_short(k):
             return {
@@ -2394,21 +2744,21 @@ class AFMSimulationWorker(QThread):
                 "YZ_Frame": "YZ",
                 "ZX_Frame": "ZX"
             }.get(k, k.replace("_Frame", ""))
-        
+
         # Prepare directory & ensure last_import_dir is valid
         directory = ""
         if self.last_import_dir and os.path.isdir(self.last_import_dir):
             directory = self.last_import_dir
         if not directory:
             directory = os.getcwd()
-        
+
         # Save original rotation
         orig_rx = self.rotation_widgets['X']['spin'].value()
         orig_ry = self.rotation_widgets['Y']['spin'].value()
         orig_rz = self.rotation_widgets['Z']['spin'].value()
-        
+
         apply_rotation = any(abs(v) > 1e-6 for v in rot_inc.values())
-        
+
         try:
             if apply_rotation:
                 # Apply incremental rotation (add to current)
@@ -2418,7 +2768,7 @@ class AFMSimulationWorker(QThread):
                 # Force apply transform & run simulation for required views
                 self.apply_structure_rotation()
                 self.simulate_views_blocking(selected_view_keys)
-            
+
             # Export each selected view
             export_count = 0
             for key in selected_view_keys:
@@ -2431,7 +2781,7 @@ class AFMSimulationWorker(QThread):
                     norm = np.zeros_like(data, dtype=np.uint8)
                 else:
                     norm = ((data - mn) / (mx - mn) * 255).astype(np.uint8)
-                
+
                 # Resize to 512x512
                 try:
                     from PIL import Image
@@ -2441,7 +2791,7 @@ class AFMSimulationWorker(QThread):
                 img = Image.fromarray(norm, mode='L')
                 resample_filter = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS
                 img = img.resize((512, 512), resample=resample_filter)
-                
+
                 fname = f"{base_name}_{key_to_short(key)}_dx{rot_inc['x']:+.0f}_dy{rot_inc['y']:+.0f}_dz{rot_inc['z']:+.0f}.png"
                 save_path = os.path.join(directory, fname)
                 try:
@@ -2449,12 +2799,12 @@ class AFMSimulationWorker(QThread):
                     export_count += 1
                 except Exception as e:
                     print(f"[ERROR] Failed to save {save_path}: {e}")
-            
+
             if export_count:
                 QMessageBox.information(self, "Export Complete", f"Exported {export_count} image(s) to:\n{directory}")
             else:
                 QMessageBox.warning(self, "No Export", "No images were exported.")
-        
+
         finally:
             # Restore original rotation if we changed it
             if apply_rotation:
@@ -2476,10 +2826,10 @@ class CustomInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
 
     def OnLeftButtonDown(self):
         rwi = self.GetInteractor()
-        
+
         # macOSのCommandキーにも対応するため、GetCommandKey()のチェックを追加
         is_ctrl_or_cmd_pressed = rwi.GetControlKey() or rwi.GetCommandKey()
-        
+
         # Ctrl(またはCmd)キーが押されているか最初にチェック
         if is_ctrl_or_cmd_pressed and not rwi.GetShiftKey():
             self.actor_rotating = True
@@ -2501,12 +2851,12 @@ class CustomInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
         if self.actor_rotating:
             self.actor_rotating = False
             self.EndRotate()
-            
+
             # ドラッグ終了時の高解像度シミュレーション
             if hasattr(self.window, 'interactive_update_check') and self.window.interactive_update_check.isChecked():
                 if hasattr(self.window, 'schedule_high_res_simulation'):
                     self.window.schedule_high_res_simulation()
-                    
+
         elif self.panning:
             self.panning = False
             self.EndPan()
@@ -2547,7 +2897,7 @@ class CustomInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
                 self.window.update_rotation_from_drag_view_dependent(dx, dy)
         except Exception:
             pass
-    
+
     def normalize_angle(self, angle):
         """角度を-180〜180の範囲に正規化"""
         while angle > 180:
@@ -2560,10 +2910,10 @@ class CustomInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
         renderer.SetDisplayPoint(float(x), float(y), float(z))
         renderer.DisplayToWorld()
         world_point = renderer.GetWorldPoint()
-        return [world_point[0] / world_point[3], 
-                world_point[1] / world_point[3], 
+        return [world_point[0] / world_point[3],
+                world_point[1] / world_point[3],
                 world_point[2] / world_point[3]]
-    
+
 class pyNuD_simulator(QMainWindow):
 
     simulation_done = pyqtSignal(object)
@@ -2584,34 +2934,34 @@ class pyNuD_simulator(QMainWindow):
         icon, _icon_path = load_app_icon()
         if not icon.isNull():
             self.setWindowIcon(icon)
-        
+
         # Windows固有の設定
         #if sys.platform.startswith('win'):
             # Windowsでの安定性向上のための設定
         #    self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         #    self.setAttribute(Qt.WA_NoSystemBackground, True)
-        
+
         # スタンドアロンアプリケーションなのでwindow_managerは使用しない
-        
+
         # ウィンドウの位置とサイズを復元
         self.settings = QSettings("pyNuD", "pyNuD_Simulator")
         self.restore_geometry()
-        
+
         # 設定が保存されていない場合はデフォルトサイズを使用
         if not self.settings.contains("geometry"):
             # ウィンドウサイズ設定
             from PyQt5.QtWidgets import QDesktopWidget
             desktop = QDesktopWidget()
             screen_geometry = desktop.screenGeometry()
-            
+
             width = int(screen_geometry.width() * 0.6)
             height = int(screen_geometry.height() * 0.6)
-            
+
             # ★★★ 変更点: 最小サイズを小さく設定 ★★★
             self.setMinimumSize(600, 450)
             self.resize(width, height)
         self.center_on_screen()
-        
+
         # データ格納
         self.atoms_data = None
         self.pdb_name = ""
@@ -2628,7 +2978,7 @@ class pyNuD_simulator(QMainWindow):
         self.tip_actor = None
         self.sample_actor = None
         self.bonds_actor = None
-        self.simulation_results = {} 
+        self.simulation_results = {}
         self.raw_simulation_results = {}
 
         self.help_window = None
@@ -2647,11 +2997,24 @@ class pyNuD_simulator(QMainWindow):
         self.real_afm_window = None
         self.real_afm_window_real_frame = None
         self.real_afm_window_aligned_frame = None
+        self.real_afm_window_diff_frame = None
+        self.real_afm_window_view = None
         self.real_afm_frame_slider = None
         self.real_afm_frame_label = None
         self.real_afm_sim_info_label = None
+        self.real_afm_diff_info_label = None
         self._real_afm_pending_frame_index = None
         self._real_afm_frame_load_timer = None
+        # Impose model overlay state
+        self.impose_model_check = None
+        self.impose_opacity_slider = None
+        self.impose_model_enabled = False
+        self.impose_model_opacity = 0.6
+        self._pose_estimation_running = False
+        self._model_overlay_update_timer = None
+        self._impose_overlay_refresh_timer = None
+        self._overlay_last_qpainter_atoms = 0
+        self._vtk_overlay_signature_cache = None
         self.pose_rotation_axes = {'X': True, 'Y': True, 'Z': True}
         self.pose_axis_checks = {}
         self.afm_appearance_window = None
@@ -2692,6 +3055,12 @@ class pyNuD_simulator(QMainWindow):
         self.sequence_drag_grab_widget = None
         self.sequence_highlight_timer = None
         self.sequence_highlight_actor = None
+        self.domain_ids = None
+        self.domain_residue_keys = []
+        self.domain_ca_atom_indices = []
+        self.domain_info = {}
+        self.flexible_fit_result = None
+        self.flexible_fit_report_text = ""
         self.block_transform_active = False
         self.block_transform_keys = set()
         self.block_transform_dragging = False
@@ -2726,6 +3095,7 @@ class pyNuD_simulator(QMainWindow):
         self._color_scheme_before_esp = None
         self.display_widget = None
         self.vtk_initialized = False
+        self._vtk_deferred_init = False
 
         # --- PyMOL image-mode performance throttling ---
         self._pymol_render_timer = None
@@ -2739,23 +3109,23 @@ class pyNuD_simulator(QMainWindow):
         self._pymol_mouse_mode = None
         self.current_standard_view = None
         self.view_plane_buttons = {}
-        
+
         # 変換を二段に分離
         self.base_transform = vtk.vtkTransform()
         self.base_transform.Identity()
-        
+
         self.local_transform = vtk.vtkTransform()
         self.local_transform.Identity()
         self.local_transform.PostMultiply()  # ローカル回転を右に積む（オブジェクト座標で回す）
-        
+
         self.combined_transform = vtk.vtkTransform()
         self.combined_transform.Identity()
         self.combined_transform.PostMultiply()
-        
+
         # 後方互換性のため残す
         self.molecule_transform = vtk.vtkTransform()
         self.last_import_dir = ""
-        
+
         # スライダ差分適用用の前回値
         self.prev_rot = {'x': 0.0, 'y': 0.0, 'z': 0.0}
 
@@ -2776,37 +3146,37 @@ class pyNuD_simulator(QMainWindow):
         self.tip_radius_debounce_timer = None
         self.minitip_radius_debounce_timer = None
         self.tip_angle_debounce_timer = None
-        
+
         # カラー・ライティング設定
         self.current_bg_color = (0.05, 0.05, 0.05)
         self.current_single_color = (0.5, 0.7, 0.9)
         self.brightness_factor = 1.0
-        
+
         # AFM像表示用の参照
         self.afm_x_widget = None
         self.afm_y_widget = None
         self.afm_z_widget = None
-        
+
         # 簡単で確実なカラーマップ
         self.element_colors = {
             'C': (0.565, 0.565, 0.565), 'O': (1.0, 0.3, 0.3), 'N': (0.3, 0.3, 1.0),
             'H': (0.9, 0.9, 0.9), 'S': (1.0, 1.0, 0.3), 'P': (1.0, 0.5, 0.0),
             'other': (0.7, 0.7, 0.7)
         }
-        
+
         # チェーンカラー
         self.chain_colors = [
             (0.2, 0.8, 0.2), (0.8, 0.2, 0.2), (0.2, 0.2, 0.8), (0.8, 0.8, 0.2),
             (0.8, 0.2, 0.8), (0.2, 0.8, 0.8), (1.0, 0.5, 0.0), (0.5, 0.0, 0.8),
         ]
-        
+
          # ★★★ ここから追加 ★★★
         # 一般的なファンデルワールス半径 (nm)
         self.vdw_radii = {
             'H': 0.120, 'C': 0.170, 'N': 0.155, 'O': 0.152,
             'P': 0.180, 'S': 0.180, 'other': 0.170
         }
-        
+
         # バックグラウンド処理からのシグナル
         #self.simulation_done = pyqtSignal(object)
         #self.simulation_progress = pyqtSignal(int)
@@ -2817,8 +3187,8 @@ class pyNuD_simulator(QMainWindow):
             'tip_radius': 2.0, 'tip_shape': 'cone', 'tip_angle': 15.0,
             'tip_x': 0.0, 'tip_y': 0.0, 'tip_z': 5.0,
         }
-        
-        
+
+
         # メニューバーを作成（Helpはここへ移動）
         self.create_menu_bar()
 
@@ -2846,8 +3216,25 @@ class pyNuD_simulator(QMainWindow):
 
         self.load_settings()
 
+    def _is_vtk_only_plugin(self):
+        """True for the in-pyNuD AFM Simulator plugin (VTK-only, no PyMOL UI)."""
+        return bool(getattr(self, "_vtk_only_plugin", False))
+
+    def _has_renderer_combo(self):
+        return getattr(self, "renderer_combo", None) is not None
+
+    def _has_esp_check(self):
+        return getattr(self, "esp_check", None) is not None
+
     def setup_pymol(self):
-        """PyMOL環境のセットアップ（Qt埋め込み）"""
+        """PyMOL環境のセットアップ（Qt埋め込み）。プラグイン版は VTK のみ。"""
+        if self._is_vtk_only_plugin():
+            self.render_backend = "vtk"
+            self.pymol_available = False
+            self.user_render_backend_preference = "vtk"
+            self._setup_vtk_legacy()
+            self._apply_view_visibility()
+            return
         self.render_backend = "pymol"
         self.pymol_available = False
         try:
@@ -2894,7 +3281,7 @@ class pyNuD_simulator(QMainWindow):
         except Exception as e:
             print(f"PyMOL setup error: {e}")
             self.render_backend = "vtk"
-            if hasattr(self, 'esp_check'):
+            if self._has_esp_check():
                 self.esp_check.setEnabled(False)
             self._setup_vtk_legacy()
             try:
@@ -2919,7 +3306,7 @@ class pyNuD_simulator(QMainWindow):
                 self._set_render_backend("pymol")
         if getattr(self, 'current_structure_type', None) == "mrc":
             self._set_render_backend("vtk")
-        if hasattr(self, 'esp_check'):
+        if self._has_esp_check():
             self.esp_check.setEnabled(self.render_backend in ("pymol", "dual") and self.pymol_available)
 
     def _install_pymol_widget(self, widget, install_event_filter=True, accept_drops=True):
@@ -4194,6 +4581,276 @@ class pyNuD_simulator(QMainWindow):
             [z*x*C - y*s, z*y*C + x*s, c + z*z*C],
         ], dtype=float)
 
+    def _current_atom_coords_array(self):
+        if getattr(self, "atoms_data", None) is None:
+            return None
+        return np.column_stack([
+            np.asarray(self.atoms_data["x"], dtype=float),
+            np.asarray(self.atoms_data["y"], dtype=float),
+            np.asarray(self.atoms_data["z"], dtype=float),
+        ])
+
+    def _set_atom_coords_array(self, coords, mark_edited=True):
+        if getattr(self, "atoms_data", None) is None:
+            return False
+        arr = np.asarray(coords, dtype=float)
+        if arr.ndim != 2 or arr.shape[1] != 3 or arr.shape[0] != len(self.atoms_data["x"]):
+            return False
+        self.atoms_data["x"] = np.array(arr[:, 0], dtype=float, copy=True)
+        self.atoms_data["y"] = np.array(arr[:, 1], dtype=float, copy=True)
+        self.atoms_data["z"] = np.array(arr[:, 2], dtype=float, copy=True)
+        if mark_edited:
+            self._mark_in_memory_structure_edited(force_pymol_reload=False)
+        return True
+
+    def _extract_ca_domain_nodes(self):
+        """Return ENM nodes and residue/atom mappings for the current structure."""
+        if getattr(self, "atoms_data", None) is None:
+            return None
+        atom_names = np.asarray(self.atoms_data.get("atom_name", []))
+        if atom_names.size == 0:
+            return None
+        node_mask = atom_names == "CA"
+        if not np.any(node_mask):
+            node_mask = atom_names == "P"
+        if not np.any(node_mask):
+            return None
+
+        node_indices = np.where(node_mask)[0]
+        residue_keys = [self._sequence_key_from_atom_arrays(int(i)) for i in node_indices]
+        coords = np.column_stack([
+            np.asarray(self.atoms_data["x"], dtype=float)[node_indices],
+            np.asarray(self.atoms_data["y"], dtype=float)[node_indices],
+            np.asarray(self.atoms_data["z"], dtype=float)[node_indices],
+        ])
+
+        key_to_node = {key: idx for idx, key in enumerate(residue_keys)}
+        atom_to_node = np.full(len(self.atoms_data["x"]), -1, dtype=int)
+        for atom_idx in range(len(self.atoms_data["x"])):
+            key = self._sequence_key_from_atom_arrays(atom_idx)
+            node_idx = key_to_node.get(key, -1)
+            atom_to_node[atom_idx] = int(node_idx)
+
+        return {
+            "coords": coords,
+            "node_indices": node_indices,
+            "residue_keys": residue_keys,
+            "atom_to_node": atom_to_node,
+        }
+
+    def _set_domain_count_widgets(self, value):
+        value = int(max(1, min(12, value)))
+        widgets = [
+            getattr(self, "domain_count_slider", None),
+            getattr(self, "domain_count_spin", None),
+        ]
+        blocked = []
+        for widget in widgets:
+            if widget is None:
+                continue
+            try:
+                blocked.append((widget, widget.blockSignals(True)))
+                widget.setValue(value)
+            except Exception:
+                pass
+        for widget, was_blocked in blocked:
+            try:
+                widget.blockSignals(was_blocked)
+            except Exception:
+                pass
+
+    def _domain_auto_enabled(self):
+        check = getattr(self, "domain_auto_check", None)
+        if check is None:
+            return False
+        try:
+            return bool(check.isChecked())
+        except Exception:
+            return False
+
+    def _update_domain_controls_enabled(self):
+        manual = not self._domain_auto_enabled()
+        for widget in (
+            getattr(self, "domain_count_slider", None),
+            getattr(self, "domain_count_spin", None),
+        ):
+            if widget is not None:
+                try:
+                    widget.setEnabled(manual)
+                except Exception:
+                    pass
+
+    def _set_domain_auto_checked(self, checked):
+        check = getattr(self, "domain_auto_check", None)
+        if check is None:
+            return
+        try:
+            old = check.blockSignals(True)
+            check.setChecked(bool(checked))
+            check.blockSignals(old)
+        except Exception:
+            pass
+        self._update_domain_controls_enabled()
+
+    def _on_domain_auto_toggled(self, checked):
+        self._update_domain_controls_enabled()
+        if checked and getattr(self, "domain_ids", None) is not None:
+            try:
+                self.detect_domains_from_ui(n_domains=None, show_messages=False)
+            except Exception as e:
+                print(f"[WARNING] Auto domain update failed: {e}")
+
+    def _on_domain_count_changed(self, value):
+        if getattr(self, "_domain_count_update_blocked", False):
+            return
+        if self._domain_auto_enabled():
+            self._set_domain_auto_checked(False)
+        if getattr(self, "domain_ids", None) is None:
+            return
+        try:
+            self.detect_domains_from_ui(n_domains=int(value), show_messages=False)
+        except Exception as e:
+            print(f"[WARNING] Domain count update failed: {e}")
+
+    def _on_domain_preview_toggled(self, checked):
+        if not hasattr(self, "color_combo"):
+            return
+        if checked:
+            if getattr(self, "domain_ids", None) is None:
+                self.domain_preview_check.blockSignals(True)
+                self.domain_preview_check.setChecked(False)
+                self.domain_preview_check.blockSignals(False)
+                QMessageBox.information(self, "Domains", "Run Detect Domains first.")
+                return
+            self.color_combo.setCurrentText("By Domain")
+        elif self.color_combo.currentText() == "By Domain":
+            self.color_combo.setCurrentText("By Chain")
+        self.update_display()
+
+    def _update_domain_status_label(self):
+        label = getattr(self, "domain_status_label", None)
+        if label is None:
+            return
+        ids = getattr(self, "domain_ids", None)
+        if ids is None:
+            if self._domain_auto_enabled():
+                label.setText("Domains: Auto (not detected)")
+            else:
+                label.setText("Domains: manual (not detected)")
+            return
+        assigned = np.asarray(ids, dtype=int)
+        n_domains = len([d for d in np.unique(assigned) if d >= 0])
+        n_atoms = int(np.count_nonzero(assigned >= 0))
+        info = getattr(self, "domain_info", {}) or {}
+        method = info.get("method", "ENM")
+        sil = info.get("silhouette", None)
+        extra = f", silhouette {sil:.2f}" if isinstance(sil, (float, int)) else ""
+        mode = "Auto" if info.get("auto_domains", False) else "Manual"
+        label.setText(f"{mode}: {n_domains} domains / {n_atoms} atoms ({method}{extra})")
+
+    def detect_domains_from_ui(self, checked=False, n_domains=None, show_messages=True):
+        """Detect ENM domains and expand residue labels to all atoms."""
+        if getattr(self, "atoms_data", None) is None:
+            if show_messages:
+                QMessageBox.warning(self, "Detect Domains", "PDB/CIF structure is not loaded.")
+            return False
+
+        nodes = self._extract_ca_domain_nodes()
+        if nodes is None or nodes["coords"].shape[0] < 2:
+            if show_messages:
+                QMessageBox.warning(self, "Detect Domains", "No C-alpha or P atoms are available for ENM detection.")
+            return False
+
+        if n_domains is None:
+            if self._domain_auto_enabled():
+                n_domains = None
+            else:
+                try:
+                    n_domains = int(self.domain_count_spin.value())
+                except Exception:
+                    n_domains = None
+        auto_domains = n_domains is None
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            residue_domain_ids, suggested_D, info = detect_domains_enm(
+                nodes["coords"],
+                cutoff_nm=1.3,
+                n_modes=8,
+                n_domains=n_domains,
+            )
+        except Exception as e:
+            if show_messages:
+                QMessageBox.critical(self, "Detect Domains", f"Domain detection failed:\n{e}")
+            return False
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        atom_to_node = np.asarray(nodes["atom_to_node"], dtype=int)
+        domain_ids = np.full(len(self.atoms_data["x"]), -1, dtype=int)
+        valid = atom_to_node >= 0
+        domain_ids[valid] = np.asarray(residue_domain_ids, dtype=int)[atom_to_node[valid]]
+
+        self.domain_ids = domain_ids
+        self.domain_residue_keys = list(nodes["residue_keys"])
+        self.domain_ca_atom_indices = np.asarray(nodes["node_indices"], dtype=int)
+        self.domain_info = dict(info or {})
+        self.domain_info["auto_domains"] = bool(auto_domains)
+        self.domain_info["scientific_note"] = (
+            "ENM domains predict potentially flexible regions; judge validity by fit improvement."
+        )
+        self.flexible_fit_result = None
+        self.flexible_fit_report_text = ""
+        if hasattr(self, "save_flex_fit_btn"):
+            self.save_flex_fit_btn.setEnabled(False)
+
+        self._domain_count_update_blocked = True
+        try:
+            self._set_domain_count_widgets(int(suggested_D))
+        finally:
+            self._domain_count_update_blocked = False
+        self._update_domain_controls_enabled()
+
+        self._update_domain_status_label()
+        if getattr(self, "domain_preview_check", None) is not None and self.domain_preview_check.isChecked():
+            self.color_combo.setCurrentText("By Domain")
+        self.update_display()
+
+        if show_messages:
+            QMessageBox.information(
+                self,
+                "Detect Domains",
+                f"Detected {suggested_D} ENM domains from {len(nodes['coords'])} nodes.\n"
+                "ENM domains indicate likely flexible regions; validate them by fit improvement."
+            )
+        return True
+
+    def _clear_domain_state(self):
+        self.domain_ids = None
+        self.domain_residue_keys = []
+        self.domain_ca_atom_indices = []
+        self.domain_info = {}
+        self.flexible_fit_result = None
+        self.flexible_fit_report_text = ""
+        self._set_domain_auto_checked(True)
+        if hasattr(self, "save_flex_fit_btn"):
+            self.save_flex_fit_btn.setEnabled(False)
+        if hasattr(self, "domain_preview_check") and self.domain_preview_check is not None:
+            try:
+                self.domain_preview_check.blockSignals(True)
+                self.domain_preview_check.setChecked(False)
+                self.domain_preview_check.blockSignals(False)
+            except Exception:
+                pass
+        if hasattr(self, "color_combo") and self.color_combo is not None:
+            try:
+                if self.color_combo.currentText() == "By Domain":
+                    self.color_combo.setCurrentText("By Chain")
+            except Exception:
+                pass
+        self._update_domain_status_label()
+        self._update_domain_controls_enabled()
+
     def _rotate_block_degrees(self, axis, angle_deg, request_render=True):
         if abs(float(angle_deg)) < 1e-9:
             return False
@@ -4708,65 +5365,62 @@ class pyNuD_simulator(QMainWindow):
         if not hasattr(self, 'vtk_widget') or self.vtk_widget is None:
             print("Error: VTK widget not found")
             return
-            
+
         try:
             # レンダラー作成
             self.renderer = vtk.vtkRenderer()
             self.renderer.SetBackground(*self.current_bg_color)
-            
+
             # スライダー操作フラグの初期化
             self.tip_slider_pressed = False
-            
+
             # スピンボックスの入力方法フラグ（True=キー入力中, False=マウス/ボタン操作）
             self.scan_size_keyboard_input = False
             self.tip_radius_keyboard_input = False
             self.minitip_radius_keyboard_input = False
             self.tip_angle_keyboard_input = False
-            
+
             # デバウンス用のタイマー
             self.scan_size_debounce_timer = None
             self.tip_radius_debounce_timer = None
             self.minitip_radius_debounce_timer = None
             self.tip_angle_debounce_timer = None
-            
+
             # アンチエイリアシング
             render_window = self.vtk_widget.GetRenderWindow()
             render_window.AddRenderer(self.renderer)
             render_window.SetMultiSamples(4)
-            
+
             # インタラクター設定
             self.interactor = self.vtk_widget.GetRenderWindow().GetInteractor()
 
             # CustomInteractorStyleにメインウィンドウ(self)への参照を渡す
             style = CustomInteractorStyle(self)
             self.interactor.SetInteractorStyle(style)
-            
-            # macOSでのイベントハンドラー問題を回避するため、直接イベントを監視
-            # 元のイベントハンドラーを保存
-            self.original_mouse_press = self.vtk_widget.mousePressEvent
-            self.original_mouse_move = self.vtk_widget.mouseMoveEvent
-            self.original_mouse_release = self.vtk_widget.mouseReleaseEvent
-            
-            self.vtk_widget.mousePressEvent = self.on_mouse_press
-            self.vtk_widget.mouseMoveEvent = self.on_mouse_move
-            self.vtk_widget.mouseReleaseEvent = self.on_mouse_release
-            
+
+            # Ctrl/Shift ドラッグは eventFilter で処理し、通常操作は VTK ネイティブに任せる
+            # （mousePressEvent の差し替えは macOS でプログラム更新後の再描画を阻害する）
+
             # ライティング改善
             self.setup_lighting()
-            
+
             # 座標軸追加
             self.add_axes()
-            
+
             # 初期カメラ設定
             self.reset_camera()
 
             # カメラ変更の同期
             self._attach_vtk_camera_observer()
-            
-            # レンダリング開始
-            self.interactor.Initialize()
+
+            # レンダリング開始（プラグイン版は show 後に Initialize — macOS GL コンテキスト対策）
+            if self._is_vtk_only_plugin():
+                self._vtk_deferred_init = True
+            else:
+                self.interactor.Initialize()
+                self._vtk_deferred_init = False
             self.vtk_initialized = True
-            
+
         except Exception as e:
             print(f"VTK setup error: {e}")
 
@@ -4791,6 +5445,8 @@ class pyNuD_simulator(QMainWindow):
             pass
 
     def _is_dual_mode(self):
+        if self._is_vtk_only_plugin():
+            return False
         if not self.pymol_available:
             return False
         if getattr(self, 'current_structure_type', None) == "mrc":
@@ -4798,6 +5454,8 @@ class pyNuD_simulator(QMainWindow):
         return self.render_backend == "dual"
 
     def _is_pymol_active(self):
+        if self._is_vtk_only_plugin():
+            return False
         return bool(self.pymol_available and self.pymol_cmd is not None and self.render_backend in ("pymol", "dual"))
 
     def _is_pymol_only(self):
@@ -4808,7 +5466,7 @@ class pyNuD_simulator(QMainWindow):
         if backend == "dual":
             backend = "pymol" if self.pymol_available and getattr(self, 'current_structure_type', None) != "mrc" else "vtk"
         self.render_backend = backend
-        if hasattr(self, 'esp_check'):
+        if self._has_esp_check():
             self.esp_check.setEnabled(backend in ("pymol", "dual") and self.pymol_available)
         # Stop pending PyMOL renders when leaving PyMOL modes
         if backend == "vtk":
@@ -4835,7 +5493,11 @@ class pyNuD_simulator(QMainWindow):
 
     def _apply_view_visibility(self):
         """2ペイン/単一表示の可視性を設定"""
-        if not hasattr(self, 'pymol_view_container') or not hasattr(self, 'vtk_view_container'):
+        if self._is_vtk_only_plugin():
+            if getattr(self, "vtk_view_container", None) is not None:
+                self.vtk_view_container.setVisible(True)
+            return
+        if getattr(self, 'pymol_view_container', None) is None or getattr(self, 'vtk_view_container', None) is None:
             return
         if self._is_dual_mode():
             self.pymol_view_container.setVisible(True)
@@ -4849,7 +5511,9 @@ class pyNuD_simulator(QMainWindow):
                 self.vtk_view_container.setVisible(True)
 
     def _update_renderer_combo(self):
-        if not hasattr(self, 'renderer_combo'):
+        if self._is_vtk_only_plugin():
+            return
+        if not self._has_renderer_combo():
             return
         try:
             self.renderer_combo.blockSignals(True)
@@ -4953,6 +5617,113 @@ class pyNuD_simulator(QMainWindow):
             pass
         self.request_render()
 
+    def _ensure_vtk_interactor_ready(self):
+        """Finish VTK interactor init once the widget is shown (macOS plugin GL context)."""
+        if not getattr(self, 'vtk_initialized', False):
+            return False
+        if not getattr(self, '_vtk_deferred_init', False):
+            return True
+        interactor = getattr(self, 'interactor', None)
+        vtk_widget = getattr(self, 'vtk_widget', None)
+        if interactor is None or vtk_widget is None:
+            return False
+        try:
+            if hasattr(vtk_widget, 'makeCurrent'):
+                vtk_widget.makeCurrent()
+            interactor.Initialize()
+            rw = vtk_widget.GetRenderWindow()
+            if rw is not None and hasattr(rw, 'SetFrameBlitModeToBlitToCurrent'):
+                rw.SetFrameBlitModeToBlitToCurrent()
+            self._vtk_deferred_init = False
+            return True
+        except Exception as e:
+            print(f"[WARNING] VTK deferred init failed: {e}")
+            return False
+
+    def _flush_vtk_display(self):
+        """VTKのフレームバッファをQtウィジェットへ反映（左パネル操作後の即時更新用）。"""
+        if self._is_pymol_only():
+            return
+        vtk_widget = getattr(self, 'vtk_widget', None)
+        if vtk_widget is None:
+            return
+        self._ensure_vtk_interactor_ready()
+        try:
+            rw = vtk_widget.GetRenderWindow()
+            if rw is None:
+                return
+
+            renderer = getattr(self, 'renderer', None)
+            if renderer is not None:
+                try:
+                    renderer.Modified()
+                    renderer.ResetCameraClippingRange()
+                except Exception:
+                    pass
+
+            if hasattr(vtk_widget, 'makeCurrent'):
+                vtk_widget.makeCurrent()
+
+            rw.Render()
+            if hasattr(rw, 'Frame'):
+                rw.Frame()
+
+            interactor = getattr(self, 'interactor', None)
+            if interactor is not None:
+                try:
+                    interactor.Render()
+                except Exception:
+                    pass
+
+            # 1px リサイズで Qt/macOS 側の再描画を促す（キャプチャより軽量）
+            w, h = int(vtk_widget.width()), int(vtk_widget.height())
+            if w > 2 and h > 2:
+                vtk_widget.resize(w + 1, h)
+                vtk_widget.resize(w, h)
+
+            if hasattr(vtk_widget, 'paintGL'):
+                try:
+                    vtk_widget.paintGL()
+                except Exception:
+                    pass
+            else:
+                QApplication.sendEvent(vtk_widget, QPaintEvent(vtk_widget.rect()))
+
+            vtk_widget.update()
+            try:
+                vtk_widget.repaint()
+            except Exception:
+                pass
+            parent = vtk_widget.parentWidget()
+            if parent is not None:
+                parent.update()
+                try:
+                    parent.repaint()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _schedule_vtk_flush(self, delay_ms=0):
+        """Display Settings 変更後など、イベント処理完了後に VTK を再描画する。"""
+        if self._is_pymol_only() or getattr(self, 'vtk_widget', None) is None:
+            return
+        if not hasattr(self, '_vtk_flush_timer') or self._vtk_flush_timer is None:
+            self._vtk_flush_timer = QTimer(self)
+            self._vtk_flush_timer.setSingleShot(True)
+            self._vtk_flush_timer.timeout.connect(self._flush_vtk_display)
+        if not hasattr(self, '_vtk_flush_followup_timer') or self._vtk_flush_followup_timer is None:
+            self._vtk_flush_followup_timer = QTimer(self)
+            self._vtk_flush_followup_timer.setSingleShot(True)
+            self._vtk_flush_followup_timer.timeout.connect(self._flush_vtk_display)
+        try:
+            delay = max(0, int(delay_ms))
+            self._vtk_flush_timer.start(delay)
+            if delay == 0:
+                self._vtk_flush_followup_timer.start(40)
+        except Exception:
+            self._flush_vtk_display()
+
     def request_render(self):
         """現在のバックエンドに応じて再描画を要求"""
         if self._is_pymol_active():
@@ -4961,10 +5732,7 @@ class pyNuD_simulator(QMainWindow):
             else:
                 self._request_pymol_widget_update()
         if (not self._is_pymol_only()) and hasattr(self, 'vtk_widget') and self.vtk_widget is not None:
-            try:
-                self.vtk_widget.GetRenderWindow().Render()
-            except Exception:
-                pass
+            self._schedule_vtk_flush(0)
 
     def _request_pymol_widget_update(self):
         """Request PyMOL redraw without forcing an immediate draw outside Qt's GL context."""
@@ -4998,6 +5766,7 @@ class pyNuD_simulator(QMainWindow):
             self.pymol_cmd.png(tmp_path, width, height, dpi=dpi, ray=0, quiet=1)
             pixmap = QPixmap(tmp_path)
             self.pymol_image_label.setPixmap(pixmap)
+            self.pymol_image_label.repaint()
         except Exception:
             pass
 
@@ -5200,7 +5969,7 @@ class pyNuD_simulator(QMainWindow):
                 self._request_pymol_widget_update()
         except Exception:
             pass
-        
+
     def center_on_screen(self):
         """ウィンドウを画面中央に配置"""
         from PyQt5.QtWidgets import QDesktopWidget
@@ -5209,7 +5978,7 @@ class pyNuD_simulator(QMainWindow):
         center_point = desktop.availableGeometry().center()
         frame_geometry.moveCenter(center_point)
         self.move(frame_geometry.topLeft())
-    
+
     def restore_geometry(self):
         """ウィンドウの位置とサイズを復元"""
         try:
@@ -5218,7 +5987,7 @@ class pyNuD_simulator(QMainWindow):
                 self.restoreGeometry(geometry)
         except Exception:
             pass  # 復元に失敗した場合は無視
-    
+
     def save_geometry(self):
         """ウィンドウの位置とサイズを保存"""
         try:
@@ -5226,7 +5995,7 @@ class pyNuD_simulator(QMainWindow):
             self.settings.setValue("geometry", geometry)
         except Exception:
             pass  # 保存に失敗した場合は無視
-        
+
     def setup_ui(self):
         """UIセットアップ"""
         central_widget = QWidget()
@@ -5253,11 +6022,11 @@ class pyNuD_simulator(QMainWindow):
         # ★★★ 修正ここまで ★★★
 
         main_layout = QHBoxLayout(central_widget)
-        
+
         # --- メインのスプリッター ---
         self.main_splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(self.main_splitter)
-        
+
         # --- 左右パネルの作成とスプリッターへの追加 ---
         left_scroll_area = QScrollArea()
         left_panel = self.create_control_panel()
@@ -5266,15 +6035,12 @@ class pyNuD_simulator(QMainWindow):
         self._force_persistent_scrollbars(left_scroll_area, vertical=True, horizontal=False)
         left_scroll_area.setMinimumWidth(280)
         self.main_splitter.addWidget(left_scroll_area)
-        
-        right_scroll_area = QScrollArea()
-        right_scroll_area.setWidgetResizable(True)
-        right_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._force_persistent_scrollbars(right_scroll_area, vertical=True, horizontal=False)
+
+        # VTK/OpenGL は QScrollArea 内だと macOS で再描画が届かないことがあるため、
+        # 右パネルは three_d_viewer と同様にスプリッターへ直接配置する。
         right_panel = self.create_vtk_panel()
-        right_scroll_area.setWidget(right_panel)
-        self.main_splitter.addWidget(right_scroll_area)
-        
+        self.main_splitter.addWidget(right_panel)
+
         self.main_splitter.setSizes([280, 1020])
         self.main_splitter.setCollapsible(0, False)
         self.main_splitter.setCollapsible(1, False)
@@ -5283,7 +6049,7 @@ class pyNuD_simulator(QMainWindow):
         """アプリケーションのメニューバーを作成する"""
         # ヘルプウィンドウの参照を初期化
         self.help_window = None
-        
+
         # QMainWindow標準のメニューバーを取得
         menu_bar = self.menuBar()
         # ウィンドウ内に表示（macOSでも常に表示）
@@ -5303,10 +6069,10 @@ class pyNuD_simulator(QMainWindow):
         load_real_action.setToolTip("Open Real AFM / Aligned image window\nReal AFM / Aligned の表示ウィンドウを開く")
         load_real_action.triggered.connect(self.open_real_afm_image_window)
         menu_bar.addAction(load_real_action)
-        
+
         # 「Help」メニューを作成
         help_menu = menu_bar.addMenu("&Help")
-        
+
         # 「View Help」アクションを作成し、クリックされたらshow_help_windowを呼び出す
         show_help_action = QAction("View Help...", self)
         show_help_action.setShortcut("F1")
@@ -5409,6 +6175,96 @@ class pyNuD_simulator(QMainWindow):
             return
         self._ensure_afm_appearance_window(show=True)
 
+    def _create_appearance_slider_for_spin(self, spin_box):
+        """Create a horizontal slider synchronized to an AFM Appearance spin box."""
+        spin_box.setFixedWidth(88)
+        spin_box.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+        slider = QSlider(Qt.Horizontal)
+        slider.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        if spin_box.toolTip():
+            slider.setToolTip(spin_box.toolTip())
+            slider.setStatusTip(spin_box.toolTip())
+
+        if isinstance(spin_box, QDoubleSpinBox):
+            decimals = max(0, min(int(spin_box.decimals()), 4))
+            scale = 10 ** decimals
+            single_step = max(1, int(round(float(spin_box.singleStep()) * scale)))
+        else:
+            scale = 1
+            single_step = max(1, int(getattr(spin_box, 'singleStep', lambda: 1)()))
+
+        slider.setRange(int(round(float(spin_box.minimum()) * scale)), int(round(float(spin_box.maximum()) * scale)))
+        slider.setSingleStep(single_step)
+        slider.setPageStep(max(single_step, single_step * 10))
+        slider.setValue(int(round(float(spin_box.value()) * scale)))
+
+        if not hasattr(self, 'appearance_spin_slider_bindings'):
+            self.appearance_spin_slider_bindings = []
+        self.appearance_spin_slider_bindings.append({
+            'spin': spin_box,
+            'slider': slider,
+            'scale': float(scale),
+        })
+
+        spin_box.valueChanged.connect(lambda _value, sb=spin_box: self._sync_appearance_slider_from_spin(sb))
+        slider.valueChanged.connect(lambda value, sb=spin_box: self._set_appearance_spin_from_slider(sb, value))
+        return slider
+
+    def _add_appearance_spin_row(self, layout, row, label_text, spin_box):
+        """Add label, slider, and compact spin box to an AFM Appearance grid row."""
+        layout.addWidget(QLabel(label_text), row, 0)
+        slider = self._create_appearance_slider_for_spin(spin_box)
+        layout.addWidget(slider, row, 1)
+        layout.addWidget(spin_box, row, 2)
+        return slider
+
+    def _appearance_slider_binding_for_spin(self, spin_box):
+        for binding in getattr(self, 'appearance_spin_slider_bindings', []):
+            if binding.get('spin') is spin_box:
+                return binding
+        return None
+
+    def _sync_appearance_slider_from_spin(self, spin_box):
+        binding = self._appearance_slider_binding_for_spin(spin_box)
+        if not binding:
+            return
+        slider = binding['slider']
+        scale = float(binding['scale'])
+        value = int(round(float(spin_box.value()) * scale))
+        if slider.value() == value:
+            return
+        try:
+            slider.blockSignals(True)
+            slider.setValue(value)
+        finally:
+            slider.blockSignals(False)
+
+    def _set_appearance_spin_from_slider(self, spin_box, slider_value):
+        binding = self._appearance_slider_binding_for_spin(spin_box)
+        if not binding:
+            return
+        scale = float(binding['scale'])
+        if isinstance(spin_box, QDoubleSpinBox):
+            value = float(slider_value) / scale
+        else:
+            value = int(slider_value)
+        if spin_box.value() == value:
+            return
+        spin_box.setValue(value)
+
+    def _set_appearance_spin_enabled(self, spin_box, enabled):
+        spin_box.setEnabled(bool(enabled))
+        binding = self._appearance_slider_binding_for_spin(spin_box)
+        if binding:
+            binding['slider'].setEnabled(bool(enabled))
+
+    def _sync_appearance_sliders_from_spins(self):
+        for binding in getattr(self, 'appearance_spin_slider_bindings', []):
+            spin_box = binding.get('spin')
+            if spin_box is not None:
+                self._sync_appearance_slider_from_spin(spin_box)
+
     def create_control_panel(self):
         """左側のコントロールパネル作成"""
         panel = QWidget()
@@ -5422,15 +6278,15 @@ class pyNuD_simulator(QMainWindow):
             QGroupBox {
                 font-size: 11px;
             }
-            QLabel, QCheckBox, QPushButton, QComboBox, QDoubleSpinBox {
+            QLabel, QCheckBox, QPushButton, QComboBox, QDoubleSpinBox, QSpinBox {
                 font-size: 11px;
             }
         """)
-        
+
         # File Import (統合: PDB/CIF/MRC)
         file_import_group = QGroupBox("File Import")
         file_import_layout = QVBoxLayout(file_import_group)
-        
+
         self.import_btn = QPushButton("Import File...")
         self.import_btn.setMinimumHeight(35)
         self.import_btn.setToolTip("Load structure file (PDB/CIF/MRC) for AFM simulation\nAFMシミュレーション用の構造ファイル（PDB/CIF/MRC）を読み込み")
@@ -5453,14 +6309,14 @@ class pyNuD_simulator(QMainWindow):
         self.file_label = QLabel("File Name: (none)")
         self.file_label.setStyleSheet("color: #666; font-size: 12px;")
         file_import_layout.addWidget(self.file_label)
-        
+
         # プログレスバー
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         file_import_layout.addWidget(self.progress_bar)
 
         layout.addWidget(file_import_group)
-        
+
         # ★★★ Density Thresholdセクションを追加 ★★★
         self.mrc_group = QGroupBox("Density Threshold")
         mrc_layout = QGridLayout(self.mrc_group)
@@ -5491,7 +6347,7 @@ class pyNuD_simulator(QMainWindow):
         # 表示設定
         display_group = QGroupBox("Display Settings")
         display_layout = QGridLayout(display_group)
-        
+
         # 表示スタイル
         display_layout.addWidget(QLabel("Style:"), 0, 0)
         self.style_combo = QComboBox()
@@ -5500,23 +6356,23 @@ class pyNuD_simulator(QMainWindow):
         ])
         self.style_combo.currentTextChanged.connect(self.update_display)
         display_layout.addWidget(self.style_combo, 0, 1)
-        
+
         # カラーリング
         display_layout.addWidget(QLabel("Color:"), 1, 0)
         self.color_combo = QComboBox()
         self.color_combo.addItems([
-            "By Element", "By Chain", "Single Color", "By B-Factor"
+            "By Element", "By Chain", "By Domain", "Single Color", "By B-Factor"
         ])
         self.color_combo.currentTextChanged.connect(self.on_color_scheme_changed)
         display_layout.addWidget(self.color_combo, 1, 1)
-        
+
         # 原子選択
         display_layout.addWidget(QLabel("Show:"), 2, 0)
         self.atom_combo = QComboBox()
         self.atom_combo.addItems(["All Atoms", "Heavy Atoms", "Backbone", "C", "N", "O"])
         self.atom_combo.currentTextChanged.connect(self.update_display)
         display_layout.addWidget(self.atom_combo, 2, 1)
-        
+
         # サイズ
         display_layout.addWidget(QLabel("Size:"), 3, 0)
         self.size_slider = QSlider(Qt.Horizontal)
@@ -5524,7 +6380,7 @@ class pyNuD_simulator(QMainWindow):
         self.size_slider.setValue(100)
         self.size_slider.valueChanged.connect(self.update_display)
         display_layout.addWidget(self.size_slider, 3, 1)
-        
+
         # 透明度
         display_layout.addWidget(QLabel("Opacity:"), 4, 0)
         self.opacity_slider = QSlider(Qt.Horizontal)
@@ -5532,7 +6388,7 @@ class pyNuD_simulator(QMainWindow):
         self.opacity_slider.setValue(100)
         self.opacity_slider.valueChanged.connect(self.update_display)
         display_layout.addWidget(self.opacity_slider, 4, 1)
-        
+
         # 品質設定
         display_layout.addWidget(QLabel("Quality:"), 5, 0)
         self.quality_combo = QComboBox()
@@ -5541,26 +6397,30 @@ class pyNuD_simulator(QMainWindow):
         self.quality_combo.currentTextChanged.connect(self.update_display)
         display_layout.addWidget(self.quality_combo, 5, 1)
 
-        # レンダラー選択（PyMOL/VTK）
-        display_layout.addWidget(QLabel("Renderer:"), 6, 0)
-        self.renderer_combo = QComboBox()
-        # 初期は両方用意（後でsetup_pymolで更新）
-        self.renderer_combo.addItems(["PyMOL (image)", "VTK (interactive)"])
-        self.renderer_combo.currentTextChanged.connect(self.on_renderer_changed)
-        display_layout.addWidget(self.renderer_combo, 6, 1)
+        if not self._is_vtk_only_plugin():
+            # レンダラー選択（PyMOL/VTK）— スタンドアロン pyNuD Simulator のみ
+            display_layout.addWidget(QLabel("Renderer:"), 6, 0)
+            self.renderer_combo = QComboBox()
+            self.renderer_combo.addItems(["PyMOL (image)", "VTK (interactive)"])
+            self.renderer_combo.currentTextChanged.connect(self.on_renderer_changed)
+            display_layout.addWidget(self.renderer_combo, 6, 1)
 
-        # 表面電荷（ESP）表示
-        self.esp_check = QCheckBox("Electrostatics (ESP)")
-        self.esp_check.setToolTip("Show electrostatic surface (Red-White-Blue)\n表面電荷（ESP）を表示")
-        self.esp_check.toggled.connect(self.display_electrostatics)
-        display_layout.addWidget(self.esp_check, 7, 0, 1, 2)
-        
+            # 表面電荷（ESP）表示 — PyMOL 専用
+            self.esp_check = QCheckBox("Electrostatics (ESP)")
+            self.esp_check.setToolTip("Show electrostatic surface (Red-White-Blue)\n表面電荷（ESP）を表示")
+            self.esp_check.toggled.connect(self.display_electrostatics)
+            display_layout.addWidget(self.esp_check, 7, 0, 1, 2)
+        else:
+            self.renderer_combo = None
+            self.esp_check = None
+
         layout.addWidget(display_group)
-        
+        self._wire_display_settings_to_impose_overlay()
+
         # カラー・ライティング設定
         color_group = QGroupBox("Color & Lighting Settings")
         color_layout = QGridLayout(color_group)
-        
+
         # 背景色設定
         color_layout.addWidget(QLabel("Background:"), 0, 0)
         self.bg_color_btn = QPushButton("Choose Color")
@@ -5578,7 +6438,7 @@ class pyNuD_simulator(QMainWindow):
         """)
         self.bg_color_btn.clicked.connect(self.choose_background_color)
         color_layout.addWidget(self.bg_color_btn, 0, 1)
-        
+
         # 明るさ調整
         color_layout.addWidget(QLabel("Brightness:"), 1, 0)
         self.brightness_slider = QSlider(Qt.Horizontal)
@@ -5588,11 +6448,11 @@ class pyNuD_simulator(QMainWindow):
         self.brightness_factor = initial_brightness / 100.0
         self.brightness_slider.valueChanged.connect(self.update_brightness)
         color_layout.addWidget(self.brightness_slider, 1, 1)
-        
+
         self.brightness_label = QLabel(f"{initial_brightness}%")
         self.brightness_label.setMinimumWidth(40)
         color_layout.addWidget(self.brightness_label, 1, 2)
-        
+
         # 単色モード用カラー選択
         color_layout.addWidget(QLabel("Single Color:"), 2, 0)
         self.single_color_btn = QPushButton("Choose Color")
@@ -5607,10 +6467,15 @@ class pyNuD_simulator(QMainWindow):
             QPushButton:hover {
                 border-color: #777;
             }
+            QPushButton:disabled {
+                background-color: #b8b8b8;
+                color: #666;
+                border-color: #aaa;
+            }
         """)
         self.single_color_btn.clicked.connect(self.choose_single_color)
         color_layout.addWidget(self.single_color_btn, 2, 1)
-        
+
         # 環境光設定
         color_layout.addWidget(QLabel("Ambient:"), 3, 0)
         self.ambient_slider = QSlider(Qt.Horizontal)
@@ -5619,11 +6484,11 @@ class pyNuD_simulator(QMainWindow):
         self.ambient_slider.setValue(initial_ambient)
         self.ambient_slider.valueChanged.connect(self.update_lighting)
         color_layout.addWidget(self.ambient_slider, 3, 1)
-        
+
         self.ambient_label = QLabel(f"{initial_ambient}%")
         self.ambient_label.setMinimumWidth(40)
         color_layout.addWidget(self.ambient_label, 3, 2)
-        
+
         # スペキュラ設定
         color_layout.addWidget(QLabel("Specular:"), 4, 0)
         self.specular_slider = QSlider(Qt.Horizontal)
@@ -5631,11 +6496,11 @@ class pyNuD_simulator(QMainWindow):
         self.specular_slider.setValue(60)
         self.specular_slider.valueChanged.connect(self.update_material)
         color_layout.addWidget(self.specular_slider, 4, 1)
-        
+
         self.specular_label = QLabel("60%")
         self.specular_label.setMinimumWidth(40)
         color_layout.addWidget(self.specular_label, 4, 2)
-        
+
         dark_btn = QPushButton("Dark Theme")
         dark_btn.setStyleSheet("""
             QPushButton {
@@ -5651,8 +6516,9 @@ class pyNuD_simulator(QMainWindow):
         """)
         dark_btn.clicked.connect(self.apply_dark_theme)
         color_layout.addWidget(dark_btn, 5, 0, 1, 3)
-        
+
         layout.addWidget(color_group)
+        self._update_single_color_control_state()
 
 
         # AFM探針設定
@@ -5705,7 +6571,7 @@ class pyNuD_simulator(QMainWindow):
         self.tip_angle_spin.editingFinished.connect(self.tip_angle_editing_finished)
         self.tip_angle_spin.keyPressEvent = self.tip_angle_key_press_event
         tip_layout.addWidget(self.tip_angle_spin, 3, 1)
-        
+
         # Row 4: Tip Info
         self.tip_info_label = QLabel("Tip Info: -")
         self.tip_info_label.setStyleSheet("""
@@ -5718,11 +6584,11 @@ class pyNuD_simulator(QMainWindow):
         tip_layout.addWidget(self.tip_info_label, 4, 0, 1, 2)
 
         layout.addWidget(tip_group)
-        
+
         # 探針位置制御
         pos_group = QGroupBox("Tip Position Control")
         pos_layout = QGridLayout(pos_group)
-        
+
         # X位置
         pos_layout.addWidget(QLabel("X (nm):"), 0, 0)
         self.tip_x_slider = QSlider(Qt.Horizontal)
@@ -5736,7 +6602,7 @@ class pyNuD_simulator(QMainWindow):
         self.tip_x_label = QLabel("0.0")
         self.tip_x_label.setMinimumWidth(30)
         pos_layout.addWidget(self.tip_x_label, 0, 2)
-        
+
         # Y位置
         pos_layout.addWidget(QLabel("Y (nm):"), 1, 0)
         self.tip_y_slider = QSlider(Qt.Horizontal)
@@ -5750,7 +6616,7 @@ class pyNuD_simulator(QMainWindow):
         self.tip_y_label = QLabel("0.0")
         self.tip_y_label.setMinimumWidth(30)
         pos_layout.addWidget(self.tip_y_label, 1, 2)
-        
+
         # Z位置
         pos_layout.addWidget(QLabel("Z (nm):"), 2, 0)
         self.tip_z_slider = QSlider(Qt.Horizontal)
@@ -5764,13 +6630,13 @@ class pyNuD_simulator(QMainWindow):
         self.tip_z_label = QLabel("5.0")
         self.tip_z_label.setMinimumWidth(30)
         pos_layout.addWidget(self.tip_z_label, 2, 2)
-        
+
         layout.addWidget(pos_group)
-        
+
         # シミュレーション設定
         sim_group = QGroupBox("AFM Simulation")
         sim_layout = QGridLayout(sim_group)
-        
+
         # スキャンサイズ (X/Y)
         sim_layout.addWidget(QLabel("Scan Size X (nm):"), 0, 0)
         self.spinScanXNm = QDoubleSpinBox()
@@ -5857,7 +6723,7 @@ class pyNuD_simulator(QMainWindow):
         finally:
             self.interactive_update_check.blockSignals(False)
         sim_layout.addWidget(self.interactive_update_check, 7, 0, 1, 2)
-        
+
         # Consider VDW check
         self.use_vdw_check = QCheckBox("Consider atom size (vdW)")
         self.use_vdw_check.setToolTip("Treat atoms as spheres with van der Waals radii instead of points\n原子を点ではなくファンデルワールス半径を持つ球として扱う")
@@ -5887,7 +6753,7 @@ class pyNuD_simulator(QMainWindow):
         self.simulate_btn.clicked.connect(self.run_simulation)
         self.simulate_btn.setEnabled(False)
         sim_layout.addWidget(self.simulate_btn, 9, 0, 1, 2)
-        
+
         layout.addWidget(sim_group)
 
         # AFM Appearance (filters + noise/artifacts)
@@ -5902,21 +6768,21 @@ class pyNuD_simulator(QMainWindow):
             "Apply FFT low-pass filter to match experimental resolution\n"
             "FFTローパスフィルターを適用して実験解像度に合わせる"
         )
-        lowpass_layout.addWidget(self.apply_filter_check, 0, 0, 1, 2)
+        lowpass_layout.addWidget(self.apply_filter_check, 0, 0, 1, 3)
 
-        lowpass_layout.addWidget(QLabel("Cutoff Wavelength (nm):"), 1, 0)
         self.filter_cutoff_spin = QDoubleSpinBox()
         self.filter_cutoff_spin.setRange(0.1, 20.0)
         self.filter_cutoff_spin.setValue(2.0)
         self.filter_cutoff_spin.setDecimals(1)
         self.filter_cutoff_spin.setSingleStep(0.1)
         self.filter_cutoff_spin.setToolTip("Cutoff wavelength for low-pass filter\nローパスフィルターのカットオフ波長")
-        lowpass_layout.addWidget(self.filter_cutoff_spin, 1, 1)
+        self.filter_cutoff_slider = self._add_appearance_spin_row(lowpass_layout, 1, "Cutoff Wavelength (nm):", self.filter_cutoff_spin)
 
-        self.apply_filter_check.toggled.connect(self.filter_cutoff_spin.setEnabled)
+        self.apply_filter_check.toggled.connect(lambda checked: self._set_appearance_spin_enabled(self.filter_cutoff_spin, checked))
         self.apply_filter_check.toggled.connect(self.process_and_display_all_images)
         self.filter_cutoff_spin.valueChanged.connect(self.start_filter_update_timer)
-        self.filter_cutoff_spin.setEnabled(False)
+        self._set_appearance_spin_enabled(self.filter_cutoff_spin, False)
+        lowpass_layout.setColumnStretch(1, 1)
 
         appearance_layout.addLayout(lowpass_layout)
 
@@ -5931,104 +6797,99 @@ class pyNuD_simulator(QMainWindow):
         appearance_layout.addWidget(noise_header)
 
         noise_layout = QGridLayout()
+        noise_layout.setColumnStretch(1, 1)
         row = 0
 
         self.chkNoiseEnable = QCheckBox("Enable Physical Noise")
-        noise_layout.addWidget(self.chkNoiseEnable, row, 0, 1, 2)
+        noise_layout.addWidget(self.chkNoiseEnable, row, 0, 1, 3)
         row += 1
 
         self.chkUseNoiseSeed = QCheckBox("Use fixed seed")
-        noise_layout.addWidget(self.chkUseNoiseSeed, row, 0, 1, 2)
+        noise_layout.addWidget(self.chkUseNoiseSeed, row, 0, 1, 3)
         row += 1
 
-        noise_layout.addWidget(QLabel("Seed:"), row, 0)
         self.spinNoiseSeed = QSpinBox()
         self.spinNoiseSeed.setRange(0, 2_147_483_647)
         self.spinNoiseSeed.setValue(42)
-        noise_layout.addWidget(self.spinNoiseSeed, row, 1)
+        self.sliderNoiseSeed = self._add_appearance_spin_row(noise_layout, row, "Seed:", self.spinNoiseSeed)
         row += 1
 
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.HLine)
         sep2.setFrameShadow(QFrame.Sunken)
-        noise_layout.addWidget(sep2, row, 0, 1, 2)
+        noise_layout.addWidget(sep2, row, 0, 1, 3)
         row += 1
 
         # Height Noise
         self.chkHeightNoise = QCheckBox("Height Noise")
-        noise_layout.addWidget(self.chkHeightNoise, row, 0, 1, 2)
+        noise_layout.addWidget(self.chkHeightNoise, row, 0, 1, 3)
         row += 1
 
-        noise_layout.addWidget(QLabel("sigma (nm):"), row, 0)
         self.spinHeightNoiseSigmaNm = QDoubleSpinBox()
         self.spinHeightNoiseSigmaNm.setRange(0.0, 5.0)
         self.spinHeightNoiseSigmaNm.setValue(0.1)
         self.spinHeightNoiseSigmaNm.setDecimals(3)
         self.spinHeightNoiseSigmaNm.setSingleStep(0.01)
-        noise_layout.addWidget(self.spinHeightNoiseSigmaNm, row, 1)
+        self.sliderHeightNoiseSigmaNm = self._add_appearance_spin_row(noise_layout, row, "sigma (nm):", self.spinHeightNoiseSigmaNm)
         row += 1
 
         # Line Noise
         self.chkLineNoise = QCheckBox("Line Noise")
-        noise_layout.addWidget(self.chkLineNoise, row, 0, 1, 2)
+        noise_layout.addWidget(self.chkLineNoise, row, 0, 1, 3)
         row += 1
 
-        noise_layout.addWidget(QLabel("sigma_line (nm):"), row, 0)
         self.spinLineNoiseSigmaNm = QDoubleSpinBox()
         self.spinLineNoiseSigmaNm.setRange(0.0, 5.0)
         self.spinLineNoiseSigmaNm.setValue(0.05)
         self.spinLineNoiseSigmaNm.setDecimals(3)
         self.spinLineNoiseSigmaNm.setSingleStep(0.01)
-        noise_layout.addWidget(self.spinLineNoiseSigmaNm, row, 1)
+        self.sliderLineNoiseSigmaNm = self._add_appearance_spin_row(noise_layout, row, "sigma_line (nm):", self.spinLineNoiseSigmaNm)
         row += 1
 
         noise_layout.addWidget(QLabel("mode:"), row, 0)
         self.comboLineNoiseMode = QComboBox()
         self.comboLineNoiseMode.addItems(["offset", "rw"])
-        noise_layout.addWidget(self.comboLineNoiseMode, row, 1)
+        noise_layout.addWidget(self.comboLineNoiseMode, row, 1, 1, 2)
         row += 1
 
         # Drift
         self.chkDrift = QCheckBox("Drift")
-        noise_layout.addWidget(self.chkDrift, row, 0, 1, 2)
+        noise_layout.addWidget(self.chkDrift, row, 0, 1, 3)
         row += 1
 
-        noise_layout.addWidget(QLabel("vx (nm/line):"), row, 0)
         self.spinDriftVxNmPerLine = QDoubleSpinBox()
         self.spinDriftVxNmPerLine.setRange(-5.0, 5.0)
         self.spinDriftVxNmPerLine.setValue(0.0)
         self.spinDriftVxNmPerLine.setDecimals(3)
         self.spinDriftVxNmPerLine.setSingleStep(0.01)
-        noise_layout.addWidget(self.spinDriftVxNmPerLine, row, 1)
+        self.sliderDriftVxNmPerLine = self._add_appearance_spin_row(noise_layout, row, "vx (nm/line):", self.spinDriftVxNmPerLine)
         row += 1
 
-        noise_layout.addWidget(QLabel("vy (nm/line):"), row, 0)
         self.spinDriftVyNmPerLine = QDoubleSpinBox()
         self.spinDriftVyNmPerLine.setRange(-5.0, 5.0)
         self.spinDriftVyNmPerLine.setValue(0.0)
         self.spinDriftVyNmPerLine.setDecimals(3)
         self.spinDriftVyNmPerLine.setSingleStep(0.01)
-        noise_layout.addWidget(self.spinDriftVyNmPerLine, row, 1)
+        self.sliderDriftVyNmPerLine = self._add_appearance_spin_row(noise_layout, row, "vy (nm/line):", self.spinDriftVyNmPerLine)
         row += 1
 
-        noise_layout.addWidget(QLabel("jitter (nm/line):"), row, 0)
         self.spinDriftJitterNmPerLine = QDoubleSpinBox()
         self.spinDriftJitterNmPerLine.setRange(0.0, 5.0)
         self.spinDriftJitterNmPerLine.setValue(0.0)
         self.spinDriftJitterNmPerLine.setDecimals(3)
         self.spinDriftJitterNmPerLine.setSingleStep(0.01)
-        noise_layout.addWidget(self.spinDriftJitterNmPerLine, row, 1)
+        self.sliderDriftJitterNmPerLine = self._add_appearance_spin_row(noise_layout, row, "jitter (nm/line):", self.spinDriftJitterNmPerLine)
         row += 1
 
         # Feedback/Scan artifacts
         self.chkFeedbackLag = QCheckBox("Feedback Lag")
-        noise_layout.addWidget(self.chkFeedbackLag, row, 0, 1, 2)
+        noise_layout.addWidget(self.chkFeedbackLag, row, 0, 1, 3)
         row += 1
 
         noise_layout.addWidget(QLabel("mode:"), row, 0)
         self.comboFeedbackMode = QComboBox()
         self.comboFeedbackMode.addItems(["linear_lag", "tapping_parachute"])
-        noise_layout.addWidget(self.comboFeedbackMode, row, 1)
+        noise_layout.addWidget(self.comboFeedbackMode, row, 1, 1, 2)
         row += 1
 
         noise_layout.addWidget(QLabel("Scan Direction:"), row, 0)
@@ -6036,53 +6897,48 @@ class pyNuD_simulator(QMainWindow):
         self.comboScanDirection.addItem("Left -> Right", "L2R")
         self.comboScanDirection.addItem("Right -> Left", "R2L")
         self.comboScanDirection.setCurrentIndex(0)
-        noise_layout.addWidget(self.comboScanDirection, row, 1)
+        noise_layout.addWidget(self.comboScanDirection, row, 1, 1, 2)
         row += 1
 
-        noise_layout.addWidget(QLabel("tau (lines):"), row, 0)
         self.spinLagTauLines = QDoubleSpinBox()
         self.spinLagTauLines.setRange(0.1, 100.0)
         self.spinLagTauLines.setValue(2.0)
         self.spinLagTauLines.setDecimals(2)
         self.spinLagTauLines.setSingleStep(0.1)
-        noise_layout.addWidget(self.spinLagTauLines, row, 1)
+        self.sliderLagTauLines = self._add_appearance_spin_row(noise_layout, row, "tau (lines):", self.spinLagTauLines)
         row += 1
 
         # Tapping parachute parameters (mode-specific)
-        noise_layout.addWidget(QLabel("tap drop (nm):"), row, 0)
         self.spinTapDropThresholdNm = QDoubleSpinBox()
         self.spinTapDropThresholdNm.setRange(0.0, 10.0)
         self.spinTapDropThresholdNm.setValue(1.0)
         self.spinTapDropThresholdNm.setDecimals(2)
         self.spinTapDropThresholdNm.setSingleStep(0.1)
-        noise_layout.addWidget(self.spinTapDropThresholdNm, row, 1)
+        self.sliderTapDropThresholdNm = self._add_appearance_spin_row(noise_layout, row, "tap drop (nm):", self.spinTapDropThresholdNm)
         row += 1
 
-        noise_layout.addWidget(QLabel("tap tau_track (lines):"), row, 0)
         self.spinTapTauTrackLines = QDoubleSpinBox()
         self.spinTapTauTrackLines.setRange(0.1, 100.0)
         self.spinTapTauTrackLines.setValue(2.0)
         self.spinTapTauTrackLines.setDecimals(2)
         self.spinTapTauTrackLines.setSingleStep(0.1)
-        noise_layout.addWidget(self.spinTapTauTrackLines, row, 1)
+        self.sliderTapTauTrackLines = self._add_appearance_spin_row(noise_layout, row, "tap tau_track (lines):", self.spinTapTauTrackLines)
         row += 1
 
-        noise_layout.addWidget(QLabel("tap tau_para (lines):"), row, 0)
         self.spinTapTauParachuteLines = QDoubleSpinBox()
         self.spinTapTauParachuteLines.setRange(0.1, 200.0)
         self.spinTapTauParachuteLines.setValue(15.0)
         self.spinTapTauParachuteLines.setDecimals(2)
         self.spinTapTauParachuteLines.setSingleStep(0.5)
-        noise_layout.addWidget(self.spinTapTauParachuteLines, row, 1)
+        self.sliderTapTauParachuteLines = self._add_appearance_spin_row(noise_layout, row, "tap tau_para (lines):", self.spinTapTauParachuteLines)
         row += 1
 
-        noise_layout.addWidget(QLabel("tap release (nm):"), row, 0)
         self.spinTapReleaseThresholdNm = QDoubleSpinBox()
         self.spinTapReleaseThresholdNm.setRange(0.0, 10.0)
         self.spinTapReleaseThresholdNm.setValue(0.3)
         self.spinTapReleaseThresholdNm.setDecimals(2)
         self.spinTapReleaseThresholdNm.setSingleStep(0.05)
-        noise_layout.addWidget(self.spinTapReleaseThresholdNm, row, 1)
+        self.sliderTapReleaseThresholdNm = self._add_appearance_spin_row(noise_layout, row, "tap release (nm):", self.spinTapReleaseThresholdNm)
         row += 1
 
         appearance_layout.addLayout(noise_layout)
@@ -6116,28 +6972,28 @@ class pyNuD_simulator(QMainWindow):
                 pass
 
         self._update_noise_ui_states()
-        
+
         #self.update_tip_ui(self.tip_shape_combo.currentText())
-        
+
         return panel
-        
-    
+
+
     def update_tip_ui(self, shape):
         """探針設定UIの表示を、選択された形状に応じて更新する"""
         shape = shape.lower()
-        
+
         is_sphere = (shape == "sphere")
         is_cone = (shape == "cone")
-        
+
         # Minitip Radius widgets visibility
         self.minitip_label.setVisible(is_sphere)
         self.minitip_radius_spin.setVisible(is_sphere)
-        
+
         # Angle widgets visibility/enabled state
         angle_is_relevant = is_cone or is_sphere
         self.tip_angle_label.setEnabled(angle_is_relevant)
         self.tip_angle_spin.setEnabled(angle_is_relevant)
-        
+
         # Trigger a tip redraw
         self.update_tip()
 
@@ -6151,19 +7007,19 @@ class pyNuD_simulator(QMainWindow):
         if hasattr(self, 'chkUseNoiseSeed'):
             self.chkUseNoiseSeed.setEnabled(noise_on)
         if hasattr(self, 'spinNoiseSeed') and hasattr(self, 'chkUseNoiseSeed'):
-            self.spinNoiseSeed.setEnabled(noise_on and self.chkUseNoiseSeed.isChecked())
+            self._set_appearance_spin_enabled(self.spinNoiseSeed, noise_on and self.chkUseNoiseSeed.isChecked())
 
         # Height noise
         if hasattr(self, 'chkHeightNoise'):
             self.chkHeightNoise.setEnabled(noise_on)
         if hasattr(self, 'spinHeightNoiseSigmaNm') and hasattr(self, 'chkHeightNoise'):
-            self.spinHeightNoiseSigmaNm.setEnabled(noise_on and self.chkHeightNoise.isChecked())
+            self._set_appearance_spin_enabled(self.spinHeightNoiseSigmaNm, noise_on and self.chkHeightNoise.isChecked())
 
         # Line noise
         if hasattr(self, 'chkLineNoise'):
             self.chkLineNoise.setEnabled(noise_on)
         if hasattr(self, 'spinLineNoiseSigmaNm') and hasattr(self, 'chkLineNoise'):
-            self.spinLineNoiseSigmaNm.setEnabled(noise_on and self.chkLineNoise.isChecked())
+            self._set_appearance_spin_enabled(self.spinLineNoiseSigmaNm, noise_on and self.chkLineNoise.isChecked())
         if hasattr(self, 'comboLineNoiseMode') and hasattr(self, 'chkLineNoise'):
             self.comboLineNoiseMode.setEnabled(noise_on and self.chkLineNoise.isChecked())
 
@@ -6172,11 +7028,11 @@ class pyNuD_simulator(QMainWindow):
             self.chkDrift.setEnabled(noise_on)
         drift_on = noise_on and hasattr(self, 'chkDrift') and self.chkDrift.isChecked()
         if hasattr(self, 'spinDriftVxNmPerLine'):
-            self.spinDriftVxNmPerLine.setEnabled(drift_on)
+            self._set_appearance_spin_enabled(self.spinDriftVxNmPerLine, drift_on)
         if hasattr(self, 'spinDriftVyNmPerLine'):
-            self.spinDriftVyNmPerLine.setEnabled(drift_on)
+            self._set_appearance_spin_enabled(self.spinDriftVyNmPerLine, drift_on)
         if hasattr(self, 'spinDriftJitterNmPerLine'):
-            self.spinDriftJitterNmPerLine.setEnabled(drift_on)
+            self._set_appearance_spin_enabled(self.spinDriftJitterNmPerLine, drift_on)
 
         # Feedback artifacts (single scan direction)
         if hasattr(self, 'chkFeedbackLag'):
@@ -6192,18 +7048,18 @@ class pyNuD_simulator(QMainWindow):
         if hasattr(self, 'comboScanDirection'):
             self.comboScanDirection.setEnabled(lag_on)
         if hasattr(self, 'spinLagTauLines'):
-            self.spinLagTauLines.setEnabled(lag_on)
+            self._set_appearance_spin_enabled(self.spinLagTauLines, lag_on)
 
         # Tapping parachute params
         tap_on = lag_on and (mode == "tapping_parachute")
         if hasattr(self, 'spinTapDropThresholdNm'):
-            self.spinTapDropThresholdNm.setEnabled(tap_on)
+            self._set_appearance_spin_enabled(self.spinTapDropThresholdNm, tap_on)
         if hasattr(self, 'spinTapTauTrackLines'):
-            self.spinTapTauTrackLines.setEnabled(tap_on)
+            self._set_appearance_spin_enabled(self.spinTapTauTrackLines, tap_on)
         if hasattr(self, 'spinTapTauParachuteLines'):
-            self.spinTapTauParachuteLines.setEnabled(tap_on)
+            self._set_appearance_spin_enabled(self.spinTapTauParachuteLines, tap_on)
         if hasattr(self, 'spinTapReleaseThresholdNm'):
-            self.spinTapReleaseThresholdNm.setEnabled(tap_on)
+            self._set_appearance_spin_enabled(self.spinTapReleaseThresholdNm, tap_on)
 
     def apply_noise_artifacts(self, height_nm, pixel_x_nm, pixel_y_nm):
         """Apply physical noise/artifacts to height map in nm."""
@@ -6246,7 +7102,7 @@ class pyNuD_simulator(QMainWindow):
             vx = float(self.spinDriftVxNmPerLine.value()) if hasattr(self, 'spinDriftVxNmPerLine') else 0.0
             vy = float(self.spinDriftVyNmPerLine.value()) if hasattr(self, 'spinDriftVyNmPerLine') else 0.0
             jitter = float(self.spinDriftJitterNmPerLine.value()) if hasattr(self, 'spinDriftJitterNmPerLine') else 0.0
-            
+
             shifted = np.zeros_like(height)
             for y in range(ny):
                 dx_nm = vx * y + rng.normal(0.0, jitter)
@@ -6691,6 +7547,14 @@ class pyNuD_simulator(QMainWindow):
             self.update_afm_display()
         except Exception:
             pass
+        try:
+            self._update_model_overlay()
+        except Exception:
+            pass
+        try:
+            self._update_difference_panel()
+        except Exception:
+            pass
 
     def sync_sim_params_to_real(self):
         """Sync simulator scan params to Real AFM metadata."""
@@ -6971,15 +7835,44 @@ class pyNuD_simulator(QMainWindow):
 
     def _get_real_afm_simulation_meta(self):
         """Return (scan_x_nm, scan_y_nm, nx, ny) from loaded ASD metadata."""
-        if self.real_afm_nm is None or not getattr(self, "real_meta", None):
+        if self.real_afm_nm is None:
             return None
-        try:
-            scan_x_nm = float(self.real_meta.get('scan_x_nm', 0.0))
-            scan_y_nm = float(self.real_meta.get('scan_y_nm', 0.0))
-            nx = int(self.real_meta.get('nx', 0))
-            ny = int(self.real_meta.get('ny', 0))
-        except Exception:
-            return None
+        scan_x_nm = scan_y_nm = 0.0
+        nx = ny = 0
+        if getattr(self, 'real_meta', None):
+            try:
+                scan_x_nm = float(self.real_meta.get('scan_x_nm', 0.0))
+                scan_y_nm = float(self.real_meta.get('scan_y_nm', 0.0))
+                nx = int(self.real_meta.get('nx', 0))
+                ny = int(self.real_meta.get('ny', 0))
+            except Exception:
+                pass
+        if scan_x_nm <= 0 or scan_y_nm <= 0:
+            try:
+                sx = float(self.spinScanXNm.value()) if hasattr(self, 'spinScanXNm') else 0.0
+                sy = float(self.spinScanYNm.value()) if hasattr(self, 'spinScanYNm') else 0.0
+                if sx > 0:
+                    scan_x_nm = sx
+                if sy > 0:
+                    scan_y_nm = sy
+            except Exception:
+                pass
+        if nx <= 0 or ny <= 0:
+            try:
+                ny, nx = int(self.real_afm_nm.shape[0]), int(self.real_afm_nm.shape[1])
+            except Exception:
+                pass
+        else:
+            try:
+                shape_h, shape_w = int(self.real_afm_nm.shape[0]), int(self.real_afm_nm.shape[1])
+                if shape_w > 0 and shape_h > 0 and (shape_w != nx or shape_h != ny):
+                    nx, ny = shape_w, shape_h
+            except Exception:
+                pass
+        if scan_x_nm <= 0 and scan_y_nm > 0:
+            scan_x_nm = scan_y_nm
+        if scan_y_nm <= 0 and scan_x_nm > 0:
+            scan_y_nm = scan_x_nm
         if scan_x_nm <= 0 or scan_y_nm <= 0 or nx <= 0 or ny <= 0:
             return None
         return scan_x_nm, scan_y_nm, nx, ny
@@ -7002,6 +7895,54 @@ class pyNuD_simulator(QMainWindow):
                     widget.blockSignals(False)
                 except Exception:
                     pass
+
+    def _get_tip_center_xy_nm(self):
+        """Return the current XY scan center controlled by the tip position sliders."""
+        x = self.tip_x_slider.value() / 5.0 if hasattr(self, 'tip_x_slider') else 0.0
+        y = self.tip_y_slider.value() / 5.0 if hasattr(self, 'tip_y_slider') else 0.0
+        return float(x), float(y)
+
+    def _clamp_tip_center_xy_nm(self, x_nm, y_nm):
+        """Clamp an XY scan center to the existing tip slider ranges."""
+        x = float(x_nm)
+        y = float(y_nm)
+        if hasattr(self, 'tip_x_slider'):
+            x = min(max(x, self.tip_x_slider.minimum() / 5.0), self.tip_x_slider.maximum() / 5.0)
+        if hasattr(self, 'tip_y_slider'):
+            y = min(max(y, self.tip_y_slider.minimum() / 5.0), self.tip_y_slider.maximum() / 5.0)
+        return x, y
+
+    def _set_tip_center_xy_nm(self, x_nm, y_nm, *, update=True):
+        """Set the XY scan center via the existing tip sliders and return actual values."""
+        x_nm, y_nm = self._clamp_tip_center_xy_nm(x_nm, y_nm)
+        widgets = []
+        if hasattr(self, 'tip_x_slider'):
+            widgets.append(self.tip_x_slider)
+        if hasattr(self, 'tip_y_slider'):
+            widgets.append(self.tip_y_slider)
+        for widget in widgets:
+            try:
+                widget.blockSignals(True)
+            except Exception:
+                pass
+        try:
+            if hasattr(self, 'tip_x_slider'):
+                self.tip_x_slider.setValue(int(round(float(x_nm) * 5.0)))
+            if hasattr(self, 'tip_y_slider'):
+                self.tip_y_slider.setValue(int(round(float(y_nm) * 5.0)))
+        finally:
+            for widget in widgets:
+                try:
+                    widget.blockSignals(False)
+                except Exception:
+                    pass
+        actual_x, actual_y = self._get_tip_center_xy_nm()
+        if update:
+            try:
+                self.update_tip_position()
+            except Exception:
+                pass
+        return actual_x, actual_y
 
     def _run_xy_simulation_blocking(self, coords, scan_x_nm, scan_y_nm, nx, ny, sim_mode='pdb', tip_params=None):
         """Run one XY AFM simulation synchronously and return raw height map."""
@@ -7071,25 +8012,104 @@ class pyNuD_simulator(QMainWindow):
             pass
         return processed_xy
 
+    def _sim_map_for_pose_scoring(self, raw_xy, scan_x_nm, scan_y_nm, nx, ny):
+        """Return the simulated height map used for pose scoring (structure, not noise)."""
+        if raw_xy is None:
+            return None
+        sim = np.asarray(raw_xy, dtype=np.float64)
+        if self.apply_filter_check.isChecked():
+            try:
+                sim = apply_low_pass_filter(sim, scan_x_nm, scan_y_nm, self.filter_cutoff_spin.value())
+            except Exception:
+                pass
+        # Do not apply synthetic noise/artifacts during pose search.
+        return sim
+
+    def _resample_sim_to_real_grid(self, real, sim):
+        """Resample *sim* onto the 2D grid of *real*. Returns (sim_on_real_grid, sim_valid_mask)."""
+        real = np.asarray(real, dtype=np.float64)
+        sim = np.asarray(sim, dtype=np.float64)
+        real_valid = np.isfinite(real) & (real > -1e8)
+        sim_valid = np.isfinite(sim) & (sim > -1e8)
+        sim_f = np.where(sim_valid, sim, 0.0)
+        sim_mask = sim_valid.astype(np.float64)
+        if sim_f.shape != real.shape:
+            zoom = (real.shape[0] / sim_f.shape[0], real.shape[1] / sim_f.shape[1])
+            try:
+                sim_f = scipy.ndimage.zoom(sim_f, zoom, order=1)
+                sim_mask = scipy.ndimage.zoom(sim_mask, zoom, order=1)
+            except Exception:
+                return None, None
+        return sim_f, (sim_mask > 0.5) & real_valid
+
+    def _compute_comparison_metrics(self, real_nm, sim_nm, dx=None, dy=None):
+        """Align Real vs Sim and return RMSD/ZNCC (same definition as the Difference panel).
+
+        Score for pose search is ``-rmsd + 0.01*zncc`` (lower difference is better).
+        """
+        if real_nm is None or sim_nm is None:
+            return {'score': -1e9, 'dx': 0.0, 'dy': 0.0, 'rmsd': None, 'zncc': None}
+
+        real = np.asarray(real_nm, dtype=np.float64)
+        sim = np.asarray(sim_nm, dtype=np.float64)
+        if real.ndim != 2 or sim.ndim != 2:
+            return {'score': -1e9, 'dx': 0.0, 'dy': 0.0, 'rmsd': None, 'zncc': None}
+
+        real_valid = np.isfinite(real) & (real > -1e8)
+        if np.count_nonzero(real_valid) < 4:
+            return {'score': -1e9, 'dx': 0.0, 'dy': 0.0, 'rmsd': None, 'zncc': None}
+
+        resampled = self._resample_sim_to_real_grid(real, sim)
+        if resampled[0] is None:
+            return {'score': -1e9, 'dx': 0.0, 'dy': 0.0, 'rmsd': None, 'zncc': None}
+        sim_f, mask = resampled
+
+        if dx is None or dy is None:
+            real_p = self.preprocess_pose_image(real)
+            sim_p = self.preprocess_pose_image(sim_f)
+            if real_p is None or sim_p is None:
+                return {'score': -1e9, 'dx': 0.0, 'dy': 0.0, 'rmsd': None, 'zncc': None}
+            dx, dy = self.estimate_translation_phase_corr(real_p, sim_p)
+        dx = float(dx)
+        dy = float(dy)
+
+        if abs(dx) > 1e-6 or abs(dy) > 1e-6:
+            try:
+                sim_f = scipy.ndimage.shift(sim_f, shift=(dy, dx), order=1, mode='nearest')
+            except Exception:
+                pass
+
+        mask = np.isfinite(sim_f) & (sim_f > -1e8) & real_valid
+        if np.count_nonzero(mask) < 4:
+            return {'score': -1e9, 'dx': dx, 'dy': dy, 'rmsd': None, 'zncc': None}
+
+        real_mean = float(np.mean(real[mask]))
+        sim_mean = float(np.mean(sim_f[mask]))
+        real0 = real - real_mean
+        sim0 = sim_f - sim_mean
+        diff = real0 - sim0
+        rmsd = float(np.sqrt(np.mean(diff[mask] ** 2)))
+
+        real_for_zncc = np.where(mask, real0, np.nan)
+        sim_for_zncc = np.where(mask, sim0, np.nan)
+        try:
+            zncc = float(self.score_zncc(real_for_zncc, sim_for_zncc))
+        except Exception:
+            zncc = -1e9
+
+        score = -rmsd + 0.01 * zncc
+        return {'score': float(score), 'dx': dx, 'dy': dy, 'rmsd': rmsd, 'zncc': zncc}
+
     def _score_real_vs_sim(self, real_preprocessed, sim_img):
-        """Translation-invariant similarity score for pose search."""
+        """Translation-invariant similarity score for pose search (legacy wrapper)."""
         if real_preprocessed is None or sim_img is None:
             return -1e9, 0.0, 0.0
-
-        sim_cmp = sim_img
-        if real_preprocessed.shape != sim_cmp.shape:
-            zoom_y = real_preprocessed.shape[0] / sim_cmp.shape[0]
-            zoom_x = real_preprocessed.shape[1] / sim_cmp.shape[1]
-            sim_cmp = scipy.ndimage.zoom(sim_cmp, (zoom_y, zoom_x), order=1)
-
-        sim_p = self.preprocess_pose_image(sim_cmp)
-        if sim_p is None:
+        # real_preprocessed is ignored; scoring uses raw Real AFM for RMSD consistency.
+        real_nm = getattr(self, 'real_afm_nm', None)
+        if real_nm is None:
             return -1e9, 0.0, 0.0
-
-        dx, dy = self.estimate_translation_phase_corr(real_preprocessed, sim_p)
-        sim_aligned = self.transform_image(sim_p, 0.0, dx, dy)
-        score = self.score_zncc(real_preprocessed, sim_aligned)
-        return float(score), float(dx), float(dy)
+        metrics = self._compute_comparison_metrics(real_nm, sim_img)
+        return metrics['score'], metrics['dx'], metrics['dy']
 
     def _simulate_xy_for_real_afm(self, *, update_panels=True, store_results=True, check_busy=True, show_messages=True):
         """Simulate XY using ASD scan metadata and return {'raw','processed','meta'} or None."""
@@ -7164,6 +8184,14 @@ class pyNuD_simulator(QMainWindow):
             target_panel = getattr(self, 'real_afm_window_aligned_frame', None)
             if target_panel is not None:
                 self.display_afm_image(processed_xy, target_panel)
+            try:
+                self._update_model_overlay()
+            except Exception:
+                pass
+            try:
+                self._update_difference_panel()
+            except Exception:
+                pass
 
         return {
             "raw": raw_xy,
@@ -7175,6 +8203,517 @@ class pyNuD_simulator(QMainWindow):
                 "ny": ny,
             },
         }
+
+    def simulate_and_score(self, coords, real_img=None, meta=None, tip=None, lowpass=None):
+        """GUI-less forward simulation and Real-AFM scoring for pose/flexible fit.
+
+        ``coords`` are already in simulation coordinates (including any current
+        global Estimate Pose rotation). The returned metrics use the same RMSD
+        and ZNCC definitions as the Difference panel.
+        """
+        if coords is None:
+            return None
+        real = self.real_afm_nm if real_img is None else real_img
+        if real is None:
+            return None
+
+        if meta is None:
+            meta = self._get_real_afm_simulation_meta()
+        if meta is None:
+            return None
+        if isinstance(meta, dict):
+            scan_x_nm = meta.get("scan_x_nm")
+            scan_y_nm = meta.get("scan_y_nm")
+            nx = meta.get("nx")
+            ny = meta.get("ny")
+        else:
+            scan_x_nm, scan_y_nm, nx, ny = meta
+        scan_x_nm = float(scan_x_nm)
+        scan_y_nm = float(scan_y_nm)
+        nx = int(nx)
+        ny = int(ny)
+
+        raw_xy = self._run_xy_simulation_blocking(
+            np.asarray(coords, dtype=float),
+            scan_x_nm,
+            scan_y_nm,
+            nx,
+            ny,
+            tip_params=tip,
+        )
+        if raw_xy is None:
+            return None
+
+        if lowpass is False:
+            sim_for_pose = np.asarray(raw_xy, dtype=np.float64)
+        elif lowpass is None:
+            sim_for_pose = self._sim_map_for_pose_scoring(raw_xy, scan_x_nm, scan_y_nm, nx, ny)
+        else:
+            sim_for_pose = np.asarray(raw_xy, dtype=np.float64)
+            try:
+                cutoff = float(lowpass)
+                sim_for_pose = apply_low_pass_filter(sim_for_pose, scan_x_nm, scan_y_nm, cutoff)
+            except Exception:
+                pass
+
+        metrics = self._compute_comparison_metrics(real, sim_for_pose, dx=0.0, dy=0.0)
+        residual_metrics = self._compute_comparison_metrics(real, sim_for_pose)
+        return {
+            "raw": raw_xy,
+            "sim_img": sim_for_pose,
+            "meta": {
+                "scan_x_nm": scan_x_nm,
+                "scan_y_nm": scan_y_nm,
+                "nx": nx,
+                "ny": ny,
+            },
+            "score": metrics.get("score", -1e9),
+            "rmsd": metrics.get("rmsd"),
+            "zncc": metrics.get("zncc"),
+            "dx": residual_metrics.get("dx", 0.0),
+            "dy": residual_metrics.get("dy", 0.0),
+            "residual_score": residual_metrics.get("score", -1e9),
+            "residual_rmsd": residual_metrics.get("rmsd"),
+            "residual_zncc": residual_metrics.get("zncc"),
+        }
+
+    def _build_flexible_fit_penalty_model(self, base_coords, domain_ids):
+        nodes = self._extract_ca_domain_nodes()
+        if nodes is None:
+            return {"node_indices": np.array([], dtype=int), "boundary_pairs": [], "boundary_dist": []}
+        node_indices = np.asarray(nodes["node_indices"], dtype=int)
+        if node_indices.size < 2:
+            return {"node_indices": node_indices, "boundary_pairs": [], "boundary_dist": []}
+
+        node_coords = np.asarray(base_coords, dtype=float)[node_indices]
+        node_domains = np.asarray(domain_ids, dtype=int)[node_indices]
+        boundary_pairs = []
+        boundary_dist = []
+        try:
+            from scipy.spatial import cKDTree
+            pairs = cKDTree(node_coords).query_pairs(1.5)
+        except Exception:
+            pairs = []
+            for i in range(node_coords.shape[0]):
+                for j in range(i + 1, node_coords.shape[0]):
+                    if np.linalg.norm(node_coords[j] - node_coords[i]) <= 1.5:
+                        pairs.append((i, j))
+
+        for i, j in pairs:
+            di = int(node_domains[i])
+            dj = int(node_domains[j])
+            if di < 0 or dj < 0 or di == dj:
+                continue
+            dist = float(np.linalg.norm(node_coords[j] - node_coords[i]))
+            if dist <= 1e-9:
+                continue
+            boundary_pairs.append((int(node_indices[i]), int(node_indices[j])))
+            boundary_dist.append(dist)
+            if len(boundary_pairs) >= 2000:
+                break
+
+        return {
+            "node_indices": node_indices,
+            "node_domains": node_domains,
+            "boundary_pairs": boundary_pairs,
+            "boundary_dist": boundary_dist,
+        }
+
+    def _flexible_fit_penalties(self, coords, penalty_model, domain_ids):
+        arr = np.asarray(coords, dtype=float)
+        boundary_penalty = 0.0
+        pairs = penalty_model.get("boundary_pairs", [])
+        base_dist = penalty_model.get("boundary_dist", [])
+        if pairs:
+            vals = []
+            for (i, j), d0 in zip(pairs, base_dist):
+                d = float(np.linalg.norm(arr[int(j)] - arr[int(i)]))
+                scale = max(0.15, 0.2 * float(d0))
+                vals.append(((d - float(d0)) / scale) ** 2)
+            if vals:
+                boundary_penalty = float(np.mean(vals))
+
+        clash_penalty = 0.0
+        node_indices = np.asarray(penalty_model.get("node_indices", []), dtype=int)
+        if node_indices.size >= 2:
+            node_coords = arr[node_indices]
+            node_domains = np.asarray(domain_ids, dtype=int)[node_indices]
+            try:
+                from scipy.spatial import cKDTree
+                close_pairs = cKDTree(node_coords).query_pairs(0.35)
+            except Exception:
+                close_pairs = []
+                for i in range(node_coords.shape[0]):
+                    for j in range(i + 1, node_coords.shape[0]):
+                        if np.linalg.norm(node_coords[j] - node_coords[i]) < 0.35:
+                            close_pairs.append((i, j))
+            vals = []
+            for i, j in close_pairs:
+                di = int(node_domains[i])
+                dj = int(node_domains[j])
+                if di < 0 or dj < 0 or di == dj:
+                    continue
+                d = float(np.linalg.norm(node_coords[j] - node_coords[i]))
+                vals.append(((0.35 - d) / 0.35) ** 2)
+                if len(vals) >= 2000:
+                    break
+            if vals:
+                clash_penalty = float(np.mean(vals))
+        return boundary_penalty, clash_penalty
+
+    def run_flexible_fit(self):
+        """Run single-frame rigid-domain flexible fitting from the Real AFM window."""
+        if self.real_afm_nm is None:
+            QMessageBox.information(self, "Flexible Fit", "Real AFM is not loaded.")
+            return
+        if getattr(self, "atoms_data", None) is None:
+            QMessageBox.warning(self, "Flexible Fit", "PDB/CIF structure is not loaded.")
+            return
+        if self.is_worker_running(getattr(self, 'sim_worker', None), attr_name='sim_worker') or \
+           self.is_worker_running(getattr(self, 'sim_worker_high_res', None), attr_name='sim_worker_high_res'):
+            QMessageBox.information(self, "Flexible Fit", "Another simulation is running. Please wait.")
+            return
+        if self.is_worker_running(getattr(self, 'sim_worker_silent', None), attr_name='sim_worker_silent'):
+            self.stop_worker(self.sim_worker_silent, timeout_ms=300, allow_terminate=True, worker_name="sim_worker_silent")
+            if self.is_worker_running(getattr(self, 'sim_worker_silent', None), attr_name='sim_worker_silent'):
+                QMessageBox.information(self, "Flexible Fit", "Another simulation is running. Please wait.")
+                return
+
+        if getattr(self, "domain_ids", None) is None:
+            if not self.detect_domains_from_ui(show_messages=False):
+                QMessageBox.warning(self, "Flexible Fit", "Detect Domains failed. Load a structure with C-alpha/P atoms.")
+                return
+
+        domain_ids = np.asarray(self.domain_ids, dtype=int)
+        domains = [int(d) for d in np.unique(domain_ids) if int(d) >= 0]
+        if not domains:
+            QMessageBox.warning(self, "Flexible Fit", "No movable domains are assigned.")
+            return
+
+        precision_levels = ["Fast", "Medium", "Thorough"]
+        selected_level, ok = QInputDialog.getItem(
+            self,
+            "Flexible Fit",
+            "Run after Estimate Pose. Precision:",
+            precision_levels,
+            0,
+            False,
+        )
+        if not ok:
+            return
+        profiles = {
+            "Fast": {"cycles": 1, "maxiter": 10, "max_rot_deg": 6.0, "xtol": 0.30, "ftol": 1e-3},
+            "Medium": {"cycles": 2, "maxiter": 16, "max_rot_deg": 10.0, "xtol": 0.20, "ftol": 5e-4},
+            "Thorough": {"cycles": 3, "maxiter": 24, "max_rot_deg": 14.0, "xtol": 0.12, "ftol": 2e-4},
+        }
+        cfg = profiles.get(str(selected_level), profiles["Fast"])
+
+        meta = self._get_real_afm_simulation_meta()
+        if meta is None:
+            QMessageBox.warning(self, "Flexible Fit", "Real AFM metadata is incomplete.")
+            return
+        scan_x_nm, scan_y_nm, nx, ny = meta
+        pixel_nm = max(float(scan_x_nm) / max(float(nx), 1.0), float(scan_y_nm) / max(float(ny), 1.0))
+        max_trans_nm = max(0.15, pixel_nm * 2.5)
+
+        base_coords = self._current_atom_coords_array()
+        if base_coords is None:
+            return
+        before_pack = self.simulate_and_score(
+            self._apply_current_rotation_to_coords(base_coords),
+            self.real_afm_nm,
+            meta=meta,
+        )
+        if before_pack is None or before_pack.get("rmsd") is None:
+            QMessageBox.warning(self, "Flexible Fit", "Initial simulation/scoring failed.")
+            return
+
+        domain_params = [
+            (np.zeros(3, dtype=float), np.zeros(3, dtype=float))
+            for _ in range(max(domains) + 1)
+        ]
+        penalty_model = self._build_flexible_fit_penalty_model(base_coords, domain_ids)
+        total_steps = int(cfg["cycles"]) * len(domains)
+        progress = QProgressDialog("Flexible fitting...", "Cancel", 0, max(1, total_steps), self)
+        progress.setWindowTitle("Flexible Fit")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+
+        try:
+            from scipy.optimize import minimize
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(self, "Flexible Fit", f"scipy.optimize is unavailable:\n{e}")
+            return
+
+        class _FitCanceled(Exception):
+            pass
+
+        best_pack = dict(before_pack)
+        eval_count = 0
+        step_count = 0
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            for cycle in range(int(cfg["cycles"])):
+                for domain in domains:
+                    if progress.wasCanceled():
+                        raise _FitCanceled()
+                    current_rot, current_trans = domain_params[domain]
+                    x0 = np.concatenate([np.degrees(current_rot), current_trans])
+                    eval_cache = {}
+
+                    def objective(x):
+                        nonlocal eval_count, best_pack
+                        if progress.wasCanceled():
+                            raise _FitCanceled()
+                        x = np.asarray(x, dtype=float)
+                        key = tuple(np.round(x, 4))
+                        if key in eval_cache:
+                            return eval_cache[key]
+                        trial_params = list(domain_params)
+                        trial_params[domain] = (np.radians(x[:3]), np.asarray(x[3:6], dtype=float))
+                        try:
+                            local_coords = apply_domain_transforms(
+                                base_coords,
+                                domain_ids,
+                                global_pose=None,
+                                domain_params=trial_params,
+                            )
+                            rotated_coords = self._apply_current_rotation_to_coords(local_coords)
+                            pack = self.simulate_and_score(rotated_coords, self.real_afm_nm, meta=meta)
+                        except Exception:
+                            pack = None
+                        eval_count += 1
+                        if pack is None or pack.get("rmsd") is None:
+                            value = 1e6
+                        else:
+                            boundary_penalty, clash_penalty = self._flexible_fit_penalties(
+                                local_coords,
+                                penalty_model,
+                                domain_ids,
+                            )
+                            value = (
+                                -float(pack.get("score", -1e9))
+                                + 0.03 * boundary_penalty
+                                + 0.05 * clash_penalty
+                            )
+                            if pack.get("score", -1e9) > best_pack.get("score", -1e9):
+                                best_pack = dict(pack)
+                        if eval_count % 4 == 0:
+                            rmsd_text = "-"
+                            if best_pack.get("rmsd") is not None:
+                                rmsd_text = f"{best_pack['rmsd']:.3f} nm"
+                            progress.setLabelText(
+                                f"Flexible fitting ({selected_level})...\n"
+                                f"Cycle {cycle + 1}/{cfg['cycles']}  Domain {domain + 1}\n"
+                                f"Best RMSD: {rmsd_text}    Evaluations: {eval_count}"
+                            )
+                            QApplication.processEvents()
+                        eval_cache[key] = float(value)
+                        return float(value)
+
+                    bounds = [(-cfg["max_rot_deg"], cfg["max_rot_deg"])] * 3 + [
+                        (-max_trans_nm, max_trans_nm)
+                    ] * 3
+                    result = minimize(
+                        objective,
+                        x0,
+                        method="Powell",
+                        bounds=bounds,
+                        options={
+                            "maxiter": int(cfg["maxiter"]),
+                            "xtol": float(cfg["xtol"]),
+                            "ftol": float(cfg["ftol"]),
+                            "disp": False,
+                        },
+                    )
+                    x_best = np.asarray(result.x if hasattr(result, "x") else x0, dtype=float)
+                    domain_params[domain] = (np.radians(x_best[:3]), x_best[3:6])
+                    step_count += 1
+                    progress.setValue(min(step_count, total_steps))
+                    QApplication.processEvents()
+
+            final_coords = apply_domain_transforms(
+                base_coords,
+                domain_ids,
+                global_pose=None,
+                domain_params=domain_params,
+            )
+            final_rotated = self._apply_current_rotation_to_coords(final_coords)
+            final_pack = self.simulate_and_score(final_rotated, self.real_afm_nm, meta=meta)
+            if final_pack is None or final_pack.get("rmsd") is None:
+                QMessageBox.warning(self, "Flexible Fit", "Final simulation/scoring failed. Structure was not changed.")
+                return
+
+            self._set_atom_coords_array(final_coords, mark_edited=True)
+            self.flexible_fit_result = {
+                "profile": str(selected_level),
+                "original_coords": base_coords,
+                "domain_params": domain_params,
+                "before": before_pack,
+                "after": final_pack,
+                "domain_ids": np.array(domain_ids, copy=True),
+                "eval_count": int(eval_count),
+            }
+            self.flexible_fit_report_text = self._format_flexible_fit_report(self.flexible_fit_result)
+            if hasattr(self, "save_flex_fit_btn"):
+                self.save_flex_fit_btn.setEnabled(True)
+
+            self.display_molecule()
+            self._simulate_xy_for_real_afm(
+                update_panels=True,
+                store_results=True,
+                check_busy=False,
+                show_messages=False,
+            )
+            self._update_domain_status_label()
+
+            before_rmsd = before_pack.get("rmsd")
+            after_rmsd = final_pack.get("rmsd")
+            before_text = f"{before_rmsd:.3f} nm" if before_rmsd is not None else "-"
+            after_text = f"{after_rmsd:.3f} nm" if after_rmsd is not None else "-"
+            QMessageBox.information(
+                self,
+                "Flexible Fit",
+                f"Flexible fit complete.\n"
+                f"RMSD: {before_text} -> {after_text}\n"
+                f"Domains: {len(domains)}   Evaluations: {eval_count}\n"
+                f"Use Save Fit to export PDB and report."
+            )
+        except _FitCanceled:
+            QMessageBox.information(self, "Flexible Fit", "Flexible fitting canceled. Structure was not changed.")
+        finally:
+            try:
+                progress.setValue(max(1, total_steps))
+                progress.close()
+            except Exception:
+                pass
+            QApplication.restoreOverrideCursor()
+
+    def _format_flexible_fit_report(self, result):
+        before = result.get("before", {}) or {}
+        after = result.get("after", {}) or {}
+        domain_params = result.get("domain_params", []) or []
+        domain_ids = np.asarray(result.get("domain_ids", []), dtype=int)
+        domains = [int(d) for d in np.unique(domain_ids) if int(d) >= 0]
+        dof = 6 * len(domains)
+        before_rmsd = before.get("rmsd")
+        after_rmsd = after.get("rmsd")
+        improvement = None
+        if before_rmsd is not None and after_rmsd is not None:
+            improvement = float(before_rmsd) - float(after_rmsd)
+        warning = ""
+        if improvement is not None and improvement < max(0.02, 0.003 * dof):
+            warning = "Warning: RMSD improvement is small relative to the fitted DOF; inspect for overfitting."
+
+        lines = [
+            "AFM Simulator Flexible Fit Report",
+            f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Real AFM: {getattr(self, 'real_asd_path', '') or '(current frame)'}",
+            f"Profile: {result.get('profile', '-')}",
+            f"Domains: {len(domains)}",
+            f"Fitted DOF: {dof} (global pose fixed after Estimate Pose)",
+            f"Evaluations: {int(result.get('eval_count', 0))}",
+            "",
+            "Metrics",
+            f"  RMSD before: {before_rmsd if before_rmsd is not None else '-'} nm",
+            f"  RMSD after : {after_rmsd if after_rmsd is not None else '-'} nm",
+            f"  ZNCC before: {before.get('zncc', '-')}",
+            f"  ZNCC after : {after.get('zncc', '-')}",
+        ]
+        if improvement is not None:
+            lines.append(f"  RMSD improvement: {improvement:.6g} nm")
+        if warning:
+            lines.extend(["", warning])
+        lines.extend(["", "Domain Transforms"])
+        for domain in domains:
+            rotvec, trans = domain_params[domain]
+            angle_deg = float(np.degrees(np.linalg.norm(rotvec)))
+            trans = np.asarray(trans, dtype=float)
+            n_atoms = int(np.count_nonzero(domain_ids == domain))
+            lines.append(
+                f"  Domain {domain + 1}: atoms={n_atoms}, angle={angle_deg:.3f} deg, "
+                f"rotvec_deg={np.degrees(rotvec).tolist()}, trans_nm={trans.tolist()}"
+            )
+        lines.extend([
+            "",
+            "Scientific note",
+            "  ENM domains predict potentially flexible regions. Validity should be judged by fit improvement and physical plausibility.",
+            "  TODO: add held-out cross-validation when continuous image-series fitting is implemented.",
+        ])
+        return "\n".join(lines) + "\n"
+
+    def _write_current_structure_pdb(self, path):
+        if getattr(self, "atoms_data", None) is None:
+            raise ValueError("No atom data loaded")
+        required = ("x", "y", "z", "element", "atom_name", "residue_name", "chain_id", "residue_id")
+        if not all(name in self.atoms_data for name in required):
+            raise ValueError("Atom data is incomplete")
+        n_atoms = len(self.atoms_data["x"])
+        with open(path, "w", encoding="ascii") as f:
+            for i in range(n_atoms):
+                serial = (i % 99999) + 1
+                element = str(self.atoms_data["element"][i]).strip()[:2] or "C"
+                atom_name = self._format_pdb_atom_name(self.atoms_data["atom_name"][i], element)
+                res_name = str(self.atoms_data["residue_name"][i]).strip().upper()[:3] or "UNK"
+                chain = str(self.atoms_data["chain_id"][i]).strip()[:1] or " "
+                try:
+                    residue_id = int(self.atoms_data["residue_id"][i])
+                except Exception:
+                    residue_id = 1
+                residue_id = max(-999, min(9999, residue_id))
+                icode = ""
+                if "icode" in self.atoms_data:
+                    icode = str(self.atoms_data["icode"][i]).strip()[:1]
+                b_factor = 20.0
+                if "b_factor" in self.atoms_data:
+                    try:
+                        b_factor = float(self.atoms_data["b_factor"][i])
+                    except Exception:
+                        pass
+                x = float(self.atoms_data["x"][i]) * 10.0
+                y = float(self.atoms_data["y"][i]) * 10.0
+                z = float(self.atoms_data["z"][i]) * 10.0
+                f.write(
+                    f"ATOM  {serial:5d} {atom_name} {res_name:>3} {chain:1}"
+                    f"{residue_id:4d}{icode:1}   "
+                    f"{x:8.3f}{y:8.3f}{z:8.3f}"
+                    f"  1.00{b_factor:6.2f}          {element:>2}\n"
+                )
+            f.write("END\n")
+
+    def save_flexible_fit_outputs(self):
+        if not getattr(self, "flexible_fit_result", None):
+            QMessageBox.information(self, "Save Fit", "Run Flexible Fit first.")
+            return
+        default_id = self.get_active_dataset_id() if hasattr(self, "get_active_dataset_id") else "afm_fit"
+        directory = self.last_import_dir if getattr(self, "last_import_dir", "") and os.path.isdir(self.last_import_dir) else ""
+        default_path = os.path.join(directory, f"{default_id}_flexible_fit.pdb") if directory else f"{default_id}_flexible_fit.pdb"
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Flexible Fit PDB",
+            default_path,
+            "PDB files (*.pdb);;All Files (*)",
+            options=QFileDialog.DontUseNativeDialog,
+        )
+        if not save_path:
+            return
+        if not save_path.lower().endswith(".pdb"):
+            save_path += ".pdb"
+        report_path = str(Path(save_path).with_name(Path(save_path).stem + "_report.txt"))
+        try:
+            self._write_current_structure_pdb(save_path)
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write(self.flexible_fit_report_text or self._format_flexible_fit_report(self.flexible_fit_result))
+            QMessageBox.information(
+                self,
+                "Save Fit",
+                f"Saved fitted PDB:\n{save_path}\n\nSaved report:\n{report_path}",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Save Fit", f"Failed to save fit outputs:\n{e}")
 
     def estimate_pose_from_real(self):
         """Estimate Rotation XYZ by iteratively re-simulating AFM and maximizing similarity."""
@@ -7203,6 +8742,7 @@ class pyNuD_simulator(QMainWindow):
         except Exception:
             QMessageBox.warning(self, "Pose", "Rotation controls are unavailable.")
             return
+        orig_tx, orig_ty = self._get_tip_center_xy_nm()
 
         allowed_axes = self._get_pose_rotation_axes()
         refine_axes = [axis for axis in ('X', 'Y', 'Z') if allowed_axes.get(axis, True)]
@@ -7215,6 +8755,13 @@ class pyNuD_simulator(QMainWindow):
         if real_p is None:
             QMessageBox.warning(self, "Pose", "Real AFM image is invalid for pose estimation.")
             return
+        meta = self._get_real_afm_simulation_meta()
+        if meta is None:
+            QMessageBox.warning(self, "Pose", "Real AFM metadata is incomplete.")
+            return
+        scan_x_nm, scan_y_nm, nx, ny = meta
+        pixel_x_nm = float(scan_x_nm) / max(float(nx), 1.0)
+        pixel_y_nm = float(scan_y_nm) / max(float(ny), 1.0)
 
         # Ask precision level before running iterative search.
         precision_levels = ["Medium", "Low", "High"]
@@ -7234,12 +8781,14 @@ class pyNuD_simulator(QMainWindow):
                 "seed_offsets": [(0.0, 0.0), (30.0, 0.0), (0.0, 30.0)],
                 "z_step": 45.0,
                 "refine_steps": (20.0, 10.0, 5.0, 2.0),
+                "xy_refine_steps_px": (8.0, 4.0, 2.0, 1.0),
                 "max_refine_iter": 8,
             },
             "Medium": {
                 "seed_offsets": [(0.0, 0.0), (45.0, 0.0), (-45.0, 0.0), (0.0, 45.0), (0.0, -45.0)],
                 "z_step": 30.0,
                 "refine_steps": (15.0, 8.0, 4.0, 2.0, 1.0),
+                "xy_refine_steps_px": (12.0, 6.0, 3.0, 1.5, 1.0),
                 "max_refine_iter": 16,
             },
             "High": {
@@ -7250,6 +8799,7 @@ class pyNuD_simulator(QMainWindow):
                 ],
                 "z_step": 20.0,
                 "refine_steps": (12.0, 6.0, 3.0, 1.5, 0.75, 0.4),
+                "xy_refine_steps_px": (16.0, 8.0, 4.0, 2.0, 1.0, 1.0),
                 "max_refine_iter": 20,
             },
         }
@@ -7257,7 +8807,11 @@ class pyNuD_simulator(QMainWindow):
 
         eval_cache = {}
         eval_count = 0
-        best = {'rx': orig_rx, 'ry': orig_ry, 'rz': orig_rz, 'score': -1e9, 'dx': 0.0, 'dy': 0.0}
+        best = {
+            'rx': orig_rx, 'ry': orig_ry, 'rz': orig_rz,
+            'tx': orig_tx, 'ty': orig_ty,
+            'score': -1e9, 'dx': 0.0, 'dy': 0.0, 'rmsd': None, 'zncc': None,
+        }
         cancel_requested = False
         if allowed_axes.get('Z', True):
             z_coarse = np.arange(-180.0, 180.0 + 1e-9, float(cfg["z_step"]))
@@ -7265,8 +8819,8 @@ class pyNuD_simulator(QMainWindow):
             z_coarse = np.array([orig_rz], dtype=float)
         max_eval_est = max(
             1,
-            len(cfg["seed_offsets"]) * len(z_coarse)
-            + len(cfg["refine_steps"]) * int(cfg["max_refine_iter"]) * 2 * len(refine_axes)
+            len(cfg["seed_offsets"]) * len(z_coarse) * 2
+            + len(cfg["refine_steps"]) * int(cfg["max_refine_iter"]) * (2 * len(refine_axes) + 4)
             + 2,
         )
         progress = QProgressDialog("Estimating pose...", "Cancel", 0, int(max_eval_est), self)
@@ -7279,7 +8833,32 @@ class pyNuD_simulator(QMainWindow):
         self._pose_estimation_running = True
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            def evaluate(rx, ry, rz):
+            def maybe_update_best(candidate):
+                nonlocal best
+                if candidate is not None and candidate.get('score', -1e9) > best['score']:
+                    best = dict(candidate)
+                    return True
+                return False
+
+            def residual_center_candidate(candidate):
+                if candidate is None:
+                    return None
+                try:
+                    dx = float(candidate.get('dx', 0.0))
+                    dy = float(candidate.get('dy', 0.0))
+                    tx = float(candidate.get('tx', orig_tx))
+                    ty = float(candidate.get('ty', orig_ty))
+                except Exception:
+                    return None
+                if abs(dx) < 0.25 and abs(dy) < 0.25:
+                    return None
+                # Positive image residual means the simulated image needs to move
+                # right/down; decreasing the scan center produces that explicit shift.
+                next_tx = tx - dx * pixel_x_nm
+                next_ty = ty - dy * pixel_y_nm
+                return evaluate(candidate['rx'], candidate['ry'], candidate['rz'], next_tx, next_ty)
+
+            def evaluate(rx, ry, rz, tx_nm, ty_nm):
                 nonlocal eval_count, cancel_requested
                 if cancel_requested:
                     return None
@@ -7287,7 +8866,9 @@ class pyNuD_simulator(QMainWindow):
                 nrx = self.normalize_angle(rx)
                 nry = self.normalize_angle(ry)
                 nrz = self.normalize_angle(rz)
-                key = (round(nrx, 3), round(nry, 3), round(nrz, 3))
+                ntx, nty = self._clamp_tip_center_xy_nm(tx_nm, ty_nm)
+                ntx, nty = self._set_tip_center_xy_nm(ntx, nty, update=False)
+                key = (round(nrx, 3), round(nry, 3), round(nrz, 3), round(ntx, 3), round(nty, 3))
                 if key in eval_cache:
                     return eval_cache[key]
 
@@ -7297,34 +8878,58 @@ class pyNuD_simulator(QMainWindow):
                     trigger_simulation=False,
                 )
                 if not ok:
-                    result = {'rx': nrx, 'ry': nry, 'rz': nrz, 'score': -1e9, 'dx': 0.0, 'dy': 0.0}
+                    result = {
+                        'rx': nrx, 'ry': nry, 'rz': nrz, 'tx': ntx, 'ty': nty,
+                        'score': -1e9, 'dx': 0.0, 'dy': 0.0, 'rmsd': None, 'zncc': None,
+                    }
                     eval_cache[key] = result
                     return result
 
-                sim_pack = self._simulate_xy_for_real_afm(
-                    update_panels=False,
-                    store_results=False,
-                    check_busy=False,
-                    show_messages=False,
+                score_pack = self.simulate_and_score(
+                    self.get_rotated_atom_coords(),
+                    self.real_afm_nm,
+                    meta=meta,
+                    tip=None,
+                    lowpass=None,
                 )
-                if sim_pack is None:
-                    result = {'rx': nrx, 'ry': nry, 'rz': nrz, 'score': -1e9, 'dx': 0.0, 'dy': 0.0}
+                if score_pack is None:
+                    result = {
+                        'rx': nrx, 'ry': nry, 'rz': nrz, 'tx': ntx, 'ty': nty,
+                        'score': -1e9, 'dx': 0.0, 'dy': 0.0, 'rmsd': None, 'zncc': None,
+                    }
                 else:
-                    score, dx, dy = self._score_real_vs_sim(real_p, sim_pack.get("processed"))
-                    result = {'rx': nrx, 'ry': nry, 'rz': nrz, 'score': score, 'dx': dx, 'dy': dy}
+                    result = {
+                        'rx': nrx, 'ry': nry, 'rz': nrz,
+                        'tx': ntx, 'ty': nty,
+                        'score': score_pack.get('score', -1e9),
+                        'dx': score_pack.get('dx', 0.0),
+                        'dy': score_pack.get('dy', 0.0),
+                        'rmsd': score_pack.get('rmsd'),
+                        'zncc': score_pack.get('zncc'),
+                        'residual_score': score_pack.get('residual_score', -1e9),
+                        'residual_rmsd': score_pack.get('residual_rmsd'),
+                        'residual_zncc': score_pack.get('residual_zncc'),
+                    }
                 eval_cache[key] = result
                 eval_count += 1
                 progress.setValue(min(eval_count, int(max_eval_est)))
+                rmsd_text = f"{best['rmsd']:.3f} nm" if best.get('rmsd') is not None else "-"
                 progress.setLabelText(
                     f"Estimating pose ({selected_level})...\n"
                     f"Rotation axes: {axes_text}\n"
+                    f"XY center: ({best.get('tx', orig_tx):.2f}, {best.get('ty', orig_ty):.2f}) nm\n"
                     f"Evaluations: {eval_count}\n"
-                    f"Best score: {best['score']:.4f}"
+                    f"Best RMSD: {rmsd_text}    Score: {best['score']:.4f}"
                 )
                 QApplication.processEvents()
                 if progress.wasCanceled():
                     cancel_requested = True
                 return result
+
+            # Baseline: current rotation (always evaluated first).
+            base = evaluate(orig_rx, orig_ry, orig_rz, orig_tx, orig_ty)
+            maybe_update_best(base)
+            maybe_update_best(residual_center_candidate(base))
 
             # Stage 1: coarse seeding (global Z scan from several X/Y starts).
             for off_x, off_y in cfg["seed_offsets"]:
@@ -7335,16 +8940,20 @@ class pyNuD_simulator(QMainWindow):
                 for zc in z_coarse:
                     if cancel_requested:
                         break
-                    cand = evaluate(sx, sy, zc)
+                    cand = evaluate(sx, sy, zc, orig_tx, orig_ty)
                     if cand is None:
                         break
-                    if cand['score'] > best['score']:
-                        best = dict(cand)
+                    maybe_update_best(cand)
+                    maybe_update_best(residual_center_candidate(cand))
 
-            # Stage 2: coordinate-descent refinement over XYZ.
-            for step in cfg["refine_steps"]:
+            # Stage 2: coordinate-descent refinement over Rotation XYZ + XY center.
+            xy_refine_steps = tuple(cfg.get("xy_refine_steps_px", (8.0, 4.0, 2.0, 1.0)))
+            for step_idx, step in enumerate(cfg["refine_steps"]):
                 if cancel_requested:
                     break
+                xy_step_px = float(xy_refine_steps[min(step_idx, len(xy_refine_steps) - 1)])
+                tx_step_nm = max(0.2, pixel_x_nm * xy_step_px)
+                ty_step_nm = max(0.2, pixel_y_nm * xy_step_px)
                 for _ in range(int(cfg["max_refine_iter"])):
                     if cancel_requested:
                         break
@@ -7352,24 +8961,30 @@ class pyNuD_simulator(QMainWindow):
                     candidates = []
                     if allowed_axes.get('X', True):
                         candidates.extend([
-                            (center['rx'] + step, center['ry'], center['rz']),
-                            (center['rx'] - step, center['ry'], center['rz']),
+                            (center['rx'] + step, center['ry'], center['rz'], center['tx'], center['ty']),
+                            (center['rx'] - step, center['ry'], center['rz'], center['tx'], center['ty']),
                         ])
                     if allowed_axes.get('Y', True):
                         candidates.extend([
-                            (center['rx'], center['ry'] + step, center['rz']),
-                            (center['rx'], center['ry'] - step, center['rz']),
+                            (center['rx'], center['ry'] + step, center['rz'], center['tx'], center['ty']),
+                            (center['rx'], center['ry'] - step, center['rz'], center['tx'], center['ty']),
                         ])
                     if allowed_axes.get('Z', True):
                         candidates.extend([
-                            (center['rx'], center['ry'], center['rz'] + step),
-                            (center['rx'], center['ry'], center['rz'] - step),
+                            (center['rx'], center['ry'], center['rz'] + step, center['tx'], center['ty']),
+                            (center['rx'], center['ry'], center['rz'] - step, center['tx'], center['ty']),
                         ])
+                    candidates.extend([
+                        (center['rx'], center['ry'], center['rz'], center['tx'] + tx_step_nm, center['ty']),
+                        (center['rx'], center['ry'], center['rz'], center['tx'] - tx_step_nm, center['ty']),
+                        (center['rx'], center['ry'], center['rz'], center['tx'], center['ty'] + ty_step_nm),
+                        (center['rx'], center['ry'], center['rz'], center['tx'], center['ty'] - ty_step_nm),
+                    ])
                     improved = False
-                    for crx, cry, crz in candidates:
+                    for crx, cry, crz, ctx, cty in candidates:
                         if cancel_requested:
                             break
-                        cand = evaluate(crx, cry, crz)
+                        cand = evaluate(crx, cry, crz, ctx, cty)
                         if cand is None:
                             break
                         if cand['score'] > (best['score'] + 1e-6):
@@ -7380,11 +8995,13 @@ class pyNuD_simulator(QMainWindow):
 
             if cancel_requested:
                 self.set_rotation_controls_xyz(orig_rx, orig_ry, orig_rz, apply_transform=True, trigger_simulation=False)
+                self._set_tip_center_xy_nm(orig_tx, orig_ty, update=True)
                 QMessageBox.information(self, "Pose", "Pose estimation canceled.")
                 return
 
             if best['score'] <= -1e8:
                 self.set_rotation_controls_xyz(orig_rx, orig_ry, orig_rz, apply_transform=True, trigger_simulation=False)
+                self._set_tip_center_xy_nm(orig_tx, orig_ty, update=True)
                 QMessageBox.warning(self, "Pose", "Pose estimation failed.")
                 return
 
@@ -7393,6 +9010,7 @@ class pyNuD_simulator(QMainWindow):
                 apply_transform=True,
                 trigger_simulation=False,
             )
+            best_tx, best_ty = self._set_tip_center_xy_nm(best['tx'], best['ty'], update=True)
             final_pack = self._simulate_xy_for_real_afm(
                 update_panels=True,
                 store_results=True,
@@ -7401,33 +9019,82 @@ class pyNuD_simulator(QMainWindow):
             )
             if final_pack is None:
                 self.set_rotation_controls_xyz(orig_rx, orig_ry, orig_rz, apply_transform=True, trigger_simulation=False)
+                self._set_tip_center_xy_nm(orig_tx, orig_ty, update=True)
                 QMessageBox.warning(self, "Pose", "Failed to generate final simulated image.")
                 return
 
-            final_score, final_dx, final_dy = self._score_real_vs_sim(real_p, final_pack.get("processed"))
+            final_meta = final_pack.get("meta") or {}
+            final_sim_for_pose = self._sim_map_for_pose_scoring(
+                final_pack.get("raw"),
+                final_meta.get("scan_x_nm"),
+                final_meta.get("scan_y_nm"),
+                final_meta.get("nx"),
+                final_meta.get("ny"),
+            )
+            final_metrics = self._compute_comparison_metrics(self.real_afm_nm, final_sim_for_pose)
+            final_explicit_metrics = self._compute_comparison_metrics(self.real_afm_nm, final_sim_for_pose, dx=0.0, dy=0.0)
             self.pose = {
                 'theta_deg': 0.0,
-                'dx_px': float(final_dx),
-                'dy_px': float(final_dy),
-                'score': float(final_score),
+                'dx_px': float(final_metrics['dx']),
+                'dy_px': float(final_metrics['dy']),
+                'score': float(final_metrics['score']),
+                'rmsd_nm': final_metrics.get('rmsd'),
+                'zncc': final_metrics.get('zncc'),
                 'mirror_mode': 'none',
                 'rot_x_deg': float(best['rx']),
                 'rot_y_deg': float(best['ry']),
                 'rot_z_deg': float(best['rz']),
+                'center_x_nm': float(best_tx),
+                'center_y_nm': float(best_ty),
+                'shift_x_nm': float(best_tx - orig_tx),
+                'shift_y_nm': float(best_ty - orig_ty),
+                'explicit_rmsd_nm': final_explicit_metrics.get('rmsd'),
+                'explicit_zncc': final_explicit_metrics.get('zncc'),
                 'rotation_axes': dict(allowed_axes),
             }
+
+            # Pose residual is now known: refresh the difference panel so it reflects
+            # the estimated dx/dy alignment.
+            try:
+                self._update_difference_panel()
+            except Exception:
+                pass
+
+            final_rmsd = final_metrics.get('rmsd')
+            final_zncc = final_metrics.get('zncc')
+            rmsd_line = f"RMSD: {final_rmsd:.3f} nm\n" if final_rmsd is not None else ""
+            zncc_line = f"ZNCC: {final_zncc:.3f}\n" if final_zncc is not None else ""
+
+            poor_fit = False
+            try:
+                real_valid = np.isfinite(self.real_afm_nm) & (self.real_afm_nm > -1e8)
+                vals = self.real_afm_nm[real_valid]
+                if vals.size >= 4 and final_rmsd is not None:
+                    dyn = float(np.percentile(vals, 99.0) - np.percentile(vals, 1.0))
+                    if dyn > 1e-9 and final_rmsd > 0.35 * dyn:
+                        poor_fit = True
+            except Exception:
+                pass
 
             QMessageBox.information(
                 self, "Pose Estimated",
                 f"RotX: {best['rx']:.2f} deg\n"
                 f"RotY: {best['ry']:.2f} deg\n"
                 f"RotZ: {best['rz']:.2f} deg\n"
-                f"Residual Dx: {final_dx:.2f} px\n"
-                f"Residual Dy: {final_dy:.2f} px\n"
-                f"Score: {final_score:.4f}\n"
+                f"Center X: {best_tx:.2f} nm\n"
+                f"Center Y: {best_ty:.2f} nm\n"
+                f"Shift X: {best_tx - orig_tx:+.2f} nm\n"
+                f"Shift Y: {best_ty - orig_ty:+.2f} nm\n"
+                f"Residual Dx: {final_metrics['dx']:.2f} px\n"
+                f"Residual Dy: {final_metrics['dy']:.2f} px\n"
+                f"{rmsd_line}"
+                f"{zncc_line}"
                 f"Evaluations: {eval_count}\n"
                 f"Rotation axes: {axes_text}\n"
                 f"Precision: {selected_level}"
+                + ("\n\nNote: RMSD is still large — try Auto-fit AFM Appearance, "
+                   "limit Pose axes (e.g. Z only), or adjust the initial orientation."
+                   if poor_fit else "")
             )
         finally:
             try:
@@ -7436,6 +9103,10 @@ class pyNuD_simulator(QMainWindow):
             except Exception:
                 pass
             self._pose_estimation_running = False
+            try:
+                self._update_model_overlay()
+            except Exception:
+                pass
             QApplication.restoreOverrideCursor()
 
     def get_simulated_image_for_real_afm(self):
@@ -7472,6 +9143,1835 @@ class pyNuD_simulator(QMainWindow):
                 pass
         self.pose_rotation_axes = {axis: bool(axes.get(axis, True)) for axis in ('X', 'Y', 'Z')}
         return dict(self.pose_rotation_axes)
+
+    def _on_impose_model_toggled(self, checked):
+        """Toggle the model overlay on the Real AFM image."""
+        self.impose_model_enabled = bool(checked)
+        if checked:
+            if self.atoms_data is None:
+                QMessageBox.information(self, "Impose model", "PDB/structure is not loaded.")
+            else:
+                try:
+                    self.sync_sim_params_to_real()
+                except Exception:
+                    pass
+            self._ensure_real_afm_window(show=False)
+        timer = getattr(self, '_model_overlay_update_timer', None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        self._update_model_overlay(force=True)
+
+    def _on_impose_opacity_changed(self, value):
+        """Update overlay opacity from the slider (10-100 -> 0.1-1.0)."""
+        try:
+            self.impose_model_opacity = max(0.0, min(1.0, float(value) / 100.0))
+        except Exception:
+            self.impose_model_opacity = 0.6
+        view = getattr(self, 'real_afm_window_view', None)
+        if view is not None:
+            try:
+                view.setModelOverlayOpacity(self.impose_model_opacity)
+            except Exception:
+                pass
+
+    def _get_real_afm_view(self):
+        """Return the _AspectPixmapView of the Real AFM panel (re-find if needed)."""
+        frame = getattr(self, 'real_afm_window_real_frame', None)
+        view = None
+        if frame is not None:
+            try:
+                view = frame.findChild(_AspectPixmapView, "afm_image_view")
+            except Exception:
+                view = None
+        if view is None:
+            cached = getattr(self, 'real_afm_window_view', None)
+            try:
+                if cached is not None and not cached.isHidden():
+                    _ = cached.width()
+                    view = cached
+            except RuntimeError:
+                view = None
+        self.real_afm_window_view = view
+        if view is None:
+            print("[WARNING] Impose model: Real AFM view widget not found")
+        return view
+
+    def _vtk_overlay_signature(self):
+        """Settings that require rebuilding hidden VTK actors used for Impose model."""
+        style = self.style_combo.currentText() if hasattr(self, 'style_combo') else ""
+        size = self.size_slider.value() if hasattr(self, 'size_slider') else 100
+        opacity = self.opacity_slider.value() if hasattr(self, 'opacity_slider') else 100
+        quality = self.quality_combo.currentText() if hasattr(self, 'quality_combo') else ""
+        atom_filter = self.atom_combo.currentText() if hasattr(self, 'atom_combo') else ""
+        color = self.color_combo.currentText() if hasattr(self, 'color_combo') else ""
+        return (style, size, opacity, quality, atom_filter, color, self.current_structure_path)
+
+    def _build_vtk_molecule_actors(self):
+        """Build/update VTK sample/bond actors from current UI settings."""
+        self._ensure_vtk_initialized()
+        if not hasattr(self, 'renderer') or self.renderer is None:
+            return False
+
+        if self.sample_actor:
+            self.renderer.RemoveActor(self.sample_actor)
+        if self.bonds_actor:
+            self.renderer.RemoveActor(self.bonds_actor)
+
+        x, y, z, elements, chain_ids, b_factors, mask = self.get_filtered_atoms()
+        if x is None:
+            return False
+
+        style = self.style_combo.currentText()
+        size_factor = self.size_slider.value() / 100.0
+        opacity = self.opacity_slider.value() / 100.0
+        quality = self.quality_combo.currentText()
+
+        if quality == "Fast":
+            resolution = 8
+            max_atoms = 5000
+        elif quality == "Good":
+            resolution = 12
+            max_atoms = 10000
+        else:
+            resolution = 16
+            max_atoms = 20000
+
+        if len(x) > max_atoms:
+            sampled_indices = np.random.choice(len(x), max_atoms, replace=False)
+            x, y, z = x[sampled_indices], y[sampled_indices], z[sampled_indices]
+            elements = elements[sampled_indices]
+            chain_ids = chain_ids[sampled_indices]
+            b_factors = b_factors[sampled_indices]
+
+        if style == "Ball & Stick":
+            self.sample_actor = self.create_ball_stick_display(
+                x, y, z, elements, chain_ids, b_factors, size_factor, resolution)
+        elif style == "Stick Only":
+            self.sample_actor = self.create_stick_display(
+                x, y, z, elements, chain_ids, b_factors, size_factor, resolution)
+        elif style == "Spheres":
+            self.sample_actor = self.create_sphere_display(
+                x, y, z, elements, chain_ids, b_factors, size_factor, resolution)
+        elif style == "Points":
+            self.sample_actor = self.create_point_display(
+                x, y, z, elements, chain_ids, b_factors, size_factor)
+        elif style == "Wireframe":
+            self.sample_actor = self.create_wireframe_display(x, y, z)
+        elif style == "Simple Cartoon":
+            self.sample_actor = self.create_simple_cartoon_display_safe()
+        elif style == "Ribbon":
+            self.sample_actor = self.create_ribbon_display(size_factor)
+        else:
+            self.sample_actor = self.create_sphere_display(
+                x, y, z, elements, chain_ids, b_factors, size_factor, resolution)
+
+        if self.sample_actor and hasattr(self.sample_actor, 'GetProperty'):
+            self.sample_actor.GetProperty().SetOpacity(opacity)
+
+        if self.sample_actor:
+            self.renderer.AddActor(self.sample_actor)
+
+        if style in ["Ball & Stick", "Stick Only"]:
+            self.create_bonds_display(
+                x, y, z, elements, chain_ids, b_factors, size_factor * 0.3, resolution,
+            )
+
+        if hasattr(self, 'combined_transform') and self.combined_transform is not None:
+            if self.sample_actor:
+                self.sample_actor.SetUserTransform(self.combined_transform)
+            if self.bonds_actor:
+                self.bonds_actor.SetUserTransform(self.combined_transform)
+        try:
+            self.update_actor_materials()
+        except Exception:
+            pass
+        try:
+            self.renderer.ResetCameraClippingRange()
+        except Exception:
+            pass
+        return self.sample_actor is not None
+
+    def _ensure_vtk_molecule_actors_for_overlay(self):
+        """Ensure hidden VTK actors exist for Impose model capture (PyMOL-only safe)."""
+        sig = self._vtk_overlay_signature()
+        if (
+            getattr(self, '_vtk_overlay_signature_cache', None) == sig
+            and getattr(self, 'sample_actor', None) is not None
+        ):
+            if hasattr(self, 'combined_transform') and self.combined_transform is not None:
+                if self.sample_actor:
+                    self.sample_actor.SetUserTransform(self.combined_transform)
+                if self.bonds_actor:
+                    self.bonds_actor.SetUserTransform(self.combined_transform)
+            return True
+        ok = self._build_vtk_molecule_actors()
+        if ok:
+            self._vtk_overlay_signature_cache = sig
+        return ok
+
+    def _collect_model_overlay_vtk_actors(self):
+        """Return VTK actors to include in the impose-model capture."""
+        actors = []
+        if getattr(self, 'sample_actor', None) is not None:
+            actors.append(self.sample_actor)
+        show_bonds = True
+        if hasattr(self, 'show_bonds_check'):
+            try:
+                show_bonds = bool(self.show_bonds_check.isChecked())
+            except Exception:
+                pass
+        if show_bonds and getattr(self, 'bonds_actor', None) is not None:
+            actors.append(self.bonds_actor)
+        mrc_actor = getattr(self, 'mrc_actor', None)
+        if mrc_actor is not None:
+            try:
+                if mrc_actor.GetVisibility():
+                    actors.append(mrc_actor)
+            except Exception:
+                actors.append(mrc_actor)
+        return actors
+
+    def _copy_renderer_lights(self, src_renderer, dst_renderer):
+        """Duplicate scene lights from one VTK renderer to another."""
+        if src_renderer is None or dst_renderer is None:
+            return
+        try:
+            lights = src_renderer.GetLights()
+            lights.InitTraversal()
+            while True:
+                light = lights.GetNextItemAsObject()
+                if light is None:
+                    break
+                new_light = vtk.vtkLight()
+                new_light.SetLightTypeToSceneLight()
+                new_light.SetPosition(light.GetPosition())
+                new_light.SetFocalPoint(light.GetFocalPoint())
+                new_light.SetColor(light.GetColor())
+                new_light.SetIntensity(light.GetIntensity())
+                dst_renderer.AddLight(new_light)
+        except Exception:
+            pass
+
+    def _vtk_image_to_rgb_array(self, vtk_image):
+        """Convert vtkWindowToImageFilter output to a top-down RGB uint8 array."""
+        from vtkmodules.util import numpy_support
+
+        if vtk_image is None:
+            return None
+        try:
+            dims = vtk_image.GetDimensions()
+            width, height = int(dims[0]), int(dims[1])
+            if width <= 0 or height <= 0:
+                return None
+            scalars = vtk_image.GetPointData().GetScalars()
+            if scalars is None:
+                return None
+            flat = numpy_support.vtk_to_numpy(scalars)
+            channels = max(1, int(flat.size // max(1, width * height)))
+            arr = flat.reshape(height, width, channels)
+            if channels >= 3:
+                arr = arr[:, :, :3].astype(np.uint8)
+            else:
+                return None
+            return np.ascontiguousarray(np.flipud(arr))
+        except Exception:
+            return None
+
+    def _rgb_array_to_rgba_with_chroma_key(self, rgb, bg_rgb, tolerance=18.0):
+        """Promote RGB to RGBA by making pixels near the capture background transparent."""
+        if rgb is None:
+            return None
+        rgb = np.asarray(rgb, dtype=np.uint8)
+        if rgb.ndim != 3 or rgb.shape[2] < 3:
+            return None
+        bg = np.asarray(bg_rgb[:3], dtype=np.float32)
+        diff = np.linalg.norm(rgb[:, :, :3].astype(np.float32) - bg, axis=2)
+        rgba = np.zeros((rgb.shape[0], rgb.shape[1], 4), dtype=np.uint8)
+        rgba[:, :, :3] = rgb[:, :, :3]
+        rgba[:, :, 3] = np.where(diff > float(tolerance), 255, 0).astype(np.uint8)
+        return rgba
+
+    def _vtk_image_to_rgba_array(self, vtk_image):
+        """Convert vtkWindowToImageFilter output to a top-down RGBA uint8 array."""
+        from vtkmodules.util import numpy_support
+
+        if vtk_image is None:
+            return None
+        try:
+            dims = vtk_image.GetDimensions()
+            width, height = int(dims[0]), int(dims[1])
+            if width <= 0 or height <= 0:
+                return None
+            scalars = vtk_image.GetPointData().GetScalars()
+            if scalars is None:
+                return None
+            flat = numpy_support.vtk_to_numpy(scalars)
+            channels = max(1, int(flat.size // max(1, width * height)))
+            arr = flat.reshape(height, width, channels)
+            if channels == 3:
+                alpha = np.full((height, width, 1), 255, dtype=np.uint8)
+                arr = np.concatenate([arr.astype(np.uint8), alpha], axis=2)
+            elif channels >= 4:
+                arr = arr[:, :, :4].astype(np.uint8)
+            else:
+                return None
+            return np.ascontiguousarray(np.flipud(arr))
+        except Exception:
+            return None
+
+    def _rgba_array_to_qpixmap(self, rgba):
+        """Convert an RGBA uint8 array to a QPixmap."""
+        from PyQt5.QtGui import QImage, QPixmap
+
+        if rgba is None:
+            return None
+        rgba = np.ascontiguousarray(rgba, dtype=np.uint8)
+        if rgba.ndim != 3 or rgba.shape[2] < 4:
+            return None
+        height, width = int(rgba.shape[0]), int(rgba.shape[1])
+        if width <= 0 or height <= 0:
+            return None
+        # Build ARGB32 explicitly (Format_RGBA8888 via sip.voidptr is unreliable on some macOS/PyQt builds).
+        argb = np.empty((height, width, 4), dtype=np.uint8)
+        argb[:, :, 0] = rgba[:, :, 2]  # B
+        argb[:, :, 1] = rgba[:, :, 1]  # G
+        argb[:, :, 2] = rgba[:, :, 0]  # R
+        argb[:, :, 3] = rgba[:, :, 3]  # A
+        argb = np.ascontiguousarray(argb)
+        bytes_per_line = int(argb.strides[0])
+        try:
+            import sip  # type: ignore
+        except Exception:
+            from PyQt5 import sip  # type: ignore
+        ptr = sip.voidptr(int(argb.ctypes.data))
+        qimg = QImage(ptr, width, height, bytes_per_line, QImage.Format_ARGB32).copy()
+        if qimg.isNull():
+            return None
+        return QPixmap.fromImage(qimg)
+
+    def _pixmap_opaque_pixel_count(self, pixmap, sample_stride=4):
+        """Count non-transparent pixels in a QPixmap (sampled for speed)."""
+        from PyQt5.QtGui import QImage
+
+        if pixmap is None or pixmap.isNull():
+            return 0
+        try:
+            img = pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
+            if img.isNull():
+                return 0
+            w, h = img.width(), img.height()
+            if w <= 0 or h <= 0:
+                return 0
+            step = max(1, int(sample_stride))
+            count = 0
+            for y in range(0, h, step):
+                for x in range(0, w, step):
+                    if (img.pixel(x, y) >> 24) & 0xFF:
+                        count += 1
+            return count
+        except Exception:
+            return 0
+
+    def _pixmap_is_valid_overlay(self, pixmap):
+        return pixmap is not None and not pixmap.isNull()
+
+    def _overlay_vtk_capture_enabled(self):
+        """VTK impose capture is unreliable on macOS (empty/garbage buffers)."""
+        if sys.platform == 'darwin':
+            return False
+        return True
+
+    def _overlay_min_opaque_pixels(self, render_w, render_h, painted_atoms=0):
+        if painted_atoms > 0:
+            return max(32, int(painted_atoms * 3))
+        area = max(1, int(render_w) * int(render_h))
+        return max(400, int(area * 0.00004))
+
+    def _pixmap_is_usable_overlay(self, pixmap, render_w, render_h, painted_atoms=0):
+        """Reject VTK noise / single-pixel 'success' buffers."""
+        if not self._pixmap_is_valid_overlay(pixmap):
+            return False
+        needed = self._overlay_min_opaque_pixels(render_w, render_h, painted_atoms)
+        count = self._pixmap_opaque_pixel_count(pixmap, sample_stride=1)
+        return count >= needed
+
+    def _pixmap_has_visible_pixels(self, pixmap, min_pixels=8):
+        """Return True when pixmap has opaque pixels (tolerant for sparse Points style)."""
+        if not self._pixmap_is_valid_overlay(pixmap):
+            return False
+        count = self._pixmap_opaque_pixel_count(pixmap, sample_stride=2)
+        if count >= int(min_pixels):
+            return True
+        # Sparse overlays (Points): do a full scan on smaller images only.
+        try:
+            w, h = pixmap.width(), pixmap.height()
+            if w > 0 and h > 0 and (w * h) <= 6_000_000:
+                return self._pixmap_opaque_pixel_count(pixmap, sample_stride=1) >= 1
+        except Exception:
+            pass
+        return False
+
+    def _impose_scan_window_nm(self):
+        """Return scan window (nm) and display pixel size matching the Real AFM image."""
+        real = getattr(self, 'real_afm_nm', None)
+        if real is None:
+            return None
+        meta = self._get_real_afm_simulation_meta()
+        if meta is None:
+            return None
+        scan_x_nm, scan_y_nm, _nx, _ny = meta
+        try:
+            disp_h, disp_w = int(real.shape[0]), int(real.shape[1])
+        except Exception:
+            return None
+        if disp_w <= 0 or disp_h <= 0 or scan_x_nm <= 0 or scan_y_nm <= 0:
+            return None
+        center_x = self.tip_x_slider.value() / 5.0
+        center_y = self.tip_y_slider.value() / 5.0
+        return {
+            'scan_x_nm': float(scan_x_nm),
+            'scan_y_nm': float(scan_y_nm),
+            'disp_w': int(disp_w),
+            'disp_h': int(disp_h),
+            'center_x': float(center_x),
+            'center_y': float(center_y),
+            'x_start': float(center_x) - float(scan_x_nm) / 2.0,
+            'y_start': float(center_y) - float(scan_y_nm) / 2.0,
+            'nm_per_px_x': float(scan_x_nm) / float(disp_w),
+            'nm_per_px_y': float(scan_y_nm) / float(disp_h),
+        }
+
+    def _overlay_render_pixel_size(self, win):
+        """High-res PNG size: same nm aspect as AFM scan, independent of AFM pixel count."""
+        scan_x = float(win['scan_x_nm'])
+        scan_y = float(win['scan_y_nm'])
+        disp_w = int(win['disp_w'])
+        disp_h = int(win['disp_h'])
+        long_edge = max(1024, min(2400, max(disp_w, disp_h) * 4))
+        if scan_x >= scan_y:
+            render_w = long_edge
+            render_h = max(64, int(round(long_edge * scan_y / max(scan_x, 1e-9))))
+        else:
+            render_h = long_edge
+            render_w = max(64, int(round(long_edge * scan_x / max(scan_y, 1e-9))))
+        return int(render_w), int(render_h)
+
+    def _nm_xy_to_render_px(self, x_nm, y_nm, win, render_w, render_h):
+        """Map nm coordinates to high-res render pixels (same nm window as AFM)."""
+        nm_per_px_x = float(win['scan_x_nm']) / float(render_w)
+        nm_per_px_y = float(win['scan_y_nm']) / float(render_h)
+        px = (float(x_nm) - win['x_start']) / nm_per_px_x
+        py = (float(render_h) - 1.0) - (float(y_nm) - win['y_start']) / nm_per_px_y
+        return px, py
+
+    def _display_structure_opacity(self):
+        """Opacity from Display Settings (0–1), separate from Impose overlay blend slider."""
+        try:
+            if hasattr(self, 'opacity_slider'):
+                return min(max(float(self.opacity_slider.value()) / 100.0, 0.0), 1.0)
+        except Exception:
+            pass
+        return 1.0
+
+    def _display_settings_style(self):
+        if hasattr(self, 'style_combo'):
+            try:
+                return str(self.style_combo.currentText())
+            except Exception:
+                pass
+        return "Spheres"
+
+    def _apply_display_opacity_to_pixmap(self, pixmap):
+        """Scale pixmap alpha by Display Settings opacity."""
+        from PyQt5.QtGui import QImage, QPixmap
+
+        if pixmap is None or pixmap.isNull():
+            return pixmap
+        alpha_scale = self._display_structure_opacity()
+        if alpha_scale >= 0.999:
+            return pixmap
+        img = pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
+        if img.isNull():
+            return pixmap
+        w, h = img.width(), img.height()
+        for y in range(h):
+            for x in range(w):
+                px = img.pixel(x, y)
+                a = (px >> 24) & 0xFF
+                if a <= 0:
+                    continue
+                na = int(round(a * alpha_scale))
+                img.setPixel(x, y, (na << 24) | (px & 0x00FFFFFF))
+        out = QPixmap.fromImage(img)
+        return out if not out.isNull() else pixmap
+
+    def _overlay_atom_limit_for_quality(self):
+        quality = self.quality_combo.currentText() if hasattr(self, 'quality_combo') else "Good"
+        if quality == "Fast":
+            return 15000
+        if quality == "High":
+            return 60000
+        return 40000
+
+    def _overlay_sphere_radius_px(self, style, size_factor, nm_per_px):
+        """Approximate on-screen atom radius (px) for QPainter fallback."""
+        sf = float(size_factor)
+        npp = max(float(nm_per_px), 1e-9)
+        if style == "Points":
+            return max(2.5, 0.10 * sf / npp)
+        if style == "Stick Only":
+            return max(1.0, 0.02 * sf / npp)
+        if style == "Ball & Stick":
+            return max(2.0, 0.10 * sf / npp)
+        return max(3.0, 0.15 * sf / npp)
+
+    def _overlay_prefers_vtk_capture(self, style=None):
+        """Styles that need VTK capture (QPainter cannot approximate them)."""
+        if style is None:
+            style = self._display_settings_style()
+        # Cartoon / Ribbon are drawn by _render_cartoon_overlay_qpainter.
+        return style in ("Ball & Stick", "Stick Only", "Wireframe")
+
+    def _overlay_skip_qpainter_atoms(self, style):
+        """QPainter cannot draw stick-only; defer to VTK when possible."""
+        return style == "Stick Only"
+
+    def _collect_ca_backbone_segments(self, rotated):
+        """CA (or P) backbone polylines per chain in residue order."""
+        if self.atoms_data is None or rotated is None:
+            return []
+        atom_names = np.asarray(self.atoms_data['atom_name'])
+        ca_mask = atom_names == 'CA'
+        if not np.any(ca_mask):
+            ca_mask = atom_names == 'P'
+        if not np.any(ca_mask):
+            return []
+        chain_ids = np.asarray(self.atoms_data['chain_id'])[ca_mask]
+        residue_ids = np.asarray(self.atoms_data['residue_id'])[ca_mask]
+        elements = np.asarray(self.atoms_data['element'])[ca_mask]
+        b_factors = np.asarray(self.atoms_data['b_factor'])[ca_mask]
+        x = np.asarray(rotated[ca_mask, 0], dtype=np.float64)
+        y = np.asarray(rotated[ca_mask, 1], dtype=np.float64)
+        z = np.asarray(rotated[ca_mask, 2], dtype=np.float64)
+
+        segments = []
+        for chain in np.unique(chain_ids):
+            cm = chain_ids == chain
+            order = np.argsort(residue_ids[cm], kind='mergesort')
+            seg_x = x[cm][order]
+            seg_y = y[cm][order]
+            seg_z = z[cm][order]
+            if seg_x.size < 2:
+                continue
+            segments.append({
+                'chain': chain,
+                'x': seg_x,
+                'y': seg_y,
+                'z': seg_z,
+                'residue_id': residue_ids[cm][order],
+                'elements': elements[cm][order],
+                'b_factors': b_factors[cm][order],
+            })
+        return segments
+
+    @staticmethod
+    def _catmull_rom_xy(p0, p1, p2, p3, t):
+        """Catmull-Rom interpolation on 3D points; returns (x, y, z)."""
+        t = float(t)
+        p0 = np.asarray(p0, dtype=np.float64)
+        p1 = np.asarray(p1, dtype=np.float64)
+        p2 = np.asarray(p2, dtype=np.float64)
+        p3 = np.asarray(p3, dtype=np.float64)
+        pt = (
+            0.5 * (
+                (2.0 * p1)
+                + (-p0 + p2) * t
+                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * (t * t)
+                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * (t * t * t)
+            )
+        )
+        return float(pt[0]), float(pt[1]), float(pt[2])
+
+    def _ribbon_ss_width_nm(self, ss_type, size_factor):
+        if ss_type == 'H':
+            return 0.6 * size_factor
+        if ss_type == 'E':
+            return 0.8 * size_factor
+        return 0.2 * size_factor
+
+    def _render_cartoon_overlay_qpainter(self, render_w, render_h, win, style):
+        """2D CA backbone overlay for Simple Cartoon / Ribbon (macOS-safe, no VTK capture)."""
+        from PyQt5.QtGui import QImage, QPainter, QColor, QPen, QPixmap
+        from PyQt5.QtCore import Qt, QPointF
+
+        rotated = self.get_rotated_atom_coords()
+        segments = self._collect_ca_backbone_segments(rotated)
+        if not segments:
+            return None
+
+        size_factor = float(self.size_slider.value()) / 100.0 if hasattr(self, 'size_slider') else 1.0
+        nm_per_px = float(win['scan_x_nm']) / float(max(render_w, 1))
+        cartoon_width_px = max(2.5, 0.30 * size_factor / max(nm_per_px, 1e-9))
+
+        img = QImage(int(render_w), int(render_h), QImage.Format_ARGB32)
+        img.fill(0)
+        painter = QPainter(img)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setBrush(Qt.NoBrush)
+
+        painted = 0
+        subdivisions = 6
+
+        for seg in segments:
+            xs = seg['x']
+            ys = seg['y']
+            zs = seg['z']
+            chain = seg['chain']
+            n = int(xs.size)
+
+            if style == "Ribbon" and n >= 4:
+                ss_types = []
+                for res_id in seg['residue_id']:
+                    key = (chain, res_id)
+                    ss_types.append(self.secondary_structure.get(key, 'C'))
+
+                for i in range(n - 1):
+                    p0_idx = max(0, i - 1)
+                    p1_idx = i
+                    p2_idx = i + 1
+                    p3_idx = min(n - 1, i + 2)
+                    p0 = (xs[p0_idx], ys[p0_idx], zs[p0_idx])
+                    p1 = (xs[p1_idx], ys[p1_idx], zs[p1_idx])
+                    p2 = (xs[p2_idx], ys[p2_idx], zs[p2_idx])
+                    p3 = (xs[p3_idx], ys[p3_idx], zs[p3_idx])
+                    color1 = self.get_atom_color(
+                        seg['elements'][p1_idx], chain, seg['b_factors'][p1_idx],
+                    )
+                    color2 = self.get_atom_color(
+                        seg['elements'][p2_idx], chain, seg['b_factors'][p2_idx],
+                    )
+                    ss_type = ss_types[p1_idx]
+                    width_px = max(
+                        2.0,
+                        self._ribbon_ss_width_nm(ss_type, size_factor) / max(nm_per_px, 1e-9),
+                    )
+                    prev_pt = None
+                    for j in range(subdivisions + 1):
+                        t = j / float(subdivisions)
+                        cx, cy, _cz = self._catmull_rom_xy(p0, p1, p2, p3, t)
+                        px, py = self._nm_xy_to_render_px(cx, cy, win, render_w, render_h)
+                        u = 1.0 - t
+                        color = (
+                            color1[0] * u + color2[0] * t,
+                            color1[1] * u + color2[1] * t,
+                            color1[2] * u + color2[2] * t,
+                        )
+                        pt = QPointF(px, py)
+                        if prev_pt is not None:
+                            pen = QPen(QColor(
+                                int(color[0] * 255), int(color[1] * 255), int(color[2] * 255), 255,
+                            ))
+                            pen.setWidthF(width_px)
+                            pen.setCapStyle(Qt.RoundCap)
+                            pen.setJoinStyle(Qt.RoundJoin)
+                            painter.setPen(pen)
+                            painter.drawLine(prev_pt, pt)
+                            painted += 1
+                        prev_pt = pt
+            else:
+                pen_width = cartoon_width_px
+                for i in range(n - 1):
+                    color = self.get_atom_color(
+                        seg['elements'][i], chain, seg['b_factors'][i],
+                    )
+                    px0, py0 = self._nm_xy_to_render_px(xs[i], ys[i], win, render_w, render_h)
+                    px1, py1 = self._nm_xy_to_render_px(xs[i + 1], ys[i + 1], win, render_w, render_h)
+                    pen = QPen(QColor(
+                        int(color[0] * 255), int(color[1] * 255), int(color[2] * 255), 255,
+                    ))
+                    pen.setWidthF(pen_width)
+                    pen.setCapStyle(Qt.RoundCap)
+                    pen.setJoinStyle(Qt.RoundJoin)
+                    painter.setPen(pen)
+                    painter.drawLine(QPointF(px0, py0), QPointF(px1, py1))
+                    painted += 1
+
+        painter.end()
+        if painted == 0:
+            self._overlay_last_qpainter_atoms = 0
+            return None
+        pixmap = QPixmap.fromImage(img)
+        if pixmap.isNull():
+            self._overlay_last_qpainter_atoms = 0
+            return None
+        self._overlay_last_qpainter_atoms = int(painted)
+        print(f"[INFO] Impose model: QPainter cartoon ({style}) {painted} segments -> {render_w}x{render_h}")
+        return pixmap
+
+    def _capture_vtk_model_overlay_qpixmap(self, render_w, render_h, scan_x_nm, scan_y_nm, center_x, center_y):
+        """VTK orthographic capture at high resolution; returns QPixmap with transparency."""
+        rgba = self._capture_vtk_model_overlay_rgba(
+            render_w, render_h, scan_x_nm, scan_y_nm, center_x, center_y,
+        )
+        if rgba is None or not self._overlay_capture_is_substantial(rgba, render_w, render_h):
+            return None
+        return self._rgba_array_to_qpixmap(rgba)
+
+    def _render_atoms_overlay_qpainter(self, render_w, render_h, win):
+        """High-res QPainter render fallback (nm-scaled; mirrors Display Settings approximately)."""
+        from PyQt5.QtGui import QImage, QPainter, QColor, QBrush, QPixmap
+        from PyQt5.QtCore import Qt, QRectF
+
+        style = self._display_settings_style()
+        if style in ("Simple Cartoon", "Ribbon"):
+            return self._render_cartoon_overlay_qpainter(render_w, render_h, win, style)
+        if self._overlay_skip_qpainter_atoms(style):
+            return None
+
+        rotated = self.get_rotated_atom_coords()
+        if rotated is None or len(rotated) == 0:
+            return None
+
+        filt = self.get_filtered_atoms()
+        if filt[0] is None:
+            return None
+        mask = np.asarray(filt[6], dtype=bool)
+        elements = np.asarray(filt[3])
+        chain_ids = np.asarray(filt[4])
+        b_factors = np.asarray(filt[5])
+
+        x = np.asarray(rotated[mask, 0], dtype=np.float64)
+        y = np.asarray(rotated[mask, 1], dtype=np.float64)
+        z = np.asarray(rotated[mask, 2], dtype=np.float64)
+
+        valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+        if not np.any(valid):
+            return None
+
+        idxs = np.flatnonzero(valid)
+        atom_limit = self._overlay_atom_limit_for_quality()
+        if idxs.size > atom_limit:
+            idxs = np.random.choice(idxs, atom_limit, replace=False)
+
+        size_factor = float(self.size_slider.value()) / 100.0 if hasattr(self, 'size_slider') else 1.0
+        nm_per_px = float(win['scan_x_nm']) / float(render_w)
+        radius_px = self._overlay_sphere_radius_px(style, size_factor, nm_per_px)
+
+        img = QImage(int(render_w), int(render_h), QImage.Format_ARGB32)
+        img.fill(0)
+        painter = QPainter(img)
+        painter.setRenderHint(QPainter.Antialiasing, style != "Points")
+        painter.setPen(Qt.NoPen)
+
+        order = idxs[np.argsort(z[idxs], kind='mergesort')]
+        painted = 0
+        for i in order:
+            px, py = self._nm_xy_to_render_px(x[i], y[i], win, render_w, render_h)
+            if px < -radius_px or py < -radius_px or px > render_w + radius_px or py > render_h + radius_px:
+                continue
+            color = self.get_atom_color(elements[i], chain_ids[i], b_factors[i])
+            painter.setBrush(QBrush(QColor(
+                int(color[0] * 255), int(color[1] * 255), int(color[2] * 255), 255,
+            )))
+            painter.drawEllipse(QRectF(px - radius_px, py - radius_px, 2.0 * radius_px, 2.0 * radius_px))
+            painted += 1
+        painter.end()
+
+        if painted == 0:
+            self._overlay_last_qpainter_atoms = 0
+            return None
+        pixmap = QPixmap.fromImage(img)
+        if pixmap.isNull():
+            self._overlay_last_qpainter_atoms = 0
+            return None
+        self._overlay_last_qpainter_atoms = int(painted)
+        print(f"[INFO] Impose model: QPainter ({style}) {painted} atoms -> {render_w}x{render_h} PNG")
+        return pixmap
+
+    def _build_model_overlay_png_pixmap(self):
+        """Render PDB model to a high-res transparent PNG framed on the AFM scan window (nm)."""
+        if self.atoms_data is None:
+            print("[WARNING] Impose model: no PDB loaded")
+            return None
+
+        win = self._impose_scan_window_nm()
+        if win is None:
+            print("[WARNING] Impose model: scan window metadata is incomplete")
+            return None
+
+        self._auto_center_tip_for_impose_if_needed(
+            win['scan_x_nm'], win['scan_y_nm'], win['disp_w'], win['disp_h'],
+        )
+        win = self._impose_scan_window_nm()
+        if win is None:
+            return None
+
+        render_w, render_h = self._overlay_render_pixel_size(win)
+        center_x = win['center_x']
+        center_y = win['center_y']
+        style = self._display_settings_style()
+        qp_pixmap = self._render_atoms_overlay_qpainter(render_w, render_h, win)
+        painted = int(getattr(self, '_overlay_last_qpainter_atoms', 0))
+        pixmap = None
+
+        # QPainter is authoritative whenever it painted atoms (stable on macOS).
+        if painted > 0 and self._pixmap_is_valid_overlay(qp_pixmap):
+            pixmap = qp_pixmap
+            print(f"[INFO] Impose model: using QPainter ({style}), {painted} atoms")
+
+        elif (
+            self._overlay_vtk_capture_enabled()
+            and self._overlay_prefers_vtk_capture(style)
+        ):
+            self._ensure_vtk_molecule_actors_for_overlay()
+            vtk_pixmap = self._capture_vtk_model_overlay_qpixmap(
+                render_w, render_h, win['scan_x_nm'], win['scan_y_nm'], center_x, center_y,
+            )
+            if self._pixmap_is_usable_overlay(vtk_pixmap, render_w, render_h):
+                pixmap = vtk_pixmap
+                print(f"[INFO] Impose model: VTK ({style}) -> {render_w}x{render_h} PNG")
+
+        if pixmap is None:
+            splat_pixmap = self._build_model_overlay_pixmap_splat_at_size(
+                render_w, render_h, win, allow_stick_only_fallback=True,
+            )
+            if splat_pixmap is not None and not splat_pixmap.isNull():
+                opaque = self._pixmap_opaque_pixel_count(splat_pixmap, sample_stride=1)
+                if opaque >= self._overlay_min_opaque_pixels(render_w, render_h) or opaque >= 32:
+                    pixmap = splat_pixmap
+                    print(f"[INFO] Impose model: splat fallback -> {render_w}x{render_h} PNG ({opaque} px)")
+
+        if pixmap is None or pixmap.isNull():
+            print("[WARNING] Impose model: failed to render model PNG")
+            return None
+
+        pixmap = self._apply_display_opacity_to_pixmap(pixmap)
+        return self._apply_pose_shift_to_pixmap(pixmap, win)
+
+    def _apply_pose_shift_to_pixmap(self, pixmap, win=None):
+        """Apply Estimate Pose residual (dx_px, dy_px in AFM pixels) to overlay PNG."""
+        from PyQt5.QtGui import QImage, QPixmap, QPainter
+
+        if pixmap is None or pixmap.isNull():
+            return None
+        pose = getattr(self, 'pose', None)
+        if not isinstance(pose, dict):
+            return pixmap
+        try:
+            dx = float(pose.get('dx_px', 0.0))
+            dy = float(pose.get('dy_px', 0.0))
+        except Exception:
+            return pixmap
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return pixmap
+
+        if isinstance(win, dict):
+            disp_w = max(1, int(win.get('disp_w', pixmap.width())))
+            disp_h = max(1, int(win.get('disp_h', pixmap.height())))
+            dx = dx * (float(pixmap.width()) / float(disp_w))
+            dy = dy * (float(pixmap.height()) / float(disp_h))
+
+        img = pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
+        w, h = img.width(), img.height()
+        shifted = QImage(w, h, QImage.Format_ARGB32)
+        shifted.fill(0)
+        p = QPainter(shifted)
+        p.drawImage(int(round(dx)), int(round(dy)), img)
+        p.end()
+        out = QPixmap.fromImage(shifted)
+        if out.isNull():
+            return pixmap
+        if self._pixmap_has_visible_pixels(out, min_pixels=10):
+            return out
+        print("[WARNING] Impose model: pose shift removed overlay; keeping unshifted image")
+        return pixmap
+
+    def _overlay_opaque_pixel_count(self, rgba):
+        try:
+            arr = np.asarray(rgba)
+            if arr.ndim != 3 or arr.shape[2] < 4:
+                return 0
+            return int(np.count_nonzero(arr[:, :, 3]))
+        except Exception:
+            return 0
+
+    def _overlay_capture_is_substantial(self, rgba, disp_w, disp_h, min_fraction=0.0005, min_pixels=200):
+        count = self._overlay_opaque_pixel_count(rgba)
+        if count <= 0:
+            return False
+        total = max(1, int(disp_w) * int(disp_h))
+        return count >= max(int(min_pixels), int(round(total * float(min_fraction))))
+
+    def _paint_disk_rgba(self, rgba, cx, cy, radius, color_rgba):
+        """Paint a filled disk onto an RGBA uint8 image (in-place)."""
+        if rgba is None or radius <= 0:
+            return
+        h, w = int(rgba.shape[0]), int(rgba.shape[1])
+        cx_i = int(round(float(cx)))
+        cy_i = int(round(float(cy)))
+        r = int(max(1, round(float(radius))))
+        y0 = max(0, cy_i - r)
+        y1 = min(h, cy_i + r + 1)
+        x0 = max(0, cx_i - r)
+        x1 = min(w, cx_i + r + 1)
+        if y0 >= y1 or x0 >= x1:
+            return
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        disk = ((xx - cx_i) ** 2 + (yy - cy_i) ** 2) <= (r * r)
+        patch = rgba[y0:y1, x0:x1]
+        patch[disk] = color_rgba
+
+    def _build_model_overlay_pixmap_splat(self):
+        """Project rotated PDB atoms onto the Real AFM grid as coloured spheres."""
+        real = getattr(self, 'real_afm_nm', None)
+        if real is None or self.atoms_data is None:
+            return None
+        meta = self._get_real_afm_simulation_meta()
+        if meta is None:
+            return None
+        scan_x_nm, scan_y_nm, nx, ny = meta
+        try:
+            disp_h, disp_w = int(real.shape[0]), int(real.shape[1])
+        except Exception:
+            return None
+        if disp_w <= 0 or disp_h <= 0 or scan_x_nm <= 0 or scan_y_nm <= 0:
+            return None
+
+        self._auto_center_tip_for_impose_if_needed(scan_x_nm, scan_y_nm, nx, ny)
+        center_x = self.tip_x_slider.value() / 5.0
+        center_y = self.tip_y_slider.value() / 5.0
+        x_start = center_x - float(scan_x_nm) / 2.0
+        y_start = center_y - float(scan_y_nm) / 2.0
+
+        rotated = self.get_rotated_atom_coords()
+        if rotated is None:
+            return None
+        filt = self.get_filtered_atoms()
+        if filt[0] is None:
+            return None
+        mask = filt[6]
+        elements = filt[3]
+        chain_ids = filt[4]
+        b_factors = filt[5]
+
+        x = np.asarray(rotated[mask, 0], dtype=np.float64)
+        y = np.asarray(rotated[mask, 1], dtype=np.float64)
+        z = np.asarray(rotated[mask, 2], dtype=np.float64)
+        valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+        if not np.any(valid):
+            return None
+        x, y, z = x[valid], y[valid], z[valid]
+        elements = elements[valid]
+        chain_ids = chain_ids[valid]
+        b_factors = b_factors[valid]
+        if x.size > 20000:
+            pick = np.random.choice(x.size, 20000, replace=False)
+            x, y, z = x[pick], y[pick], z[pick]
+            elements = elements[pick]
+            chain_ids = chain_ids[pick]
+            b_factors = b_factors[pick]
+
+        size_factor = float(self.size_slider.value()) / 100.0 if hasattr(self, 'size_slider') else 1.0
+        nm_per_px_x = float(scan_x_nm) / float(max(disp_w, 1))
+        sphere_nm = max(0.05, 0.15 * size_factor)
+        radius_px = max(2, int(round(sphere_nm / max(nm_per_px_x, 1e-6))))
+
+        rgba = np.zeros((disp_h, disp_w, 4), dtype=np.uint8)
+        order = np.argsort(z, kind='mergesort')
+        for idx in order:
+            px = (float(x[idx]) - x_start) / float(scan_x_nm) * float(disp_w)
+            py = (float(y[idx]) - y_start) / float(scan_y_nm) * float(disp_h)
+            if px < -radius_px or py < -radius_px or px > disp_w + radius_px or py > disp_h + radius_px:
+                continue
+            color = self.get_atom_color(elements[idx], chain_ids[idx], b_factors[idx])
+            color_rgba = np.array(
+                [int(color[0] * 255), int(color[1] * 255), int(color[2] * 255), 255],
+                dtype=np.uint8,
+            )
+            self._paint_disk_rgba(rgba, px, py, radius_px, color_rgba)
+
+        if not np.any(rgba[:, :, 3]):
+            print("[WARNING] Impose model: atom splat produced an empty overlay")
+            return None
+
+        rgba_display = np.ascontiguousarray(np.flipud(rgba))
+        return self._finalize_model_overlay_rgba(rgba_display, struct_opacity=1.0)
+
+    def _build_model_overlay_pixmap_splat_at_size(self, render_w, render_h, win, allow_stick_only_fallback=False):
+        """High-res splat fallback: project atoms onto a nm-scaled render grid."""
+        if self.atoms_data is None or win is None:
+            return None
+        render_w = int(render_w)
+        render_h = int(render_h)
+        if render_w <= 0 or render_h <= 0:
+            return None
+
+        rotated = self.get_rotated_atom_coords()
+        if rotated is None:
+            return None
+        filt = self.get_filtered_atoms()
+        if filt[0] is None:
+            return None
+        mask = np.asarray(filt[6], dtype=bool)
+        elements = np.asarray(filt[3])
+        chain_ids = np.asarray(filt[4])
+        b_factors = np.asarray(filt[5])
+
+        x = np.asarray(rotated[mask, 0], dtype=np.float64)
+        y = np.asarray(rotated[mask, 1], dtype=np.float64)
+        z = np.asarray(rotated[mask, 2], dtype=np.float64)
+        valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+        if not np.any(valid):
+            return None
+        x, y, z = x[valid], y[valid], z[valid]
+        elements = elements[valid]
+        chain_ids = chain_ids[valid]
+        b_factors = b_factors[valid]
+        if x.size > self._overlay_atom_limit_for_quality():
+            pick = np.random.choice(x.size, self._overlay_atom_limit_for_quality(), replace=False)
+            x, y, z = x[pick], y[pick], z[pick]
+            elements = elements[pick]
+            chain_ids = chain_ids[pick]
+            b_factors = b_factors[pick]
+
+        style = self._display_settings_style()
+        if self._overlay_skip_qpainter_atoms(style) and not allow_stick_only_fallback:
+            return None
+
+        size_factor = float(self.size_slider.value()) / 100.0 if hasattr(self, 'size_slider') else 1.0
+        nm_per_px = float(win['scan_x_nm']) / float(render_w)
+        radius_px = self._overlay_sphere_radius_px(style, size_factor, nm_per_px)
+
+        rgba = np.zeros((render_h, render_w, 4), dtype=np.uint8)
+        order = np.argsort(z, kind='mergesort')
+        for idx in order:
+            px, py = self._nm_xy_to_render_px(x[idx], y[idx], win, render_w, render_h)
+            if px < -radius_px or py < -radius_px or px > render_w + radius_px or py > render_h + radius_px:
+                continue
+            color = self.get_atom_color(elements[idx], chain_ids[idx], b_factors[idx])
+            color_rgba = np.array(
+                [int(color[0] * 255), int(color[1] * 255), int(color[2] * 255), 255],
+                dtype=np.uint8,
+            )
+            self._paint_disk_rgba(rgba, px, py, radius_px, color_rgba)
+
+        if not np.any(rgba[:, :, 3]):
+            return None
+        return self._rgba_array_to_qpixmap(rgba)
+
+    def _finalize_model_overlay_rgba(self, rgba, struct_opacity=1.0):
+        """Apply pose shift, optional alpha scaling, and convert to QPixmap."""
+        if rgba is None:
+            return None
+        rgba = np.asarray(rgba, dtype=np.uint8)
+        if rgba.ndim != 3 or rgba.shape[2] < 4 or not np.any(rgba[:, :, 3]):
+            return None
+
+        alpha_scale = min(max(float(struct_opacity), 0.0), 1.0)
+        if alpha_scale < 1.0:
+            rgba = rgba.copy()
+            rgba[:, :, 3] = (rgba[:, :, 3].astype(np.float32) * alpha_scale).astype(np.uint8)
+
+        pose = getattr(self, 'pose', None)
+        if isinstance(pose, dict):
+            try:
+                dx = float(pose.get('dx_px', 0.0))
+                dy = float(pose.get('dy_px', 0.0))
+            except Exception:
+                dx = dy = 0.0
+            if abs(dx) > 1e-6 or abs(dy) > 1e-6:
+                before = int(np.count_nonzero(rgba[:, :, 3]))
+                shifted = rgba.copy()
+                for ch in range(4):
+                    shifted[:, :, ch] = scipy.ndimage.shift(
+                        shifted[:, :, ch], shift=(dy, dx), order=0, mode='constant', cval=0.0,
+                    )
+                after = int(np.count_nonzero(shifted[:, :, 3]))
+                if after > 0 or before == 0:
+                    rgba = shifted
+                else:
+                    print("[WARNING] Impose model: pose shift removed overlay; keeping unshifted image")
+
+        return self._rgba_array_to_qpixmap(rgba)
+
+    def _capture_vtk_model_overlay_rgba(self, disp_w, disp_h, scan_x_nm, scan_y_nm, center_x, center_y):
+        """Capture the current VTK molecule render framed on the AFM scan window.
+
+        Uses the existing ``vtk_widget`` render window (same path as Save 3D View) because
+        macOS off-screen ``vtkRenderWindow`` instances often return empty buffers.
+        """
+        if disp_w <= 0 or disp_h <= 0 or scan_x_nm <= 0 or scan_y_nm <= 0:
+            return None
+        if not self._ensure_vtk_molecule_actors_for_overlay():
+            print("[WARNING] Impose model: failed to build VTK overlay actors")
+            return None
+
+        vtk_widget = getattr(self, 'vtk_widget', None)
+        if vtk_widget is None or not getattr(self, 'renderer', None):
+            print("[WARNING] Impose model: VTK widget/renderer unavailable")
+            return None
+        rw = vtk_widget.GetRenderWindow()
+        if rw is None:
+            print("[WARNING] Impose model: VTK render window unavailable")
+            return None
+
+        actors = self._collect_model_overlay_vtk_actors()
+        if not actors:
+            print("[WARNING] Impose model: no VTK actors to capture")
+            return None
+
+        cam = self.renderer.GetActiveCamera()
+        if cam is None:
+            return None
+
+        saved_size = list(rw.GetSize())
+        if saved_size[0] < 16 or saved_size[1] < 16:
+            try:
+                saved_size = [
+                    max(16, int(vtk_widget.width())),
+                    max(16, int(vtk_widget.height())),
+                ]
+            except Exception:
+                saved_size = [max(16, int(disp_w)), max(16, int(disp_h))]
+        capture_bg = (1.0, 0.0, 1.0)
+        bg_rgb = (255, 0, 255)
+        saved_bg = self.renderer.GetBackground()
+        try:
+            saved_bg_alpha = float(self.renderer.GetBackgroundAlpha())
+        except Exception:
+            saved_bg_alpha = 1.0
+        saved_cam = {
+            'position': cam.GetPosition(),
+            'focal': cam.GetFocalPoint(),
+            'view_up': cam.GetViewUp(),
+            'parallel': bool(cam.GetParallelProjection()),
+            'parallel_scale': float(cam.GetParallelScale()),
+            'view_angle': float(cam.GetViewAngle()),
+            'clipping_range': cam.GetClippingRange(),
+        }
+
+        tip_actor = getattr(self, 'tip_actor', None)
+        tip_was_visible = None
+        if tip_actor is not None:
+            try:
+                tip_was_visible = bool(tip_actor.GetVisibility())
+                tip_actor.SetVisibility(0)
+            except Exception:
+                tip_was_visible = None
+
+        orient_widget = getattr(self, 'orientation_widget', None)
+        orient_was_enabled = None
+        if orient_widget is not None:
+            try:
+                orient_was_enabled = bool(orient_widget.GetEnabled())
+                orient_widget.SetEnabled(0)
+            except Exception:
+                orient_was_enabled = None
+
+        vtk_container = getattr(self, 'vtk_view_container', None)
+        container_was_visible = bool(vtk_container.isVisible()) if vtk_container is not None else True
+        if vtk_container is not None and not container_was_visible:
+            try:
+                vtk_container.setVisible(True)
+                QApplication.processEvents()
+            except Exception:
+                container_was_visible = True
+
+        bounds = self._get_structure_bounds_for_camera_fit()
+        if bounds is not None:
+            z_center = 0.5 * (bounds[4] + bounds[5])
+            z_extent = max(bounds[5] - bounds[4], 1.0)
+        else:
+            z_center = 0.0
+            z_extent = 100.0
+
+        actor_opacities = []
+        for actor in actors:
+            try:
+                prop = actor.GetProperty()
+                actor_opacities.append(float(prop.GetOpacity()))
+                prop.SetOpacity(1.0)
+            except Exception:
+                actor_opacities.append(None)
+
+        try:
+            self.renderer.SetBackground(capture_bg[0], capture_bg[1], capture_bg[2])
+            try:
+                self.renderer.SetBackgroundAlpha(1.0)
+            except Exception:
+                pass
+
+            cam.SetParallelProjection(True)
+            cam.SetFocalPoint(float(center_x), float(center_y), float(z_center))
+            cam.SetPosition(
+                float(center_x), float(center_y), float(z_center + max(200.0, z_extent * 3.0)),
+            )
+            cam.SetViewUp(0.0, 1.0, 0.0)
+            aspect_img = float(disp_w) / float(disp_h)
+            ps_y = float(scan_y_nm) / 2.0
+            ps_x = float(scan_x_nm) / (2.0 * aspect_img)
+            cam.SetParallelScale(max(ps_y, ps_x))
+            self.renderer.ResetCameraClippingRange()
+
+            rw.SetSize(int(disp_w), int(disp_h))
+            try:
+                vtk_widget.setVisible(True)
+                QApplication.processEvents()
+            except Exception:
+                pass
+            rw.Render()
+
+            rgba = None
+            for buffer_type, label in (("rgb", "RGB"), ("rgba", "RGBA")):
+                try:
+                    w2i = vtk.vtkWindowToImageFilter()
+                    w2i.SetInput(rw)
+                    if label == "RGBA":
+                        w2i.SetInputBufferTypeToRGBA()
+                    else:
+                        w2i.SetInputBufferTypeToRGB()
+                    w2i.ReadFrontBufferOff()
+                    w2i.SetScale(1)
+                    w2i.Update()
+                    if label == "RGBA":
+                        rgba = self._vtk_image_to_rgba_array(w2i.GetOutput())
+                    else:
+                        rgb = self._vtk_image_to_rgb_array(w2i.GetOutput())
+                        rgba = self._rgb_array_to_rgba_with_chroma_key(rgb, bg_rgb)
+                    if rgba is not None and np.any(rgba[:, :, 3] > 0):
+                        break
+                    rgba = None
+                except Exception as inner_e:
+                    print(f"[WARNING] Impose model: VTK {label} capture attempt failed: {inner_e}")
+                    rgba = None
+
+            if rgba is None or not np.any(rgba[:, :, 3]):
+                try:
+                    grabbed = vtk_widget.grab()
+                    if grabbed is not None and not grabbed.isNull():
+                        from PyQt5.QtGui import QImage
+                        qimg = grabbed.toImage().convertToFormat(QImage.Format_RGBA8888)
+                        if not qimg.isNull():
+                            qw, qh = qimg.width(), qimg.height()
+                            if qw > 0 and qh > 0:
+                                ptr = qimg.bits()
+                                ptr.setsize(qh * qw * 4)
+                                arr = np.frombuffer(ptr, dtype=np.uint8).reshape(qh, qw, 4).copy()
+                                rgb = arr[:, :, :3]
+                                keyed = self._rgb_array_to_rgba_with_chroma_key(rgb, bg_rgb, tolerance=40.0)
+                                if keyed is not None and np.any(keyed[:, :, 3] > 0):
+                                    rgba = keyed
+                except Exception as grab_e:
+                    print(f"[WARNING] Impose model: QWidget.grab fallback failed: {grab_e}")
+
+            if rgba is None or not np.any(rgba[:, :, 3]):
+                print("[WARNING] Impose model: VTK capture returned empty buffer")
+            return rgba
+        except Exception as e:
+            print(f"[WARNING] Impose model: VTK capture failed: {e}")
+            return None
+        finally:
+            for actor, saved_opacity in zip(actors, actor_opacities):
+                if saved_opacity is not None:
+                    try:
+                        actor.GetProperty().SetOpacity(saved_opacity)
+                    except Exception:
+                        pass
+            try:
+                self.renderer.SetBackground(saved_bg[0], saved_bg[1], saved_bg[2])
+                try:
+                    self.renderer.SetBackgroundAlpha(saved_bg_alpha)
+                except Exception:
+                    pass
+                cam.SetParallelProjection(saved_cam['parallel'])
+                cam.SetPosition(saved_cam['position'])
+                cam.SetFocalPoint(saved_cam['focal'])
+                cam.SetViewUp(saved_cam['view_up'])
+                cam.SetParallelScale(saved_cam['parallel_scale'])
+                cam.SetViewAngle(saved_cam['view_angle'])
+                cam.SetClippingRange(saved_cam['clipping_range'][0], saved_cam['clipping_range'][1])
+                if tip_actor is not None and tip_was_visible is not None:
+                    tip_actor.SetVisibility(1 if tip_was_visible else 0)
+                if orient_widget is not None and orient_was_enabled is not None:
+                    orient_widget.SetEnabled(1 if orient_was_enabled else 0)
+                if vtk_container is not None and not container_was_visible:
+                    try:
+                        vtk_container.setVisible(False)
+                    except Exception:
+                        pass
+                rw.SetSize(int(saved_size[0]), int(saved_size[1]))
+                rw.Render()
+            except Exception:
+                pass
+
+    def _capture_pymol_model_overlay_rgba(self, disp_w, disp_h, scan_x_nm, scan_y_nm, center_x, center_y):
+        """PyMOL off-screen render framed on the AFM scan window (PyMOL-only mode)."""
+        if not self._is_pymol_active() or self.pymol_cmd is None:
+            return None
+        if disp_w <= 0 or disp_h <= 0 or scan_x_nm <= 0 or scan_y_nm <= 0:
+            return None
+
+        frame_obj = "_pynud_scan_overlay_frame"
+        saved = {}
+        try:
+            saved['view'] = list(self.pymol_cmd.get_view())
+        except Exception:
+            saved['view'] = None
+        for key in ("opaque_background", "ray_opaque_background"):
+            try:
+                saved[key] = self.pymol_cmd.get(key)
+            except Exception:
+                pass
+
+        try:
+            cx_a = float(center_x) * 10.0
+            cy_a = float(center_y) * 10.0
+            hx_a = float(scan_x_nm) * 5.0
+            hy_a = float(scan_y_nm) * 5.0
+            z_a = 0.0
+            bounds = self._get_structure_bounds_for_camera_fit()
+            if bounds is not None:
+                z_a = 0.5 * (bounds[4] + bounds[5]) * 10.0
+
+            try:
+                self.pymol_cmd.delete(frame_obj)
+            except Exception:
+                pass
+            corner_names = []
+            for i, (px, py) in enumerate((
+                (cx_a - hx_a, cy_a - hy_a),
+                (cx_a + hx_a, cy_a - hy_a),
+                (cx_a - hx_a, cy_a + hy_a),
+                (cx_a + hx_a, cy_a + hy_a),
+            )):
+                name = f"{frame_obj}_{i}"
+                corner_names.append(name)
+                self.pymol_cmd.pseudoatom(name, pos=[px, py, z_a], color="white", vdw=0.01)
+            self.pymol_cmd.group(frame_obj, " ".join(corner_names))
+
+            self._pymol_set_standard_view('xy')
+            self.pymol_cmd.zoom(frame_obj, buffer=0)
+            self.pymol_cmd.viewport(int(disp_w), int(disp_h))
+            try:
+                self.pymol_cmd.set("opaque_background", 0)
+                self.pymol_cmd.set("ray_opaque_background", 0)
+            except Exception:
+                pass
+
+            tmp_path = os.path.join(tempfile.gettempdir(), "pynud_impose_overlay.png")
+            self.pymol_cmd.png(tmp_path, int(disp_w), int(disp_h), dpi=120, ray=0, quiet=1)
+            from PyQt5.QtGui import QImage
+            qimg = QImage(tmp_path)
+            if qimg.isNull():
+                return None
+            qimg = qimg.convertToFormat(QImage.Format_RGBA8888)
+            width, height = qimg.width(), qimg.height()
+            if width <= 0 or height <= 0:
+                return None
+            ptr = qimg.bits()
+            ptr.setsize(height * width * 4)
+            return np.frombuffer(ptr, dtype=np.uint8).reshape(height, width, 4).copy()
+        except Exception:
+            return None
+        finally:
+            try:
+                self.pymol_cmd.delete(frame_obj)
+            except Exception:
+                pass
+            if saved.get('view') is not None:
+                try:
+                    self.pymol_cmd.set_view(saved['view'])
+                except Exception:
+                    pass
+            for key in ("opaque_background", "ray_opaque_background"):
+                if key in saved:
+                    try:
+                        self.pymol_cmd.set(key, saved[key])
+                    except Exception:
+                        pass
+
+    def _auto_center_tip_for_impose_if_needed(self, scan_x_nm, scan_y_nm, nx, ny):
+        """Move the scan window onto the molecule when no atoms fall inside it."""
+        rotated = self.get_rotated_atom_coords()
+        if rotated is None or len(rotated) == 0:
+            return
+        try:
+            center_x = self.tip_x_slider.value() / 5.0
+            center_y = self.tip_y_slider.value() / 5.0
+            pixel_x = float(scan_x_nm) / float(max(nx, 1))
+            pixel_y = float(scan_y_nm) / float(max(ny, 1))
+            if pixel_x <= 0 or pixel_y <= 0:
+                return
+            x_start = center_x - float(scan_x_nm) / 2.0
+            y_start = center_y - float(scan_y_nm) / 2.0
+            x = np.asarray(rotated[:, 0], dtype=np.float64)
+            y = np.asarray(rotated[:, 1], dtype=np.float64)
+            ix = np.floor((x - x_start) / pixel_x).astype(np.int32)
+            iy = np.floor((y - y_start) / pixel_y).astype(np.int32)
+            inside = (ix >= 0) & (ix < int(nx)) & (iy >= 0) & (iy < int(ny))
+            if np.any(inside):
+                return
+            cx = float(np.median(x[np.isfinite(x)]))
+            cy = float(np.median(y[np.isfinite(y)]))
+            if hasattr(self, 'tip_x_slider'):
+                self.tip_x_slider.setValue(int(round(cx * 5.0)))
+            if hasattr(self, 'tip_y_slider'):
+                self.tip_y_slider.setValue(int(round(cy * 5.0)))
+        except Exception:
+            pass
+
+    def _build_model_overlay_pixmap(self):
+        """Build a transparent PNG overlay aligned 1:1 with the Real AFM image pixels."""
+        return self._build_model_overlay_png_pixmap()
+
+    def _build_model_overlay_pixmap_binning(self):
+        """Fallback: rasterize max-Z surface atoms onto the Real AFM grid."""
+        real = getattr(self, 'real_afm_nm', None)
+        if real is None or self.atoms_data is None:
+            return None
+        meta = self._get_real_afm_simulation_meta()
+        if meta is None:
+            return None
+        scan_x_nm, scan_y_nm, nx, ny = meta
+        nx = int(nx)
+        ny = int(ny)
+        try:
+            disp_h, disp_w = int(real.shape[0]), int(real.shape[1])
+        except Exception:
+            return None
+        if disp_w <= 0 or disp_h <= 0 or nx <= 0 or ny <= 0:
+            return None
+
+        rotated = self.get_rotated_atom_coords()
+        if rotated is None:
+            return None
+        filt = self.get_filtered_atoms()
+        if filt[0] is None:
+            return None
+        mask = filt[6]
+        elements = filt[3]
+        chain_ids = filt[4]
+        b_factors = filt[5]
+
+        x = np.asarray(rotated[mask, 0], dtype=np.float64)
+        y = np.asarray(rotated[mask, 1], dtype=np.float64)
+        z = np.asarray(rotated[mask, 2], dtype=np.float64)
+
+        style = self.style_combo.currentText() if hasattr(self, 'style_combo') else "Spheres"
+
+        if style in ("Simple Cartoon", "Ribbon"):
+            atom_names = self.atoms_data.get('atom_name', None)
+            if atom_names is not None:
+                ca_mask = np.array([str(n).strip().upper() == 'CA' for n in atom_names[mask]], dtype=bool)
+                if np.any(ca_mask):
+                    x, y, z = x[ca_mask], y[ca_mask], z[ca_mask]
+                    elements = elements[ca_mask]
+                    chain_ids = chain_ids[ca_mask]
+                    b_factors = b_factors[ca_mask]
+
+        center_x = self.tip_x_slider.value() / 5.0
+        center_y = self.tip_y_slider.value() / 5.0
+        pixel_x = scan_x_nm / float(nx)
+        pixel_y = scan_y_nm / float(ny)
+        if pixel_x <= 0 or pixel_y <= 0:
+            return None
+        x_start = center_x - scan_x_nm / 2.0
+        y_start = center_y - scan_y_nm / 2.0
+
+        # Identical binning to AFMSimulationWorker.create_atom_center_surface.
+        ix_sim = np.floor((x - x_start) / pixel_x).astype(np.int32)
+        iy_sim = np.floor((y - y_start) / pixel_y).astype(np.int32)
+        in_sim = (
+            np.isfinite(z)
+            & (ix_sim >= 0) & (ix_sim < nx)
+            & (iy_sim >= 0) & (iy_sim < ny)
+        )
+        if not np.any(in_sim):
+            # Retry once after centering the scan window on the molecule.
+            try:
+                cx = float(np.median(x[np.isfinite(x)]))
+                cy = float(np.median(y[np.isfinite(y)]))
+                if hasattr(self, 'tip_x_slider'):
+                    self.tip_x_slider.setValue(int(round(cx * 5.0)))
+                if hasattr(self, 'tip_y_slider'):
+                    self.tip_y_slider.setValue(int(round(cy * 5.0)))
+                center_x = cx
+                center_y = cy
+                x_start = center_x - scan_x_nm / 2.0
+                y_start = center_y - scan_y_nm / 2.0
+                ix_sim = np.floor((x - x_start) / pixel_x).astype(np.int32)
+                iy_sim = np.floor((y - y_start) / pixel_y).astype(np.int32)
+                in_sim = (
+                    np.isfinite(z)
+                    & (ix_sim >= 0) & (ix_sim < nx)
+                    & (iy_sim >= 0) & (iy_sim < ny)
+                )
+            except Exception:
+                pass
+        if not np.any(in_sim):
+            print("[WARNING] Impose model: no atoms inside the AFM scan window")
+            return None
+
+        ix_sim = ix_sim[in_sim]
+        iy_sim = iy_sim[in_sim]
+        z = z[in_sim]
+        elements = elements[in_sim]
+        chain_ids = chain_ids[in_sim]
+        b_factors = b_factors[in_sim]
+
+        # Top atom per simulation pixel (max Z).
+        order = np.lexsort((z, ix_sim, iy_sim))
+        ix_s = ix_sim[order]
+        iy_s = iy_sim[order]
+        at_end = np.concatenate([
+            (ix_s[1:] != ix_s[:-1]) | (iy_s[1:] != iy_s[:-1]),
+            [True],
+        ])
+        surface_idx = order[at_end]
+        if surface_idx.size == 0:
+            return None
+
+        alpha_u8 = 255
+        rgba = np.zeros((disp_h, disp_w, 4), dtype=np.uint8)
+
+        # Paint each simulation cell onto the display grid (nearest-neighbour upscale).
+        for k in surface_idx:
+            si = int(ix_sim[k])
+            sj = int(iy_sim[k])
+            color = self.get_atom_color(elements[k], chain_ids[k], b_factors[k])
+            r = int(color[0] * 255)
+            g = int(color[1] * 255)
+            b = int(color[2] * 255)
+            x0 = (si * disp_w) // nx
+            x1 = max(x0 + 1, ((si + 1) * disp_w) // nx)
+            y0 = (sj * disp_h) // ny
+            y1 = max(y0 + 1, ((sj + 1) * disp_h) // ny)
+            rgba[y0:y1, x0:x1, 0] = r
+            rgba[y0:y1, x0:x1, 1] = g
+            rgba[y0:y1, x0:x1, 2] = b
+            rgba[y0:y1, x0:x1, 3] = alpha_u8
+
+        if not np.any(rgba[:, :, 3]):
+            return None
+
+        rgba_display = np.ascontiguousarray(np.flipud(rgba))
+        return self._finalize_model_overlay_rgba(rgba_display, struct_opacity=1.0)
+
+    def _is_impose_model_active(self):
+        """True when Impose model is enabled on the Real AFM window."""
+        check = getattr(self, 'impose_model_check', None)
+        if check is not None:
+            try:
+                return bool(check.isChecked())
+            except Exception:
+                pass
+        return bool(getattr(self, 'impose_model_enabled', False))
+
+    def _wire_display_settings_to_impose_overlay(self):
+        """Keep the Real AFM impose overlay in sync with Display Settings."""
+        handler = self._on_display_settings_changed_for_overlay
+        widgets = (
+            getattr(self, 'style_combo', None),
+            getattr(self, 'color_combo', None),
+            getattr(self, 'atom_combo', None),
+            getattr(self, 'quality_combo', None),
+            getattr(self, 'size_slider', None),
+            getattr(self, 'opacity_slider', None),
+        )
+        for widget in widgets:
+            if widget is None:
+                continue
+            try:
+                if hasattr(widget, 'currentTextChanged'):
+                    widget.currentTextChanged.connect(handler)
+                elif hasattr(widget, 'valueChanged'):
+                    widget.valueChanged.connect(handler)
+            except Exception:
+                pass
+        for slider in (getattr(self, 'size_slider', None), getattr(self, 'opacity_slider', None)):
+            if slider is None:
+                continue
+            try:
+                slider.sliderReleased.connect(
+                    lambda: self._queue_impose_overlay_refresh(0),
+                )
+            except Exception:
+                pass
+
+    def _on_display_settings_changed_for_overlay(self, *_args):
+        """Debounced overlay refresh after Display Settings change (QPainter only on macOS)."""
+        self._queue_impose_overlay_refresh(150)
+
+    def _queue_impose_overlay_refresh(self, delay_ms=80):
+        """Schedule an impose-overlay rebuild (debounced for sliders)."""
+        if not self._is_impose_model_active():
+            return
+        if getattr(self, '_pose_estimation_running', False):
+            return
+        timer = getattr(self, '_impose_overlay_refresh_timer', None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda: self._update_model_overlay(force=True))
+            self._impose_overlay_refresh_timer = timer
+        try:
+            timer.stop()
+            timer.start(max(0, int(delay_ms)))
+        except Exception:
+            self._update_model_overlay(force=True)
+
+    def _schedule_model_overlay_update(self, delay_ms=120):
+        """Backward-compatible alias."""
+        self._queue_impose_overlay_refresh(delay_ms)
+
+    def _update_model_overlay(self, force=False):
+        """Refresh the imposed-model overlay on the Real AFM view based on current state."""
+        if not force and getattr(self, '_pose_estimation_running', False):
+            return
+        if self.real_afm_nm is not None:
+            try:
+                self._ensure_real_afm_window(show=False)
+            except Exception:
+                pass
+        view = self._get_real_afm_view()
+        if view is None:
+            return
+        enabled = self._is_impose_model_active()
+        self.impose_model_enabled = enabled
+        if not enabled:
+            try:
+                view.setModelOverlayVisible(False)
+            except Exception:
+                pass
+            return
+        try:
+            pixmap = self._build_model_overlay_pixmap()
+        except Exception as e:
+            print(f"[WARNING] Model overlay computation failed: {e}")
+            pixmap = None
+        if pixmap is None:
+            view.setModelOverlayVisible(False)
+            print("[WARNING] Impose model: overlay pixmap is empty (check PDB, scan size, tip position)")
+            return
+        view.setModelOverlayPixmap(pixmap)
+        view.setModelOverlayOpacity(float(getattr(self, 'impose_model_opacity', 0.6)))
+        view.setModelOverlayVisible(True)
+        self.real_afm_window_view = view
+        try:
+            if hasattr(view, 'parentWidget') and view.parentWidget() is not None:
+                view.parentWidget().update()
+            view.update()
+            view.repaint()
+        except Exception:
+            pass
+
+    def _compute_difference_map(self):
+        """Compute the Real - Sim difference map (nm) plus RMSD/ZNCC metrics.
+
+        Both maps are mean-offset removed before subtraction. If a pose residual
+        (dx_px, dy_px) is available, the simulated image is shifted to match the
+        Real AFM features before differencing.
+
+        Returns (diff_map, rmsd_nm, zncc) or (None, None, None).
+        """
+        real = getattr(self, 'real_afm_nm', None)
+        sim = getattr(self, 'sim_aligned_nm', None)
+        if real is None or sim is None:
+            return None, None, None
+
+        real = np.asarray(real, dtype=np.float64)
+        sim = np.asarray(sim, dtype=np.float64)
+        if real.ndim != 2 or sim.ndim != 2:
+            return None, None, None
+
+        # Sentinel / non-finite handling.
+        real_valid = np.isfinite(real) & (real > -1e8)
+        sim_valid = np.isfinite(sim) & (sim > -1e8)
+        if np.count_nonzero(real_valid) < 4 or np.count_nonzero(sim_valid) < 4:
+            return None, None, None
+
+        real_f = np.where(real_valid, real, 0.0)
+        sim_f = np.where(sim_valid, sim, 0.0)
+        sim_mask = sim_valid.astype(np.float64)
+
+        # Resample simulated map onto the Real AFM grid if needed.
+        if sim_f.shape != real_f.shape:
+            zoom = (real_f.shape[0] / sim_f.shape[0], real_f.shape[1] / sim_f.shape[1])
+            try:
+                sim_f = scipy.ndimage.zoom(sim_f, zoom, order=1)
+                sim_mask = scipy.ndimage.zoom(sim_mask, zoom, order=1)
+            except Exception:
+                return None, None, None
+
+        # Apply stored pose residual translation to align sim onto real features.
+        pose = getattr(self, 'pose', None)
+        if isinstance(pose, dict):
+            try:
+                dx = float(pose.get('dx_px', 0.0))
+                dy = float(pose.get('dy_px', 0.0))
+            except Exception:
+                dx = dy = 0.0
+            if abs(dx) > 1e-6 or abs(dy) > 1e-6:
+                try:
+                    sim_f = scipy.ndimage.shift(sim_f, shift=(dy, dx), order=1, mode='nearest')
+                    sim_mask = scipy.ndimage.shift(sim_mask, shift=(dy, dx), order=1, mode='nearest')
+                except Exception:
+                    pass
+
+        sim_valid_r = sim_mask > 0.5
+        mask = real_valid & sim_valid_r
+        if np.count_nonzero(mask) < 4:
+            return None, None, None
+
+        real_mean = float(np.mean(real_f[mask]))
+        sim_mean = float(np.mean(sim_f[mask]))
+        real0 = real_f - real_mean
+        sim0 = sim_f - sim_mean
+
+        diff = real0 - sim0
+        diff = np.where(mask, diff, np.nan)
+
+        # RMSD / ZNCC: same definition as Estimate Pose (structure map, not noise).
+        raw_sim = None
+        if isinstance(getattr(self, 'raw_simulation_results', None), dict):
+            raw_sim = self.raw_simulation_results.get("XY_Frame")
+        meta = self._get_real_afm_simulation_meta()
+        sim_for_metrics = sim
+        if raw_sim is not None and meta is not None:
+            try:
+                sim_for_metrics = self._sim_map_for_pose_scoring(raw_sim, *meta)
+            except Exception:
+                sim_for_metrics = sim
+        pose = getattr(self, 'pose', None)
+        dx = dy = None
+        if isinstance(pose, dict):
+            dx = pose.get('dx_px')
+            dy = pose.get('dy_px')
+        metrics = self._compute_comparison_metrics(real, sim_for_metrics, dx=dx, dy=dy)
+        rmsd = metrics.get('rmsd')
+        zncc = metrics.get('zncc')
+        if rmsd is None:
+            d = diff[mask]
+            rmsd = float(np.sqrt(np.mean(d * d)))
+        if zncc is None:
+            real_for_zncc = np.where(mask, real0, np.nan)
+            sim_for_zncc = np.where(mask, sim0, np.nan)
+            try:
+                zncc = float(self.score_zncc(real_for_zncc, sim_for_zncc))
+            except Exception:
+                zncc = -1e9
+
+        return diff, rmsd, zncc
+
+    def display_diff_image(self, diff_map, target_panel):
+        """Display a signed difference map with a diverging colormap centered at 0."""
+        import matplotlib.cm as cm
+        from PyQt5.QtGui import QImage, QPixmap
+        if target_panel is None or diff_map is None:
+            return
+
+        finite = np.isfinite(diff_map)
+        h, w = diff_map.shape[:2]
+        if np.count_nonzero(finite) < 2:
+            image_data = np.full((h, w, 3), 180, dtype=np.uint8)
+        else:
+            vals = np.abs(diff_map[finite])
+            vmax = float(np.percentile(vals, 99.0))
+            if not np.isfinite(vmax) or vmax <= 1e-12:
+                vmax = float(np.max(vals)) if vals.size else 1.0
+            if vmax <= 1e-12:
+                vmax = 1.0
+            norm = np.clip((np.nan_to_num(diff_map, nan=0.0) + vmax) / (2.0 * vmax), 0.0, 1.0)
+            image_data = (cm.seismic(norm)[:, :, :3] * 255).astype(np.uint8)
+            # Neutral gray for invalid pixels.
+            image_data[~finite] = (180, 180, 180)
+
+        image_data_flipped = np.ascontiguousarray(np.flipud(image_data))
+        height, width, _channel = image_data_flipped.shape
+        bytes_per_line = int(image_data_flipped.strides[0])
+        try:
+            import sip  # type: ignore
+        except Exception:
+            from PyQt5 import sip  # type: ignore
+        ptr = sip.voidptr(int(image_data_flipped.ctypes.data))
+        qimg = QImage(ptr, width, height, bytes_per_line, QImage.Format_RGB888).copy()
+
+        container = target_panel.findChild(QWidget, "afm_image_container")
+        if container is None:
+            container = target_panel
+        view = container.findChild(_AspectPixmapView, "afm_image_view")
+        placeholder = container.findChild(QLabel, "afm_placeholder")
+        layout = container.layout()
+        if view is None:
+            view = _AspectPixmapView(container)
+            view.setObjectName("afm_image_view")
+            if layout is None:
+                layout = QStackedLayout(container)
+                layout.setContentsMargins(0, 0, 0, 0)
+            try:
+                layout.addWidget(view)
+            except Exception:
+                pass
+
+        pixmap = QPixmap.fromImage(qimg)
+        view.setSourcePixmap(pixmap)
+
+        aspect = None
+        try:
+            if getattr(self, "real_meta", None):
+                sx = float(self.real_meta.get("scan_x_nm", 0.0))
+                sy = float(self.real_meta.get("scan_y_nm", 0.0))
+                if sx > 0 and sy > 0:
+                    aspect = sx / sy
+        except Exception:
+            aspect = None
+        view.setDisplayAspectRatio(aspect)
+
+        if layout is not None and hasattr(layout, "setCurrentWidget"):
+            try:
+                layout.setCurrentWidget(view)
+            except Exception:
+                pass
+        elif placeholder is not None:
+            try:
+                placeholder.setVisible(False)
+                view.setVisible(True)
+            except Exception:
+                pass
+
+    def _update_difference_panel(self):
+        """Recompute and refresh the Difference panel and its RMSD/ZNCC label."""
+        diff_frame = getattr(self, 'real_afm_window_diff_frame', None)
+        if diff_frame is None:
+            return
+        info_label = getattr(self, 'real_afm_diff_info_label', None)
+        try:
+            diff_map, rmsd, zncc = self._compute_difference_map()
+        except Exception as e:
+            print(f"[WARNING] Difference computation failed: {e}")
+            diff_map = None
+            rmsd = zncc = None
+        if diff_map is None:
+            self._clear_afm_panel(diff_frame)
+            if info_label is not None:
+                try:
+                    if getattr(self, 'sim_aligned_nm', None) is None:
+                        info_label.setText("RMSD: -    ZNCC: -   (run Get Simulated image)")
+                    else:
+                        info_label.setText("RMSD: -    ZNCC: -")
+                except Exception:
+                    pass
+            return
+        self.display_diff_image(diff_map, diff_frame)
+        if info_label is not None:
+            try:
+                zncc_text = f"{zncc:.3f}" if (zncc is not None and zncc > -1e8) else "-"
+                info_label.setText(f"RMSD: {rmsd:.3f} nm    ZNCC: {zncc_text}")
+            except Exception:
+                pass
 
     def _clear_afm_panel(self, target_panel):
         """Show placeholder and clear the image view for a panel created by create_afm_image_panel()."""
@@ -7510,8 +11010,8 @@ class pyNuD_simulator(QMainWindow):
 
         win = QWidget(None)
         win.setAttribute(Qt.WA_DeleteOnClose, True)
-        win.setWindowTitle("Real AFM (ASD) / Sim Aligned")
-        win.resize(900, 480)
+        win.setWindowTitle("Real AFM (ASD) / Sim Aligned / Difference")
+        win.resize(1320, 520)
 
         outer = QVBoxLayout(win)
         outer.setContentsMargins(6, 6, 6, 6)
@@ -7546,7 +11046,84 @@ class pyNuD_simulator(QMainWindow):
         btn_auto_fit.setToolTip("Two-stage fit: probe/low-pass first, then noise/artifacts.")
         btn_auto_fit.clicked.connect(self.auto_fit_appearance)
         row.addWidget(btn_auto_fit)
+
+        # Impose model: overlay the rotated structure on the Real AFM image
+        self.impose_model_check = QCheckBox("Impose model")
+        self.impose_model_check.setToolTip(
+            "Overlay the molecular model (same style/colors as the main 3D view) on the Real AFM image.\n"
+            "メイン画面のモデル構造表示（Style / Color / Size / Opacity）と同じものをReal AFM像の上に重ねます。"
+        )
+        self.impose_model_check.setChecked(bool(getattr(self, 'impose_model_enabled', False)))
+        self.impose_model_check.toggled.connect(self._on_impose_model_toggled)
+        row.addWidget(self.impose_model_check)
+
+        opacity_label = QLabel("Opacity:")
+        opacity_label.setToolTip("Adjust overlay opacity / オーバーレイの不透明度")
+        row.addWidget(opacity_label)
+        self.impose_opacity_slider = QSlider(Qt.Horizontal)
+        self.impose_opacity_slider.setRange(10, 100)
+        self.impose_opacity_slider.setValue(int(getattr(self, 'impose_model_opacity', 0.6) * 100))
+        self.impose_opacity_slider.setFixedWidth(90)
+        self.impose_opacity_slider.setToolTip("Adjust overlay opacity / オーバーレイの不透明度")
+        self.impose_opacity_slider.valueChanged.connect(self._on_impose_opacity_changed)
+        row.addWidget(self.impose_opacity_slider)
         outer.addLayout(row)
+
+        fit_row = QHBoxLayout()
+        fit_row.setContentsMargins(0, 0, 0, 0)
+        fit_row.setSpacing(6)
+        fit_label = QLabel("Flexible Fit:")
+        fit_label.setStyleSheet("font-weight: bold; color: #444;")
+        fit_row.addWidget(fit_label)
+        self.detect_domains_btn = QPushButton("Detect Domains")
+        self.detect_domains_btn.setToolTip(
+            "Detect ENM domains for Flexible Fit. Run after loading PDB/CIF; use after Estimate Pose for fitting."
+        )
+        self.detect_domains_btn.clicked.connect(self.detect_domains_from_ui)
+        fit_row.addWidget(self.detect_domains_btn)
+
+        fit_row.addWidget(QLabel("Domains:"))
+        self.domain_auto_check = QCheckBox("Auto")
+        self.domain_auto_check.setChecked(True)
+        self.domain_auto_check.setToolTip("Let ENM suggest the number of domains. Turn off to choose manually.")
+        self.domain_auto_check.toggled.connect(self._on_domain_auto_toggled)
+        fit_row.addWidget(self.domain_auto_check)
+        self.domain_count_slider = QSlider(Qt.Horizontal)
+        self.domain_count_slider.setRange(1, 12)
+        self.domain_count_slider.setValue(2)
+        self.domain_count_slider.setTracking(False)
+        self.domain_count_slider.setFixedWidth(110)
+        self.domain_count_spin = QSpinBox()
+        self.domain_count_spin.setRange(1, 12)
+        self.domain_count_spin.setValue(2)
+        self.domain_count_spin.setFixedWidth(48)
+        self.domain_count_slider.valueChanged.connect(self.domain_count_spin.setValue)
+        self.domain_count_spin.valueChanged.connect(self.domain_count_slider.setValue)
+        self.domain_count_spin.valueChanged.connect(self._on_domain_count_changed)
+        fit_row.addWidget(self.domain_count_slider)
+        fit_row.addWidget(self.domain_count_spin)
+        self._update_domain_controls_enabled()
+
+        self.domain_preview_check = QCheckBox("Domain colors")
+        self.domain_preview_check.setToolTip("Preview detected ENM domains using Display Settings > Color: By Domain.")
+        self.domain_preview_check.toggled.connect(self._on_domain_preview_toggled)
+        fit_row.addWidget(self.domain_preview_check)
+
+        self.flex_fit_btn = QPushButton("Run Flexible Fit")
+        self.flex_fit_btn.setToolTip("Refine detected domains against the current Real AFM frame after Estimate Pose.")
+        self.flex_fit_btn.clicked.connect(self.run_flexible_fit)
+        fit_row.addWidget(self.flex_fit_btn)
+
+        self.save_flex_fit_btn = QPushButton("Save Fit")
+        self.save_flex_fit_btn.setEnabled(False)
+        self.save_flex_fit_btn.clicked.connect(self.save_flexible_fit_outputs)
+        fit_row.addWidget(self.save_flex_fit_btn)
+        self.domain_status_label = QLabel("Domains: Auto (not detected)")
+        self.domain_status_label.setStyleSheet("color: #555;")
+        self.domain_status_label.setMinimumWidth(180)
+        fit_row.addWidget(self.domain_status_label)
+        fit_row.addStretch(1)
+        outer.addLayout(fit_row)
 
         splitter = QSplitter(Qt.Horizontal, win)
         splitter.setHandleWidth(6)
@@ -7555,6 +11132,8 @@ class pyNuD_simulator(QMainWindow):
         real_frame.setObjectName("REAL_AFM_Frame")
         aligned_frame = self.create_afm_image_panel("Sim Aligned")
         aligned_frame.setObjectName("SIM_ALIGNED_Frame")
+        diff_frame = self.create_afm_image_panel("Difference (Real − Sim)")
+        diff_frame.setObjectName("DIFF_Frame")
 
         # Frame slider (ASD can have multiple frames)
         control_row_height = 28
@@ -7620,12 +11199,35 @@ class pyNuD_simulator(QMainWindow):
         except Exception:
             self.real_afm_sim_info_label = None
 
+        # Difference panel metric row (RMSD / ZNCC), aligned with the other panels' control rows.
+        try:
+            diff_spacer_row = QWidget(diff_frame)
+            diff_spacer_row.setObjectName("DIFF_FrameControlSpacer")
+            diff_spacer_row.setFixedHeight(control_row_height)
+            diff_spacer_layout = QHBoxLayout(diff_spacer_row)
+            diff_spacer_layout.setContentsMargins(4, 2, 4, 2)
+            diff_spacer_layout.setSpacing(6)
+
+            diff_info_label = QLabel("RMSD: - nm    ZNCC: -", diff_spacer_row)
+            diff_info_label.setObjectName("DIFF_InfoLabel")
+            diff_info_label.setStyleSheet("color: #444; font-size: 9px;")
+            diff_info_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            diff_spacer_layout.addWidget(diff_info_label, 1)
+            self.real_afm_diff_info_label = diff_info_label
+
+            df = diff_frame.layout()
+            if df is not None:
+                df.insertWidget(1, diff_spacer_row)
+        except Exception:
+            self.real_afm_diff_info_label = None
+
         # Enable drag&drop of ASD file onto the Real AFM panel
         try:
             self._asd_drop_filter = _ASDDropFilter(self)
             container = real_frame.findChild(QWidget, "afm_image_container")
             placeholder = real_frame.findChild(QLabel, "afm_placeholder")
             view = real_frame.findChild(_AspectPixmapView, "afm_image_view")
+            self.real_afm_window_view = view
             if view is not None:
                 try:
                     view.setRoiSelectionEnabled(True)
@@ -7644,15 +11246,21 @@ class pyNuD_simulator(QMainWindow):
 
         splitter.addWidget(real_frame)
         splitter.addWidget(aligned_frame)
-        splitter.setSizes([450, 450])
+        splitter.addWidget(diff_frame)
+        splitter.setSizes([440, 440, 440])
         outer.addWidget(splitter, 1)
 
         def _on_destroyed(*_):
             self.real_afm_window = None
             self.real_afm_window_real_frame = None
             self.real_afm_window_aligned_frame = None
+            self.real_afm_window_diff_frame = None
+            self.real_afm_window_view = None
             self.real_afm_sim_info_label = None
+            self.real_afm_diff_info_label = None
             self.pose_axis_checks = {}
+            self.impose_model_check = None
+            self.impose_opacity_slider = None
 
         try:
             win.destroyed.connect(_on_destroyed)
@@ -7662,6 +11270,7 @@ class pyNuD_simulator(QMainWindow):
         self.real_afm_window = win
         self.real_afm_window_real_frame = real_frame
         self.real_afm_window_aligned_frame = aligned_frame
+        self.real_afm_window_diff_frame = diff_frame
 
         # Populate initial content if available
         if getattr(self, 'real_afm_nm', None) is not None:
@@ -7679,6 +11288,14 @@ class pyNuD_simulator(QMainWindow):
             pass
         try:
             self._update_sim_aligned_info_label()
+        except Exception:
+            pass
+        try:
+            self._update_model_overlay()
+        except Exception:
+            pass
+        try:
+            self._update_difference_panel()
         except Exception:
             pass
 
@@ -8075,7 +11692,8 @@ class pyNuD_simulator(QMainWindow):
                     except Exception:
                         pass
 
-            self.filter_cutoff_spin.setEnabled(self.apply_filter_check.isChecked())
+            self._sync_appearance_sliders_from_spins()
+            self._set_appearance_spin_enabled(self.filter_cutoff_spin, self.apply_filter_check.isChecked())
             self._update_noise_ui_states()
             self.create_tip()
             self.update_tip_info()
@@ -8204,11 +11822,11 @@ class pyNuD_simulator(QMainWindow):
         """右側のVTK表示パネル作成（上下可変分割 + 下部3分割）"""
         panel = QWidget()
         panel.setMinimumSize(550, 600)
-        
+
         main_layout = QVBoxLayout(panel)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
-        
+
         # 上下のメインスプリッター
         self.afm_splitter = QSplitter(Qt.Vertical)
         self.afm_splitter.setHandleWidth(8)
@@ -8221,7 +11839,7 @@ class pyNuD_simulator(QMainWindow):
                 background-color: #bbb;
             }
         """)
-        
+
         # --- 上部：PDB構造表示エリア ---
         structure_frame = QFrame()
         structure_frame.setFrameStyle(QFrame.StyledPanel)
@@ -8235,7 +11853,7 @@ class pyNuD_simulator(QMainWindow):
         structure_layout.addWidget(self.sequence_panel)
 
         structure_layout.addWidget(self.progress_container)
-        
+
         # VTKウィンドウとコントロールパネルを配置するための垂直スプリッター
         self.view_control_splitter = QSplitter(Qt.Vertical)
         self.view_control_splitter.setHandleWidth(6)
@@ -8250,89 +11868,106 @@ class pyNuD_simulator(QMainWindow):
                 background-color: #cccccc;
             }
         """)
-        
-        # 分子ビュー用の2ペイン（PyMOL + VTK）
-        self.structure_view_splitter = QSplitter(Qt.Horizontal)
-        self.structure_view_splitter.setHandleWidth(6)
-        self.structure_view_splitter.setStyleSheet("""
-            QSplitter::handle:horizontal {
-                width: 6px;
-                background-color: #e0e0e0;
-                border-left: 1px solid #c0c0c0;
-                border-right: 1px solid #c0c0c0;
-            }
-            QSplitter::handle:horizontal:hover {
-                background-color: #cccccc;
-            }
-        """)
 
-        # PyMOLビュー（画像 or 埋め込み）
-        self.pymol_view_container = QWidget(self.structure_view_splitter)
-        self.pymol_view_layout = QVBoxLayout(self.pymol_view_container)
-        self.pymol_view_layout.setContentsMargins(0, 0, 0, 0)
-        self.pymol_view_layout.setSpacing(0)
-        self.pymol_widget_container = QWidget(self.pymol_view_container)
-        self.pymol_widget_layout = QVBoxLayout(self.pymol_widget_container)
-        self.pymol_widget_layout.setContentsMargins(0, 0, 0, 0)
-        self.pymol_widget_layout.setSpacing(0)
-        self.pymol_placeholder = QLabel("PyMOL view (initializing...)")
-        self.pymol_placeholder.setAlignment(Qt.AlignCenter)
-        self.pymol_widget_layout.addWidget(self.pymol_placeholder)
-        self.pymol_view_layout.addWidget(self.pymol_widget_container, 1)
+        # 分子ビュー（プラグイン版は VTK のみ / スタンドアロンは PyMOL + VTK）
+        self.pymol_view_container = None
+        self.pymol_widget_container = None
+        self.pymol_placeholder = None
+        self.esp_colorbar_widget = None
+        self.structure_view_splitter = None
 
-        # ESP legend bar (shown only when ESP is enabled in PyMOL)
-        self.esp_colorbar_widget = QWidget(self.pymol_view_container)
-        esp_bar_layout = QHBoxLayout(self.esp_colorbar_widget)
-        esp_bar_layout.setContentsMargins(8, 4, 8, 6)
-        esp_bar_layout.setSpacing(6)
-        neg = QLabel("−")
-        neg.setToolTip("Negative")
-        neg.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-        pos = QLabel("+")
-        pos.setToolTip("Positive")
-        pos.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
-        for lbl in (neg, pos):
-            lbl.setMinimumWidth(14)
-            lbl.setStyleSheet("font-size: 10px; color: #444; font-weight: bold;")
-        bar = _EspGradientBar(self.esp_colorbar_widget)
-        esp_bar_layout.addWidget(neg)
-        esp_bar_layout.addWidget(bar, 1)
-        esp_bar_layout.addWidget(pos)
-        self.esp_colorbar_widget.setVisible(False)
-        self.pymol_view_layout.addWidget(self.esp_colorbar_widget, 0)
-
-        # VTKビュー（インタラクティブ）
-        self.vtk_view_container = QWidget(self.structure_view_splitter)
+        self.vtk_view_container = QWidget()
         vtk_layout = QVBoxLayout(self.vtk_view_container)
         vtk_layout.setContentsMargins(0, 0, 0, 0)
         vtk_layout.setSpacing(0)
         self.vtk_widget = QVTKRenderWindowInteractor(self.vtk_view_container)
+        self.vtk_widget.setFocusPolicy(Qt.StrongFocus)
         self.vtk_widget.setAcceptDrops(True)
         self.vtk_widget.installEventFilter(self)
         vtk_layout.addWidget(self.vtk_widget)
         self.display_widget = self.vtk_widget
 
-        self.structure_view_splitter.addWidget(self.pymol_view_container)
-        self.structure_view_splitter.addWidget(self.vtk_view_container)
-        self.structure_view_splitter.setSizes([600, 600])
+        if self._is_vtk_only_plugin():
+            structure_view_widget = self.vtk_view_container
+        else:
+            self.structure_view_splitter = QSplitter(Qt.Horizontal)
+            self.structure_view_splitter.setHandleWidth(6)
+            self.structure_view_splitter.setStyleSheet("""
+                QSplitter::handle:horizontal {
+                    width: 6px;
+                    background-color: #e0e0e0;
+                    border-left: 1px solid #c0c0c0;
+                    border-right: 1px solid #c0c0c0;
+                }
+                QSplitter::handle:horizontal:hover {
+                    background-color: #cccccc;
+                }
+            """)
+
+            # PyMOLビュー（画像 or 埋め込み）
+            self.pymol_view_container = QWidget(self.structure_view_splitter)
+            self.pymol_view_layout = QVBoxLayout(self.pymol_view_container)
+            self.pymol_view_layout.setContentsMargins(0, 0, 0, 0)
+            self.pymol_view_layout.setSpacing(0)
+            self.pymol_widget_container = QWidget(self.pymol_view_container)
+            self.pymol_widget_layout = QVBoxLayout(self.pymol_widget_container)
+            self.pymol_widget_layout.setContentsMargins(0, 0, 0, 0)
+            self.pymol_widget_layout.setSpacing(0)
+            self.pymol_placeholder = QLabel("PyMOL view (initializing...)")
+            self.pymol_placeholder.setAlignment(Qt.AlignCenter)
+            self.pymol_widget_layout.addWidget(self.pymol_placeholder)
+            self.pymol_view_layout.addWidget(self.pymol_widget_container, 1)
+
+            # ESP legend bar (shown only when ESP is enabled in PyMOL)
+            self.esp_colorbar_widget = QWidget(self.pymol_view_container)
+            esp_bar_layout = QHBoxLayout(self.esp_colorbar_widget)
+            esp_bar_layout.setContentsMargins(8, 4, 8, 6)
+            esp_bar_layout.setSpacing(6)
+            neg = QLabel("−")
+            neg.setToolTip("Negative")
+            neg.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+            pos = QLabel("+")
+            pos.setToolTip("Positive")
+            pos.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
+            for lbl in (neg, pos):
+                lbl.setMinimumWidth(14)
+                lbl.setStyleSheet("font-size: 10px; color: #444; font-weight: bold;")
+            bar = _EspGradientBar(self.esp_colorbar_widget)
+            esp_bar_layout.addWidget(neg)
+            esp_bar_layout.addWidget(bar, 1)
+            esp_bar_layout.addWidget(pos)
+            self.esp_colorbar_widget.setVisible(False)
+            self.pymol_view_layout.addWidget(self.esp_colorbar_widget, 0)
+
+            self.vtk_view_container.setParent(self.structure_view_splitter)
+            self.structure_view_splitter.addWidget(self.pymol_view_container)
+            self.structure_view_splitter.addWidget(self.vtk_view_container)
+            self.structure_view_splitter.setSizes([600, 600])
+            structure_view_widget = self.structure_view_splitter
+
         # ドロップを受け付ける
-        for w in (
+        drop_targets = [
             self.structure_view_toolbar,
             self.structure_drop_label,
             self.sequence_panel,
             self.sequence_scroll_area,
-            self.pymol_view_container,
-            self.pymol_widget_container,
             self.vtk_view_container,
-            self.structure_view_splitter,
-        ):
+        ]
+        if self.pymol_view_container is not None:
+            drop_targets.extend([
+                self.pymol_view_container,
+                self.pymol_widget_container,
+            ])
+        if self.structure_view_splitter is not None:
+            drop_targets.append(self.structure_view_splitter)
+        for w in drop_targets:
             try:
                 w.setAcceptDrops(True)
                 w.installEventFilter(self)
             except Exception:
                 pass
 
-        self.view_control_splitter.addWidget(self.structure_view_splitter)
+        self.view_control_splitter.addWidget(structure_view_widget)
 
         rotation_controls = self.create_rotation_controls()
         controls_scroll = QScrollArea()
@@ -8343,7 +11978,7 @@ class pyNuD_simulator(QMainWindow):
         controls_scroll.setWidget(rotation_controls)
         controls_scroll.setMinimumHeight(80)
         self.view_control_splitter.addWidget(controls_scroll)
-        
+
         self.view_control_splitter.setSizes([560, 120])
         self.view_control_splitter.setCollapsible(0, False)
         self.view_control_splitter.setCollapsible(1, True)
@@ -8360,11 +11995,11 @@ class pyNuD_simulator(QMainWindow):
         afm_layout = QVBoxLayout(afm_frame)
         afm_layout.setContentsMargins(2, 2, 2, 2)
         afm_layout.setSpacing(2)
-        
+
         afm_header_layout = QHBoxLayout()
         afm_header_layout.setContentsMargins(3, 3, 3, 3)
         afm_header_layout.setSpacing(0)
-        
+
         afm_label = QLabel("Simulated AFM Images")
         afm_label.setStyleSheet("""
             QLabel {
@@ -8379,20 +12014,20 @@ class pyNuD_simulator(QMainWindow):
         """)
         afm_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         afm_header_layout.addWidget(afm_label)
-        
+
         afm_header_layout.addSpacing(10)
 
-        
-    
-        
+
+
+
         self.afm_x_check = QCheckBox("XY")
         self.afm_y_check = QCheckBox("YZ")
         self.afm_z_check = QCheckBox("ZX")
-        
+
         self.afm_x_check.setChecked(True)
         self.afm_y_check.setChecked(False)
         self.afm_z_check.setChecked(False)
-        
+
         checkbox_style = """
             QCheckBox {
                 font-size: 10px; font-weight: bold; color: #555;
@@ -8403,11 +12038,11 @@ class pyNuD_simulator(QMainWindow):
             QCheckBox::indicator:unchecked { background-color: white; border: 2px solid #ccc; }
             QCheckBox::indicator:hover { border-color: #888; }
         """
-        
+
         self.afm_x_check.setStyleSheet(checkbox_style)
         self.afm_y_check.setStyleSheet(checkbox_style)
-        self.afm_z_check.setStyleSheet(checkbox_style)        
-        
+        self.afm_z_check.setStyleSheet(checkbox_style)
+
         self.afm_x_check.toggled.connect(self.update_afm_display)
         self.afm_y_check.toggled.connect(self.update_afm_display)
         self.afm_z_check.toggled.connect(self.update_afm_display)
@@ -8416,8 +12051,8 @@ class pyNuD_simulator(QMainWindow):
         self.afm_x_check.toggled.connect(self.run_simulation_on_view_change)
         self.afm_y_check.toggled.connect(self.run_simulation_on_view_change)
         self.afm_z_check.toggled.connect(self.run_simulation_on_view_change)
- 
-        
+
+
         afm_header_layout.addWidget(self.afm_x_check)
         afm_header_layout.addSpacing(12)
         afm_header_layout.addWidget(self.afm_y_check)
@@ -8447,7 +12082,7 @@ class pyNuD_simulator(QMainWindow):
         self.save_image_button.clicked.connect(self.handle_save_image)
         self.save_image_button.setEnabled(False)
         afm_header_layout.addWidget(self.save_image_button)
-        
+
         afm_header_widget = QWidget()
         afm_header_widget.setLayout(afm_header_layout)
         afm_header_widget.setMaximumHeight(30)
@@ -8459,11 +12094,11 @@ class pyNuD_simulator(QMainWindow):
             }
         """)
         afm_layout.addWidget(afm_header_widget)
-        
+
         self.afm_images_layout = QHBoxLayout()
         self.afm_images_layout.setSpacing(3)
         self.afm_images_layout.setContentsMargins(0, 0, 0, 0)
-        
+
         # 画像パネルのタイトルを XY View, YZ View, ZX View に変更
         self.afm_x_frame = self.create_afm_image_panel("XY View")
         self.afm_x_frame.setObjectName("XY_Frame") # 追加
@@ -8471,23 +12106,23 @@ class pyNuD_simulator(QMainWindow):
         self.afm_y_frame.setObjectName("YZ_Frame") # 追加
         self.afm_z_frame = self.create_afm_image_panel("ZX View")
         self.afm_z_frame.setObjectName("ZX_Frame") # 追加
-        
+
         self.afm_images_layout.addWidget(self.afm_x_frame, 1)
         self.afm_images_layout.addWidget(self.afm_y_frame, 1)
         self.afm_images_layout.addWidget(self.afm_z_frame, 1)
-        
+
         afm_layout.addLayout(self.afm_images_layout)
-        
+
         # メインスプリッターにウィジェットを追加
         self.afm_splitter.addWidget(structure_frame)
         self.afm_splitter.addWidget(afm_frame)
-        
+
         self.afm_splitter.setSizes([560, 300])
         self.afm_splitter.setCollapsible(0, False)
         self.afm_splitter.setCollapsible(1, False)
         self.afm_splitter.setStretchFactor(0, 2)
         self.afm_splitter.setStretchFactor(1, 3)
-        
+
         main_layout.addWidget(self.afm_splitter)
 
         self.update_afm_display()
@@ -8501,15 +12136,15 @@ class pyNuD_simulator(QMainWindow):
                 )
         except Exception:
             pass
-        
+
         return panel
-    
+
 
     def create_rotation_controls(self):
         """PDB構造回転用コントロールと視点コントロールを作成"""
         group = QGroupBox("Structure & View Control (Rotation XYZ sets the simulation pose)")
         group.setStyleSheet("QGroupBox { font-weight: bold; }")
-        
+
         # メインの水平レイアウト
         main_layout = QHBoxLayout(group)
         main_layout.setSpacing(10)
@@ -8560,7 +12195,7 @@ class pyNuD_simulator(QMainWindow):
             # 1. 値が「変化している最中」は、UIの同期のみを行う
             slider.valueChanged.connect(self.sync_rotation_widgets)
             spin_box.valueChanged.connect(self.sync_rotation_widgets)
-            
+
             # 2. 操作が「完了した時」にのみ、3Dモデルの回転とシミュレーションのトリガーを実行
             slider.sliderReleased.connect(self.apply_rotation_and_trigger_simulation)
             spin_box.valueChanged.connect(self.start_rotation_update_timer)
@@ -8574,10 +12209,10 @@ class pyNuD_simulator(QMainWindow):
         right_layout = QVBoxLayout(right_widget)
         right_layout.setSpacing(5)
         right_layout.setContentsMargins(5, 0, 0, 0)
-        
+
          # 1. ボタンを格納する水平レイアウトを作成
         top_button_layout = QHBoxLayout()
-        
+
         reset_btn = QPushButton("Reset All")
         reset_btn.setToolTip("Reset molecule rotation, tip position, and camera view to initial state\n分子の回転、探針の位置、カメラの視点を初期状態に戻します")
         reset_btn.clicked.connect(self.handle_reset_button_clicked)
@@ -8587,7 +12222,7 @@ class pyNuD_simulator(QMainWindow):
         save_view_btn = QPushButton("📷 Save 3D View...")
         save_view_btn.setToolTip("Save the current 3D view as a PNG or TIFF image\n現在の3DビューをPNGまたはTIFF画像として保存")
         save_view_btn.clicked.connect(self.handle_save_3d_view) # 新しいメソッドに接続
-        top_button_layout.addWidget(save_view_btn) # 水平レイアウトに追加   
+        top_button_layout.addWidget(save_view_btn) # 水平レイアウトに追加
 
         # Find Initial Plane（接触候補の基板射影面積最大）ボタン
         find_plane_btn = QPushButton("Find Initial Plane")
@@ -8993,7 +12628,7 @@ class pyNuD_simulator(QMainWindow):
         params_io_layout.addWidget(self.load_params_button)
 
         right_layout.addLayout(params_io_layout)
-        
+
         # 標準視点ボタンを水平に配置
         view_btn_layout = QHBoxLayout()
         xy_btn = QPushButton("XY")
@@ -9149,15 +12784,15 @@ class pyNuD_simulator(QMainWindow):
             return
 
         camera = self.renderer.GetActiveCamera()
-        
+
         # 現在のカメラの状態を保存
         current_position = camera.GetPosition()
         current_focal_point = camera.GetFocalPoint()
         current_view_up = camera.GetViewUp()
-        
+
         # 現在のカメラと焦点の距離を計算
         distance = np.sqrt(sum((current_position[i] - current_focal_point[i]) ** 2 for i in range(3)))
-        
+
         # 分子の中心を計算
         bbox = vtk.vtkBoundingBox()
         if self.sample_actor and self.show_molecule_check.isChecked():
@@ -9167,7 +12802,7 @@ class pyNuD_simulator(QMainWindow):
         # MRCサーフェス
         if hasattr(self, 'mrc_actor') and self.mrc_actor is not None:
             bbox.AddBounds(self.mrc_actor.GetBounds())
-        
+
         if not bbox.IsValid():
             # 分子が表示されていない場合は、現在の焦点を中心とする
             molecule_center = current_focal_point
@@ -9198,16 +12833,16 @@ class pyNuD_simulator(QMainWindow):
             camera.SetPosition(new_position[0], new_position[1], new_position[2])
             camera.SetFocalPoint(molecule_center)
             camera.SetViewUp(0, 0, 1)
-        
+
         # PDB分子の回転適用後、MRCアクターにも同じ回転を適用
         if hasattr(self, 'mrc_actor') and self.mrc_actor is not None:
             self.mrc_actor.SetUserTransform(self.molecule_transform)
-        
+
         # Tipの表示/透明度制御
         self._update_tip_visual_state(
             self.show_tip_check.isChecked() if hasattr(self, 'show_tip_check') else True
         )
-        
+
         self.request_render()
         if self._is_dual_mode():
             self._sync_pymol_view_from_vtk()
@@ -9299,7 +12934,7 @@ class pyNuD_simulator(QMainWindow):
                 self.pymol_cmd.color(name, selection)
             elif color_scheme == "By B-Factor":
                 # B-factor coloring (also used as an ESP colormap when ESP is enabled)
-                if hasattr(self, "esp_check") and self.esp_check.isChecked():
+                if self._has_esp_check() and self.esp_check.isChecked():
                     primary = "red_white_blue"
                     fallback = "blue_white_red"
                 else:
@@ -9522,7 +13157,7 @@ class pyNuD_simulator(QMainWindow):
         self._apply_pymol_lighting()
 
         # Electrostatics表示が有効なら再適用
-        if hasattr(self, 'esp_check') and self.esp_check.isChecked():
+        if self._has_esp_check() and self.esp_check.isChecked():
             self.display_electrostatics(True)
 
         self.request_render()
@@ -9599,7 +13234,7 @@ class pyNuD_simulator(QMainWindow):
                 self.pymol_available
                 and self.pymol_cmd is not None
                 and self.render_backend in ("pymol", "dual")
-                and hasattr(self, "esp_check")
+                and self._has_esp_check()
                 and self.esp_check.isChecked()
                 and getattr(self, "current_structure_type", None) != "mrc"
             )
@@ -9632,7 +13267,7 @@ class pyNuD_simulator(QMainWindow):
                 return
             show = bool(
                 self.pymol_available
-                and hasattr(self, "esp_check")
+                and self._has_esp_check()
                 and self.esp_check.isChecked()
                 and self.render_backend in ("pymol", "dual")
                 and getattr(self, "current_structure_type", None) != "mrc"
@@ -9673,7 +13308,7 @@ class pyNuD_simulator(QMainWindow):
             self.afm_x_check.blockSignals(False)
             self.afm_y_check.blockSignals(False)
         self.update_afm_display()
-    
+
     def sync_rotation_widgets(self):
         """スライダーとスピンボックスの値を同期させ、Interactive Updateが有効な場合はリアルタイム更新も実行"""
         sender = self.sender()
@@ -9699,16 +13334,16 @@ class pyNuD_simulator(QMainWindow):
             slider.blockSignals(True)
             slider.setValue(int(new_val * 10))
             slider.blockSignals(False)
-        
+
         # 構造回転を適用
         self.apply_structure_rotation()
-        
+
         # Interactive Updateが有効で、スライダーからの変更の場合はリアルタイム更新
-        if (hasattr(self, 'interactive_update_check') and 
-            self.interactive_update_check.isChecked() and 
+        if (hasattr(self, 'interactive_update_check') and
+            self.interactive_update_check.isChecked() and
             isinstance(sender, QSlider)):
             self.run_simulation_immediate_controlled()
-    
+
     def start_rotation_update_timer(self):
         """
         スピンボックスからの回転更新を遅延させるためのタイマーを開始/リセットする。
@@ -9719,7 +13354,7 @@ class pyNuD_simulator(QMainWindow):
             self.rotation_update_timer = QTimer(self)  # 親ウィンドウを設定
             self.rotation_update_timer.setSingleShot(True)
             self.rotation_update_timer.timeout.connect(self.apply_rotation_and_trigger_simulation)
-        
+
         # 500ミリ秒後に更新を実行するようにタイマーを開始（またはリセット）
         self.rotation_update_timer.start(500)
 
@@ -9727,7 +13362,7 @@ class pyNuD_simulator(QMainWindow):
         """UIの操作完了後に、3Dモデルの回転を適用し、シミュレーションをトリガーする"""
         #print("Rotation change finished. Applying transform and triggering simulation if interactive.")
         self.apply_structure_rotation()
-        
+
         # Interactive Updateが有効な場合は高解像度シミュレーションをスケジュール
         if hasattr(self, 'interactive_update_check') and self.interactive_update_check.isChecked():
             if hasattr(self, 'schedule_high_res_simulation'):
@@ -9743,7 +13378,7 @@ class pyNuD_simulator(QMainWindow):
             if sender is widgets['slider'] or sender is widgets['spin']:
                 changed_axis = axis
                 break
-        
+
         if not changed_axis:
             return
 
@@ -9773,7 +13408,7 @@ class pyNuD_simulator(QMainWindow):
         try:
             # 変換行列を安全に初期化
             self.combined_transform.Identity()
-            
+
             # 変換行列の妥当性をチェック
             if self.base_transform is not None:
                 base_matrix = self.base_transform.GetMatrix()
@@ -9781,41 +13416,40 @@ class pyNuD_simulator(QMainWindow):
                     self.combined_transform.Concatenate(self.base_transform)
                 else:
                     print("[WARNING] Invalid base_transform, using identity")
-            
+
             if self.local_transform is not None:
                 local_matrix = self.local_transform.GetMatrix()
                 if self._is_transform_matrix_valid(local_matrix):
                     self.combined_transform.Concatenate(self.local_transform)
                 else:
                     print("[WARNING] Invalid local_transform, using identity")
-            
+
             # 最終的な変換行列の妥当性をチェック
             final_matrix = self.combined_transform.GetMatrix()
             if not self._is_transform_matrix_valid(final_matrix):
                 print("[WARNING] Invalid combined_transform, resetting to identity")
                 self.combined_transform.Identity()
-            
-            if not self._is_pymol_only():
-                # アクターに適用
-                if self.sample_actor:
-                    self.sample_actor.SetUserTransform(self.combined_transform)
-                if self.bonds_actor:
-                    self.bonds_actor.SetUserTransform(self.combined_transform)
-                if self.sequence_highlight_actor is not None:
-                    self.sequence_highlight_actor.SetUserTransform(self.combined_transform)
-                if hasattr(self, 'mrc_actor') and self.mrc_actor is not None:
-                    self.mrc_actor.SetUserTransform(self.combined_transform)
-                if hasattr(self, 'vtk_widget'):
-                    self.vtk_widget.GetRenderWindow().Render()
+
+            # Keep hidden VTK overlay actors in sync even in PyMOL-only mode.
+            if self.sample_actor:
+                self.sample_actor.SetUserTransform(self.combined_transform)
+            if self.bonds_actor:
+                self.bonds_actor.SetUserTransform(self.combined_transform)
+            if self.sequence_highlight_actor is not None:
+                self.sequence_highlight_actor.SetUserTransform(self.combined_transform)
+            if hasattr(self, 'mrc_actor') and self.mrc_actor is not None:
+                self.mrc_actor.SetUserTransform(self.combined_transform)
+            if (not self._is_pymol_only()) and hasattr(self, 'vtk_widget') and self.vtk_widget is not None:
+                self.vtk_widget.GetRenderWindow().Render()
             if self._is_pymol_active():
                 self._mark_pymol_interaction()
                 self._sync_pymol_object_ttt_from_vtk()
-                
+
         except Exception as e:
             print(f"[WARNING] Error in update_actor_transform: {e}")
             # エラーが発生した場合は単位行列にリセット
             self.combined_transform.Identity()
-    
+
     def _is_transform_matrix_valid(self, vtk_matrix):
         """VTK変換行列が妥当かどうかをチェック"""
         try:
@@ -9832,9 +13466,9 @@ class pyNuD_simulator(QMainWindow):
         """スライダー（絶対角）→ 差分回転をlocal_transformに適用"""
         if not hasattr(self, 'rotation_widgets'):
             return
-        
+
         # PDBデータまたはMRCデータのどちらかが読み込まれているかチェック
-        if (getattr(self, 'atoms_data', None) is None and 
+        if (getattr(self, 'atoms_data', None) is None and
             not (hasattr(self, 'mrc_data') and self.mrc_data is not None)):
             return
 
@@ -9861,6 +13495,8 @@ class pyNuD_simulator(QMainWindow):
             self._display_pymol_tip_overlay()
 
         self.prev_rot['x'], self.prev_rot['y'], self.prev_rot['z'] = rx, ry, rz
+        if self._is_impose_model_active():
+            self._queue_impose_overlay_refresh(0)
         if trigger_simulation:
             self.trigger_interactive_simulation()
 
@@ -10373,7 +14009,7 @@ class pyNuD_simulator(QMainWindow):
         if getattr(self, 'atoms_data', None) is None and not (hasattr(self, 'mrc_data') and self.mrc_data is not None):
             QMessageBox.warning(self, "Warning", "PDBまたはMRCファイルが読み込まれていません。")
             return
-        
+
         # --- PDB: contact-patch based search ---
         if getattr(self, 'atoms_data', None) is not None:
             # parameters (Å) + electrostatics
@@ -10725,42 +14361,42 @@ class pyNuD_simulator(QMainWindow):
                 # 入力データの妥当性チェック
                 if X is None or len(X) == 0:
                     return float('inf'), 0
-                
+
                 if Rr is None or len(Rr) == 0:
                     return float('inf'), 0
-                
+
                 # 数値の安全性を確保（より厳格な範囲制限）
                 X_safe = np.clip(X, -1000, 1000)  # より狭い範囲
                 Rr_safe = np.clip(Rr, -100, 100)  # 回転行列は小さい値
-                
+
                 # 行列の形状をチェック
                 if X_safe.shape[1] != Rr_safe.shape[0]:
                     return float('inf'), 0
-                
+
                 # ゼロ除算を防ぐためのチェック
                 if np.any(np.abs(Rr_safe) < 1e-10):
                     return float('inf'), 0
-                
+
                 # 行列積を安全に実行
                 try:
                     with np.errstate(all='ignore'):  # 警告を無視
                         z = (X_safe @ Rr_safe)[:, 2]
                 except (OverflowError, RuntimeWarning, ValueError):
                     return float('inf'), 0
-                
+
                 # NaNやInfをチェック
                 if not np.all(np.isfinite(z)):
                     return float('inf'), 0
-                
+
                 # 結果の妥当性チェック
                 zmin = z.min()
                 zmax = z.max()
                 h = zmax - zmin
-                
+
                 # 厚みが異常に大きい場合は無効
                 if h > 1000 or not np.isfinite(h) or h < 0:
                     return float('inf'), 0
-                
+
                 # 接触原子数の計算
                 try:
                     cnt = int(np.count_nonzero(z - zmin <= eps_nm))
@@ -10768,9 +14404,9 @@ class pyNuD_simulator(QMainWindow):
                         return float('inf'), 0
                 except (OverflowError, ValueError):
                     return float('inf'), 0
-                
+
                 return h, cnt
-                
+
             except Exception as e:
                 # 全ての例外をキャッチ
                 return float('inf'), 0
@@ -10817,7 +14453,7 @@ class pyNuD_simulator(QMainWindow):
                 y = np.degrees(np.arctan2(-R[2,0], sy))
                 x = np.degrees(np.arctan2(-R[1,2], R[1,1]))
             # -180〜180に正規化
-            def _wrap(a): 
+            def _wrap(a):
                 return (a + 180) % 360 - 180
             return _wrap(x), _wrap(y), _wrap(z)
 
@@ -10873,7 +14509,7 @@ class pyNuD_simulator(QMainWindow):
         self.molecule_transform.SetMatrix(M)
 
         self.update_actor_transform()
-        
+
         if hasattr(self, 'set_standard_view'):
             self.set_standard_view('yz')
         if hasattr(self, 'trigger_interactive_simulation'):
@@ -10881,13 +14517,13 @@ class pyNuD_simulator(QMainWindow):
 
     def on_mouse_press(self, event):
         """直接的なマウスプレスイベントハンドラー"""
-        
+
         if event.button() == Qt.LeftButton:
             # キーの状態をチェック
             modifiers = event.modifiers()
             ctrl_pressed = bool(modifiers & Qt.ControlModifier)
             shift_pressed = bool(modifiers & Qt.ShiftModifier)
-            
+
             if ctrl_pressed and not shift_pressed:
                 self.actor_rotating = True
                 self.drag_start_pos = event.pos()
@@ -10898,7 +14534,7 @@ class pyNuD_simulator(QMainWindow):
                 self.pan_start_pos = event.pos()
                 event.accept()
                 return
-        
+
         # 通常のマウスイベントをVTKウィジェットの元のハンドラーに渡す
         if hasattr(self, 'original_mouse_press'):
             self.original_mouse_press(event)
@@ -10909,10 +14545,10 @@ class pyNuD_simulator(QMainWindow):
             if hasattr(self, 'drag_start_pos'):
                 dx = event.pos().x() - self.drag_start_pos.x()
                 dy = event.pos().y() - self.drag_start_pos.y()
-                
+
                 # 視点に応じた回転軸マッピング
                 self.update_rotation_from_drag_view_dependent(dx, dy)
-                
+
                 self.drag_start_pos = event.pos()
             event.accept()
             return
@@ -10920,29 +14556,29 @@ class pyNuD_simulator(QMainWindow):
             # パニング処理は後で実装
             event.accept()
             return
-        
+
         # 通常のマウスイベントをVTKウィジェットの元のハンドラーに渡す
         if hasattr(self, 'original_mouse_move'):
             self.original_mouse_move(event)
 
     def on_mouse_release(self, event):
         """直接的なマウスリリースイベントハンドラー"""
-        
+
         if event.button() == Qt.LeftButton:
             if self.actor_rotating:
                 self.actor_rotating = False
-                
+
                 # ★★★ 追加：ドラッグ終了時の高解像度シミュレーション ★★★
                 if self.interactive_update_check.isChecked():
                     self.schedule_high_res_simulation()
-                
+
                 event.accept()
                 return
             elif self.panning:
                 self.panning = False
                 event.accept()
                 return
-        
+
         # 通常のマウスイベントをVTKウィジェットの元のハンドラーに渡す
         if hasattr(self, 'original_mouse_release'):
             self.original_mouse_release(event)
@@ -10951,7 +14587,7 @@ class pyNuD_simulator(QMainWindow):
         """分子の回転をリセット（PDB/MRC読み込み時の状態に戻す）"""
         if not hasattr(self, 'rotation_widgets'):
             return
-        
+
         # 回転ウィジェットを0にリセット
         for axis in ['X', 'Y', 'Z']:
             self.rotation_widgets[axis]['spin'].blockSignals(True)
@@ -10960,7 +14596,7 @@ class pyNuD_simulator(QMainWindow):
             self.rotation_widgets[axis]['slider'].setValue(0)
             self.rotation_widgets[axis]['spin'].blockSignals(False)
             self.rotation_widgets[axis]['slider'].blockSignals(False)
-        
+
         # prev_rotをリセット
         self.prev_rot = {'x': 0.0, 'y': 0.0, 'z': 0.0}
 
@@ -10978,7 +14614,7 @@ class pyNuD_simulator(QMainWindow):
             # キャッシュが古いとidentity再同期がskipされ、PyMOL object側だけ
             # 以前のTTT姿勢を保持するため、Reset時は強制的に再適用する。
             self._pymol_last_ttt = None
-        
+
         # アクターの変換を更新
         self.update_actor_transform()
         if self._is_dual_mode() and self._is_pymol_active():
@@ -10990,11 +14626,11 @@ class pyNuD_simulator(QMainWindow):
         """現在のカメラの向きから視点方向を判定"""
         if not hasattr(self, 'renderer') or not self.renderer:
             return 'free'
-        
+
         camera = self.renderer.GetActiveCamera()
         pos = camera.GetPosition()
         focal = camera.GetFocalPoint()
-        
+
         # カメラから焦点への方向ベクトル
         view_dir = [focal[i] - pos[i] for i in range(3)]
         # 正規化
@@ -11002,7 +14638,7 @@ class pyNuD_simulator(QMainWindow):
         if length < 1e-10:
             return 'free'
         view_dir = [d/length for d in view_dir]
-        
+
         # 各軸方向との内積で判定（閾値0.8）
         if abs(view_dir[2]) > 0.8:  # Z方向
             return 'xy'  # XY面を見ている
@@ -11156,7 +14792,7 @@ class pyNuD_simulator(QMainWindow):
         raw_x = current_rot_x + angle_x_delta
         raw_y = current_rot_y + angle_y_delta
         raw_z = current_rot_z + angle_z_delta
-        
+
         # 角度を-180から+180の範囲に正規化する
         new_rot_x = (raw_x + 180) % 360 - 180
         new_rot_y = (raw_y + 180) % 360 - 180
@@ -11166,24 +14802,24 @@ class pyNuD_simulator(QMainWindow):
         for axis in ['X', 'Y', 'Z']:
             self.rotation_widgets[axis]['spin'].blockSignals(True)
             self.rotation_widgets[axis]['slider'].blockSignals(True)
-        
+
         self.rotation_widgets['X']['spin'].setValue(new_rot_x)
         self.rotation_widgets['Y']['spin'].setValue(new_rot_y)
         self.rotation_widgets['Z']['spin'].setValue(new_rot_z)
-        
+
         # スライダーも同期
         self.rotation_widgets['X']['slider'].setValue(int(new_rot_x * 10))
         self.rotation_widgets['Y']['slider'].setValue(int(new_rot_y * 10))
         self.rotation_widgets['Z']['slider'].setValue(int(new_rot_z * 10))
-        
+
         # シグナルを再有効化
         for axis in ['X', 'Y', 'Z']:
             self.rotation_widgets[axis]['spin'].blockSignals(False)
             self.rotation_widgets[axis]['slider'].blockSignals(False)
-        
+
         # スライダー値を変更した後、回転を適用
         self.apply_structure_rotation()
-        
+
         # ★★★ 修正: ドラッグ中の制御されたリアルタイム更新 ★★★
         if self.interactive_update_check.isChecked():
             # ドラッグ中は制御付きで更新（頻度制限あり）
@@ -11198,7 +14834,7 @@ class pyNuD_simulator(QMainWindow):
             self.afm_y_check.isChecked(),
             self.afm_z_check.isChecked()
         ])
-        
+
         # 最低1つはチェックされている必要がある
         if checked_count == 0:
             # どのチェックボックスが最後に変更されたかを確認して元に戻す
@@ -11207,11 +14843,11 @@ class pyNuD_simulator(QMainWindow):
                 sender.blockSignals(True)  # 再帰呼び出しを防ぐ
                 sender.setChecked(True)
                 sender.blockSignals(False)
-                
-            QMessageBox.warning(self, "Warning", 
+
+            QMessageBox.warning(self, "Warning",
                             "At least one AFM view must be selected!")
             return
-        
+
         # 各パネルの表示/非表示を設定
         self.afm_x_frame.setVisible(self.afm_x_check.isChecked())
         self.afm_y_frame.setVisible(self.afm_y_check.isChecked())
@@ -11222,7 +14858,7 @@ class pyNuD_simulator(QMainWindow):
         if hasattr(self, 'afm_real_frame'):
             has_real = getattr(self, 'real_afm_nm', None) is not None
             self.afm_real_frame.setVisible(bool(has_real))
-        
+
         # デバッグ情報
         visible_views = []
         if self.afm_x_check.isChecked():
@@ -11231,7 +14867,7 @@ class pyNuD_simulator(QMainWindow):
             visible_views.append("Y")
         if self.afm_z_check.isChecked():
             visible_views.append("Z")
-        
+
         #print(f"AFM views visible: {', '.join(visible_views)}")
 
     def create_afm_image_panel(self, title):
@@ -11246,11 +14882,11 @@ class pyNuD_simulator(QMainWindow):
                 border-radius: 3px;
             }
         """)
-        
+
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(1)
-        
+
         # タイトルラベル
         title_label = QLabel(title)
         title_label.setStyleSheet("""
@@ -11266,7 +14902,7 @@ class pyNuD_simulator(QMainWindow):
         title_label.setAlignment(Qt.AlignCenter)
         title_label.setMaximumHeight(18)
         layout.addWidget(title_label)
-        
+
         # 画像コンテナ
         image_container = QWidget()
         image_container.setObjectName("afm_image_container")
@@ -11301,9 +14937,9 @@ class pyNuD_simulator(QMainWindow):
         image_layout.setCurrentWidget(placeholder)
 
         layout.addWidget(image_container)
-        
+
         return frame
-    
+
     def reset_camera(self):
         """カメラのリセット（デフォルトでXY平面視点）"""
         if self._is_pymol_active():
@@ -11316,12 +14952,12 @@ class pyNuD_simulator(QMainWindow):
                 return
         self.renderer.ResetCamera()
         camera = self.renderer.GetActiveCamera()
-        
+
         # デフォルトでXY平面視点に設定
         camera.SetViewUp(0, 1, 0)  # Y軸が上方向
         camera.SetPosition(0, 0, 15)  # Z軸の正方向から見る
         camera.SetFocalPoint(0, 0, 0)  # 原点を焦点に
-        
+
         self.renderer.ResetCameraClippingRange()
         self.request_render()
         if self._is_dual_mode():
@@ -11415,7 +15051,7 @@ class pyNuD_simulator(QMainWindow):
                 cam.SetFocalPoint(center[0], center[1], center[2])
         except Exception:
             pass
-    
+
     def setup_lighting(self):
         """ライティング設定"""
         # メインライト
@@ -11424,14 +15060,14 @@ class pyNuD_simulator(QMainWindow):
         light1.SetIntensity(0.8)
         light1.SetColor(1.0, 1.0, 1.0)
         self.renderer.AddLight(light1)
-        
+
         # フィルライト
         light2 = vtk.vtkLight()
         light2.SetPosition(-5, -5, 5)
         light2.SetIntensity(0.4)
         light2.SetColor(0.9, 0.9, 1.0)
         self.renderer.AddLight(light2)
-        
+
     def add_axes(self):
         """大きな座標軸を画面左下隅に追加"""
         # 座標軸アクターを作成
@@ -11440,104 +15076,104 @@ class pyNuD_simulator(QMainWindow):
         axes.SetCylinderRadius(0.05)        # ★★★ 線を細く（0.24→0.05） ★★★
         axes.SetShaftType(0)                # シンプルな軸
         axes.SetAxisLabels(1)               # ラベル表示
-        
+
         # ★★★ ラベルのフォントサイズは大きく維持 ★★★
         axes.GetXAxisCaptionActor2D().GetCaptionTextProperty().SetFontSize(54)  # 大きく維持
         axes.GetYAxisCaptionActor2D().GetCaptionTextProperty().SetFontSize(54)  # 大きく維持
         axes.GetZAxisCaptionActor2D().GetCaptionTextProperty().SetFontSize(54)  # 大きく維持
-        
+
         # 軸ラベルの色設定（より鮮明に）
         axes.GetXAxisCaptionActor2D().GetCaptionTextProperty().SetColor(1, 0.1, 0.1)  # より鮮明な赤
         axes.GetYAxisCaptionActor2D().GetCaptionTextProperty().SetColor(0.1, 1, 0.1)  # より鮮明な緑
         axes.GetZAxisCaptionActor2D().GetCaptionTextProperty().SetColor(0.1, 0.1, 1)  # より鮮明な青
-        
+
         # オリエンテーションマーカーウィジェットを作成
         self.orientation_widget = vtk.vtkOrientationMarkerWidget()
         self.orientation_widget.SetOrientationMarker(axes)
         self.orientation_widget.SetInteractor(self.interactor)
-        
+
         # ★★★ 位置とサイズを設定（左下隅、より小さく配置） ★★★
         self.orientation_widget.SetViewport(0.0, 0.0, 0.3, 0.3)  # 左下の30%×30%（60%→30%）
         self.orientation_widget.SetEnabled(True)
         self.orientation_widget.InteractiveOff()  # 相互作用を無効（邪魔にならない）
-    
+
     def debug_molecule_info(self):
         """分子情報のデバッグ表示"""
         if self.atoms_data is None:
             print("No molecule data available")
             QMessageBox.warning(self, "Debug", "No molecule data loaded!")
             return
-        
+
         atom_x = self.atoms_data['x']
-        atom_y = self.atoms_data['y'] 
+        atom_y = self.atoms_data['y']
         atom_z = self.atoms_data['z']
-        
+
         #print("\n" + "="*50)
         #print("MOLECULE DEBUG INFO")
         #print("="*50)
-        
+
         # 基本統計
         #print(f"Total atoms: {len(atom_x)}")
         #print(f"X range: {np.min(atom_x):.2f} to {np.max(atom_x):.2f}nm (size: {np.max(atom_x)-np.min(atom_x):.2f}nm)")
         #print(f"Y range: {np.min(atom_y):.2f} to {np.max(atom_y):.2f}nm (size: {np.max(atom_y)-np.min(atom_y):.2f}nm)")
         #print(f"Z range: {np.min(atom_z):.2f} to {np.max(atom_z):.2f}nm (size: {np.max(atom_z)-np.min(atom_z):.2f}nm)")
-        
+
         # 中心位置
         center_x = np.mean(atom_x)
         center_y = np.mean(atom_y)
         center_z = np.mean(atom_z)
         print(f"Center: ({center_x:.2f}, {center_y:.2f}, {center_z:.2f})nm")
-        
+
         # 推奨設定
         mol_size = max(np.max(atom_x)-np.min(atom_x), np.max(atom_y)-np.min(atom_y))
         recommended_scan = mol_size * 1.5
         recommended_tip_z = np.max(atom_z) + 2.0
-        
+
         #print(f"\nRECOMMENDED SETTINGS:")
         #print(f"Scan size: {recommended_scan:.1f}nm (current X: {self.spinScanXNm.value():.1f}nm)")
        # print(f"Tip Z position: {recommended_tip_z:.1f}nm (current: {self.afm_params['tip_z']:.1f}nm)")
-        
+
         # 探針位置チェック
         tip_x = self.afm_params['tip_x']
         tip_y = self.afm_params['tip_y']
         tip_z = self.afm_params['tip_z']
-        
+
         #print(f"\nTIP POSITION CHECK:")
         #print(f"Current tip: ({tip_x:.2f}, {tip_y:.2f}, {tip_z:.2f})nm")
-        
+
         # 分子との重なりチェック
-        if (np.min(atom_x) <= tip_x <= np.max(atom_x) and 
+        if (np.min(atom_x) <= tip_x <= np.max(atom_x) and
             np.min(atom_y) <= tip_y <= np.max(atom_y)):
             #print("✓ Tip is positioned over the molecule")
             pass
         else:
             #print("⚠ WARNING: Tip is NOT over the molecule!")
             pass
-        
+
         if tip_z > np.max(atom_z) + 1.0:
             #print("✓ Tip Z position is safe")
             pass
         else:
             #print("⚠ WARNING: Tip Z position may be too low!")
             pass
-        
+
         #print("="*50)
-        
+
         # UIに推奨設定を表示
         msg = f"""Debug Information:
-        
+
 Molecule size: {mol_size:.1f}nm
 Current scan size X: {self.spinScanXNm.value():.1f}nm
 Current scan size Y: {self.spinScanYNm.value():.1f}nm
 Recommended scan size: {recommended_scan:.1f}nm
 
-Current tip Z: {tip_z:.1f}nm  
+Current tip Z: {tip_z:.1f}nm
 Recommended tip Z: {recommended_tip_z:.1f}nm
 
 Tip over molecule: {np.min(atom_x) <= tip_x <= np.max(atom_x) and np.min(atom_y) <= tip_y <= np.max(atom_y)}
 
 Check console for detailed information."""
-        
+
         QMessageBox.information(self, "Debug Info", msg)
 
     def quick_collision_test(self):
@@ -11545,25 +15181,25 @@ Check console for detailed information."""
         if self.atoms_data is None:
             print("No molecule data available")
             return
-        
+
         atom_x = self.atoms_data['x']
         atom_y = self.atoms_data['y']
         atom_z = self.atoms_data['z']
         atom_elem = self.atoms_data['element']
         atom_radii = np.array([self.vdw_radii.get(e, self.vdw_radii['other']) for e in atom_elem])
-        
+
         # 分子の中心での衝突テスト
         center_x = np.mean(atom_x)
         center_y = np.mean(atom_y)
         test_z = np.max(atom_z) + 3.0
-        
+
         #print(f"\nQUICK COLLISION TEST:")
         #print(f"Test point: ({center_x:.2f}, {center_y:.2f}, {test_z:.2f})nm")
-        
+
         try:
             height = self.find_collision_height(center_x, center_y, atom_x, atom_y, atom_z, atom_radii)
             #print(f"Calculated collision height: {height:.3f}nm")
-            
+
             # 妥当性チェック
             if height > np.max(atom_z):
                 #print("✓ Result seems reasonable (above molecule)")
@@ -11571,9 +15207,9 @@ Check console for detailed information."""
             else:
                 #print("⚠ WARNING: Result may be too low")
                 result_msg = f"⚠ Collision test FAILED\n\nTest point: ({center_x:.2f}, {center_y:.2f})\nCalculated height: {height:.3f}nm\nMolecule top: {np.max(atom_z):.3f}nm\n\nHeight is too low!"
-                
+
             QMessageBox.information(self, "Collision Test", result_msg)
-            
+
         except Exception as e:
             print(f"ERROR in collision calculation: {e}")
             QMessageBox.critical(self, "Error", f"Collision test failed:\n{str(e)}")
@@ -11583,43 +15219,43 @@ Check console for detailed information."""
         if self.atoms_data is None:
             QMessageBox.warning(self, "Warning", "No molecule data loaded!")
             return
-        
+
         atom_x = self.atoms_data['x']
-        atom_y = self.atoms_data['y'] 
+        atom_y = self.atoms_data['y']
         atom_z = self.atoms_data['z']
-        
+
         # 推奨設定を計算
         mol_size = max(np.max(atom_x)-np.min(atom_x), np.max(atom_y)-np.min(atom_y))
         recommended_scan = mol_size * 1.5
         recommended_tip_z = np.max(atom_z) + 2.0
-        
+
         # UIに設定を適用
         self.spinScanXNm.setValue(recommended_scan)
         self.spinScanYNm.setValue(recommended_scan)
-        
+
         # 探針Z位置を設定（スライダー値に変換）
         slider_value = int(recommended_tip_z * 5.0)  # z = value / 5.0 の逆算
-        slider_value = max(self.tip_z_slider.minimum(), 
+        slider_value = max(self.tip_z_slider.minimum(),
                           min(self.tip_z_slider.maximum(), slider_value))
         self.tip_z_slider.setValue(slider_value)
-        
+
         # 探針を分子中心に移動
         center_x = np.mean(atom_x)
         center_y = np.mean(atom_y)
-        
+
         self.tip_x_slider.setValue(int(center_x * 5.0))  # x = value / 5.0 の逆算
         self.tip_y_slider.setValue(int(center_y * 5.0))  # y = value / 5.0 の逆算
-        
+
         print(f"Applied recommended settings:")
         print(f"- Scan size: {recommended_scan:.1f}nm")
         print(f"- Tip position: ({center_x:.1f}, {center_y:.1f}, {recommended_tip_z:.1f})nm")
-        
-        QMessageBox.information(self, "Settings Applied", 
+
+        QMessageBox.information(self, "Settings Applied",
                                f"Recommended settings applied:\n\n"
                                f"Scan size: {recommended_scan:.1f}nm\n"
                                f"Tip position: ({center_x:.1f}, {center_y:.1f}, {recommended_tip_z:.1f})nm")
 
-        
+
     def import_file(self):
         """統合ファイルインポート（PDB/CIF/MRC）"""
         initial_dir = self.last_import_dir if hasattr(self, 'last_import_dir') and self.last_import_dir else ""
@@ -11627,13 +15263,13 @@ Check console for detailed information."""
             self, "Select Structure File", initial_dir,
             "Structure Files (*.pdb *.cif *.mmcif *.mrc);;PDB files (*.pdb);;mmCIF files (*.cif *.mmcif);;MRC Files (*.mrc);;All Files (*)",
             options=QFileDialog.DontUseNativeDialog)
-        
+
         if not file_path:
             return
-        
+
         self.last_import_dir = os.path.dirname(file_path)
         ext = os.path.splitext(file_path)[1].lower()
-        
+
         if ext == '.pdb':
             self._import_pdb_internal(file_path)
         elif ext in ['.cif', '.mmcif']:
@@ -11641,7 +15277,7 @@ Check console for detailed information."""
         elif ext == '.mrc':
             self._import_mrc_internal(file_path)
         else:
-            QMessageBox.warning(self, "Unsupported Format", 
+            QMessageBox.warning(self, "Unsupported Format",
                               f"File format '{ext}' is not supported.\nSupported formats: .pdb, .cif, .mmcif, .mrc")
 
     def _structure_path_from_mime(self, mime_data):
@@ -11685,6 +15321,9 @@ Check console for detailed information."""
         if self._handle_pymol_mouse_interaction(obj, event):
             return True
 
+        if self._handle_vtk_mouse_interaction(obj, event):
+            return True
+
         target = False
         # 互換性: vtk/pymol/コンテナいずれにもドロップを許可
         if hasattr(self, 'vtk_widget') and obj is self.vtk_widget:
@@ -11720,6 +15359,59 @@ Check console for detailed information."""
                     event.acceptProposedAction()
                     return True
         return super().eventFilter(obj, event)
+
+    def _handle_vtk_mouse_interaction(self, obj, event):
+        """VTK ビュー: Ctrl=構造回転 / Shift=パン。それ以外はネイティブ VTK に委譲。"""
+        vtk_widget = getattr(self, 'vtk_widget', None)
+        if vtk_widget is None or obj is not vtk_widget or self._is_pymol_only():
+            return False
+
+        etype = event.type()
+        if etype == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            modifiers = event.modifiers()
+            ctrl_pressed = bool(modifiers & Qt.ControlModifier) or bool(modifiers & Qt.MetaModifier)
+            shift_pressed = bool(modifiers & Qt.ShiftModifier)
+            if ctrl_pressed and not shift_pressed:
+                self.actor_rotating = True
+                self.drag_start_pos = event.pos()
+                event.accept()
+                return True
+            if shift_pressed and not ctrl_pressed:
+                self.panning = True
+                self.pan_start_pos = event.pos()
+                event.accept()
+                return True
+            return False
+
+        if etype == QEvent.MouseMove:
+            if self.actor_rotating:
+                if hasattr(self, 'drag_start_pos'):
+                    dx = event.pos().x() - self.drag_start_pos.x()
+                    dy = event.pos().y() - self.drag_start_pos.y()
+                    self.update_rotation_from_drag_view_dependent(dx, dy)
+                    self.drag_start_pos = event.pos()
+                event.accept()
+                return True
+            if self.panning:
+                event.accept()
+                return True
+            return False
+
+        if etype == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+            if self.actor_rotating:
+                self.actor_rotating = False
+                if hasattr(self, 'interactive_update_check') and self.interactive_update_check.isChecked():
+                    if hasattr(self, 'schedule_high_res_simulation'):
+                        self.schedule_high_res_simulation()
+                event.accept()
+                return True
+            if self.panning:
+                self.panning = False
+                event.accept()
+                return True
+            return False
+
+        return False
 
     def _is_pymol_mouse_target(self, obj):
         if getattr(self, 'pymol_widget', None) is not None and obj is self.pymol_widget:
@@ -11957,7 +15649,7 @@ Check console for detailed information."""
 
     def _import_pdb_internal(self, file_path):
         """PDBファイルの読み込み（内部メソッド）"""
-            
+
         try:
             # MRCデータをクリア（PDBファイルimport時）
             self.clear_mrc_data()
@@ -11987,7 +15679,7 @@ Check console for detailed information."""
                 if pref not in ("pymol", "vtk"):
                     pref = "pymol"
                 self._set_render_backend(pref)
-            if hasattr(self, 'esp_check'):
+            if self._has_esp_check():
                 self.esp_check.setChecked(False)
             self.pymol_esp_object = None
 
@@ -11995,12 +15687,12 @@ Check console for detailed information."""
             self.progress_bar.setVisible(True)
             self.progress_bar.setValue(0)
             QApplication.processEvents()
-            
+
             self.read_pdb_file(file_path)
             self._store_original_atoms_data()
             self.progress_bar.setValue(50)
             QApplication.processEvents()
-            
+
             self.update_statistics()
             self.selected_residue_keys = set()
             self._last_sequence_key = None
@@ -12008,7 +15700,7 @@ Check console for detailed information."""
             self._update_sequence_control()
             self.progress_bar.setValue(70)
             QApplication.processEvents()
-            
+
             self.display_molecule()
             self.progress_bar.setValue(90)
             QApplication.processEvents()
@@ -12016,56 +15708,56 @@ Check console for detailed information."""
             # ロード直後にモデルが画面内に収まるように調整
             self.fit_view_to_contents()
             self.set_standard_view('xy')
-            
+
             self.create_tip()
              # ★★★ ここから追加 ★★★
             # PDB構造の最高点から2nm上に探針の初期位置を設定
             if self.atoms_data is not None:
                 z_max = self.atoms_data['z'].max()
                 initial_tip_z = z_max + 2.0
-                
+
                 # Z位置スライダーの物理値と表示値を更新
                 # スライダー値は物理値の5倍 (z = value / 5.0 の逆算)
                 slider_value = int(initial_tip_z * 5.0)
-                
+
                 # スライダーが設定可能な範囲内に収まるように調整
                 min_val, max_val = self.tip_z_slider.minimum(), self.tip_z_slider.maximum()
                 slider_value = max(min_val, min(max_val, slider_value))
-                
+
                 # スライダーの値を設定 (これによりupdate_tip_positionが自動で呼ばれる)
                 self.tip_z_slider.setValue(slider_value)
             # ★★★ ここまで追加 ★★★
             self.progress_bar.setValue(100)
             QApplication.processEvents()
-            
+
             # ファイル名表示
-            self.pdb_name = os.path.basename(file_path) 
+            self.pdb_name = os.path.basename(file_path)
             self.pdb_id = os.path.splitext(self.pdb_name)[0]
             self.file_label.setText(f"File Name: {self.pdb_name} (PDB)")
-            
+
             # シミュレーションボタンを有効化
             self.simulate_btn.setEnabled(True)
-            
+
             # 回転ウィジェットも有効化
             if hasattr(self, 'rotation_widgets'):
                 for axis in ['X', 'Y', 'Z']:
                     self.rotation_widgets[axis]['spin'].setEnabled(True)
                     self.rotation_widgets[axis]['slider'].setEnabled(True)
-            
+
             # プログレスバー非表示
             QTimer.singleShot(1000, lambda: self.progress_bar.setVisible(False))
 
             # Default behavior: auto-run a first simulation when Interactive Update is enabled.
             if hasattr(self, 'interactive_update_check') and self.interactive_update_check.isChecked():
                 QTimer.singleShot(0, self.trigger_interactive_simulation)
-            
-            QMessageBox.information(self, "Success", 
+
+            QMessageBox.information(self, "Success",
                                 f"Successfully loaded {self.pdb_name}\n"
                                 f"Atoms: {len(self.atoms_data['x'])}")
-            
+
         except Exception as e:
             self.progress_bar.setVisible(False)
-            QMessageBox.critical(self, "Error", 
+            QMessageBox.critical(self, "Error",
                             f"Failed to load PDB file:\n{str(e)}")
 
     def _import_cif_internal(self, file_path):
@@ -12100,7 +15792,7 @@ Check console for detailed information."""
                 if pref not in ("pymol", "vtk"):
                     pref = "pymol"
                 self._set_render_backend(pref)
-            if hasattr(self, 'esp_check'):
+            if self._has_esp_check():
                 self.esp_check.setChecked(False)
             self.pymol_esp_object = None
 
@@ -12172,13 +15864,13 @@ Check console for detailed information."""
         except Exception as e:
             self.progress_bar.setVisible(False)
             QMessageBox.critical(self, "Error", f"Failed to load mmCIF file:\n{str(e)}")
-            
+
     def read_pdb_file(self, file_path):
         """PDBファイルの解析"""
         atoms = []
         helices = []  # (chain_id, start_residue, end_residue)
         sheets = []   # (chain_id, start_residue, end_residue)
-        
+
         with open(file_path, 'r') as file:
             for line_num, line in enumerate(file, 1):
                 # HELIXレコードの解析
@@ -12190,7 +15882,7 @@ Check console for detailed information."""
                         helices.append((chain_id, start_residue, end_residue))
                     except (ValueError, IndexError):
                         pass
-                
+
                 # SHEETレコードの解析
                 elif line.startswith('SHEET'):
                     try:
@@ -12200,7 +15892,7 @@ Check console for detailed information."""
                         sheets.append((chain_id, start_residue, end_residue))
                     except (ValueError, IndexError):
                         pass
-                
+
                 # ATOM/HETATMレコードの解析
                 elif line.startswith('ATOM') or line.startswith('HETATM'):
                     try:
@@ -12210,22 +15902,22 @@ Check console for detailed information."""
                         chain_id = line[21:22].strip()
                         residue_id = int(line[22:26].strip())
                         icode = line[26:27].strip()
-                        
+
                         x = float(line[30:38]) / 10.0  # Åからnmに変換
                         y = float(line[38:46]) / 10.0
                         z = float(line[46:54]) / 10.0
-                        
+
                         # 元素名取得
                         element = line[76:78].strip()
                         if not element:
                             element = atom_name[0]
-                        
+
                         # B-factor取得
                         try:
                             b_factor = float(line[60:66])
                         except:
                             b_factor = 20.0
-                        
+
                         atoms.append({
                             'name': atom_name,
                             'x': x, 'y': y, 'z': z,
@@ -12236,14 +15928,14 @@ Check console for detailed information."""
                             'icode': icode,
                             'b_factor': b_factor
                         })
-                        
+
                     except (ValueError, IndexError) as e:
                         print(f"Error parsing line {line_num}: {e}")
                         continue
-        
+
         if not atoms:
             raise ValueError("No valid atoms found in PDB file")
-        
+
         # numpy配列に変換
         self.atoms_data = {
             'x': np.array([atom['x'] for atom in atoms]),
@@ -12257,31 +15949,32 @@ Check console for detailed information."""
             'icode': np.array([atom['icode'] for atom in atoms]),
             'b_factor': np.array([atom['b_factor'] for atom in atoms])
         }
-        
+        self._clear_domain_state()
+
         # 二次構造情報を辞書に格納
         self.secondary_structure = {}
-        
+
         # ヘリックスを登録
         for chain_id, start_res, end_res in helices:
             for res_id in range(start_res, end_res + 1):
                 key = (chain_id, res_id)
                 self.secondary_structure[key] = 'H'
-        
+
         # シートを登録
         for chain_id, start_res, end_res in sheets:
             for res_id in range(start_res, end_res + 1):
                 key = (chain_id, res_id)
                 self.secondary_structure[key] = 'E'
-        
+
         # 座標を中心化
         self.center_coordinates()
-        
+
         print(f"Loaded {len(atoms)} atoms")
         if helices:
             print(f"Found {len(helices)} helix regions (from PDB)")
         if sheets:
             print(f"Found {len(sheets)} sheet regions (from PDB)")
-        
+
         # HELIX/SHEETレコードがない、または少ない場合は幾何学的検出を実行
         if len(helices) + len(sheets) < 3:
             print("Running geometric secondary structure detection...")
@@ -12504,10 +16197,11 @@ Check console for detailed information."""
             'icode': np.array([atom['icode'] for atom in atoms]),
             'b_factor': np.array([atom['b_factor'] for atom in atoms])
         }
+        self._clear_domain_state()
 
         self.center_coordinates()
         print(f"Loaded {len(atoms)} atoms from mmCIF")
-    
+
     def detect_secondary_structure_geometric(self):
         """
         幾何学的な二次構造検出（PyMOL風）
@@ -12515,23 +16209,23 @@ Check console for detailed information."""
         """
         if self.atoms_data is None:
             return
-        
+
         # Cα原子のみを抽出
         mask = (self.atoms_data['atom_name'] == 'CA')
         if not np.any(mask):
             return
-        
+
         ca_x = self.atoms_data['x'][mask]
         ca_y = self.atoms_data['y'][mask]
         ca_z = self.atoms_data['z'][mask]
         chain_ids = self.atoms_data['chain_id'][mask]
         residue_ids = self.atoms_data['residue_id'][mask]
-        
+
         unique_chains = np.unique(chain_ids)
-        
+
         helix_count = 0
         sheet_count = 0
-        
+
         for chain in unique_chains:
             # チェーン内のCα原子を抽出
             chain_mask = (chain_ids == chain)
@@ -12539,53 +16233,53 @@ Check console for detailed information."""
             c_y = ca_y[chain_mask]
             c_z = ca_z[chain_mask]
             c_res_id = residue_ids[chain_mask]
-            
+
             # 残基ID順にソート
             sort_idx = np.argsort(c_res_id)
             c_x = c_x[sort_idx]
             c_y = c_y[sort_idx]
             c_z = c_z[sort_idx]
             c_res_id_sorted = c_res_id[sort_idx]
-            
+
             if len(c_x) < 5:
                 continue
-            
+
             # 各残基について二次構造を判定
             for i in range(len(c_x)):
                 res_id = c_res_id_sorted[i]
                 key = (chain, res_id)
-                
+
                 # 既に二次構造が割り当てられている場合はスキップ
                 if key in self.secondary_structure:
                     continue
-                
+
                 # ヘリックス検出: i, i+3, i+4 の距離パターン
                 is_helix = False
                 if i + 4 < len(c_x):
                     # 隣接CA間の距離
-                    d1 = np.sqrt((c_x[i+1] - c_x[i])**2 + 
-                                 (c_y[i+1] - c_y[i])**2 + 
+                    d1 = np.sqrt((c_x[i+1] - c_x[i])**2 +
+                                 (c_y[i+1] - c_y[i])**2 +
                                  (c_z[i+1] - c_z[i])**2)
-                    
+
                     # i と i+3 の距離（ヘリックスの特徴）
-                    d3 = np.sqrt((c_x[i+3] - c_x[i])**2 + 
-                                 (c_y[i+3] - c_y[i])**2 + 
+                    d3 = np.sqrt((c_x[i+3] - c_x[i])**2 +
+                                 (c_y[i+3] - c_y[i])**2 +
                                  (c_z[i+3] - c_z[i])**2)
-                    
+
                     # i と i+4 の距離（ヘリックスの特徴）
-                    d4 = np.sqrt((c_x[i+4] - c_x[i])**2 + 
-                                 (c_y[i+4] - c_y[i])**2 + 
+                    d4 = np.sqrt((c_x[i+4] - c_x[i])**2 +
+                                 (c_y[i+4] - c_y[i])**2 +
                                  (c_z[i+4] - c_z[i])**2)
-                    
+
                     # ヘリックスの判定基準
                     # - 隣接CA距離: 約3.6-4.0Å (0.36-0.40 nm)
                     # - i→i+3距離: 約5.0-5.5Å (0.50-0.55 nm)
                     # - i→i+4距離: 約5.8-6.5Å (0.58-0.65 nm)
-                    if (0.34 < d1 < 0.42 and 
-                        0.48 < d3 < 0.58 and 
+                    if (0.34 < d1 < 0.42 and
+                        0.48 < d3 < 0.58 and
                         0.56 < d4 < 0.68):
                         is_helix = True
-                
+
                 if is_helix:
                     self.secondary_structure[key] = 'H'
                     helix_count += 1
@@ -12594,14 +16288,14 @@ Check console for detailed information."""
                     is_sheet = False
                     if i + 2 < len(c_x) and i > 0:
                         # 隣接CA間の距離が約3.3-3.5Å (シートの特徴)
-                        d1 = np.sqrt((c_x[i+1] - c_x[i])**2 + 
-                                     (c_y[i+1] - c_y[i])**2 + 
+                        d1 = np.sqrt((c_x[i+1] - c_x[i])**2 +
+                                     (c_y[i+1] - c_y[i])**2 +
                                      (c_z[i+1] - c_z[i])**2)
-                        
-                        d_prev = np.sqrt((c_x[i] - c_x[i-1])**2 + 
-                                        (c_y[i] - c_y[i-1])**2 + 
+
+                        d_prev = np.sqrt((c_x[i] - c_x[i-1])**2 +
+                                        (c_y[i] - c_y[i-1])**2 +
                                         (c_z[i] - c_z[i-1])**2)
-                        
+
                         # シートの判定基準
                         # - CA間距離: 約3.2-3.5Å (0.32-0.35 nm)
                         # - 比較的伸びた構造
@@ -12609,65 +16303,65 @@ Check console for detailed information."""
                             # 前後の点を含めて判定
                             if i + 2 < len(c_x):
                                 # 3つの連続したCAがほぼ直線状かチェック
-                                vec1 = np.array([c_x[i] - c_x[i-1], 
-                                                c_y[i] - c_y[i-1], 
+                                vec1 = np.array([c_x[i] - c_x[i-1],
+                                                c_y[i] - c_y[i-1],
                                                 c_z[i] - c_z[i-1]])
-                                vec2 = np.array([c_x[i+1] - c_x[i], 
-                                                c_y[i+1] - c_y[i], 
+                                vec2 = np.array([c_x[i+1] - c_x[i],
+                                                c_y[i+1] - c_y[i],
                                                 c_z[i+1] - c_z[i]])
-                                
+
                                 # ベクトルを正規化
                                 vec1_norm = np.linalg.norm(vec1)
                                 vec2_norm = np.linalg.norm(vec2)
-                                
+
                                 if vec1_norm > 1e-6 and vec2_norm > 1e-6:
                                     vec1 = vec1 / vec1_norm
                                     vec2 = vec2 / vec2_norm
-                                    
+
                                     # 内積が大きい（ほぼ同じ方向）ならシート
                                     dot_product = np.dot(vec1, vec2)
                                     if dot_product > 0.85:  # 約30度以内
                                         is_sheet = True
-                    
+
                     if is_sheet:
                         self.secondary_structure[key] = 'E'
                         sheet_count += 1
                     else:
                         # デフォルトはコイル
                         self.secondary_structure[key] = 'C'
-        
+
         print(f"Geometric detection: {helix_count} helix, {sheet_count} sheet residues")
-        
+
     def center_coordinates(self):
         """座標を中心に移動"""
         for coord in ['x', 'y', 'z']:
             center = (self.atoms_data[coord].max() + self.atoms_data[coord].min()) / 2
             self.atoms_data[coord] -= center
-            
+
     def update_statistics(self):
         """原子統計の更新"""
         if self.atoms_data is None:
             return
-            
+
         total = len(self.atoms_data['x'])
         self.stats_labels['Total'].setText(f"Total: {total}")
-        
+
         for atom_type in ['C', 'O', 'N', 'H']:
             count = np.sum(self.atoms_data['element'] == atom_type)
             self.stats_labels[atom_type].setText(f"{atom_type}: {count}")
-        
+
         # その他の原子
         known_types = ['C', 'O', 'N', 'H']
         other_count = np.sum(~np.isin(self.atoms_data['element'], known_types))
         self.stats_labels['Other'].setText(f"Other: {other_count}")
-        
+
     def get_filtered_atoms(self):
         """表示フィルターに基づいて原子を選択"""
         if self.atoms_data is None:
             return None, None, None, None, None, None, None
-            
+
         atom_filter = self.atom_combo.currentText()
-        
+
         if atom_filter == "All Atoms":
             mask = np.ones(len(self.atoms_data['x']), dtype=bool)
         elif atom_filter == "Heavy Atoms":
@@ -12678,30 +16372,58 @@ Check console for detailed information."""
             mask = self.atoms_data['element'] == atom_filter
         else:
             mask = np.ones(len(self.atoms_data['x']), dtype=bool)
-        
+
         if not np.any(mask):
             return None, None, None, None, None, None, None
-            
-        return (self.atoms_data['x'][mask], 
+
+        chain_ids = self.atoms_data['chain_id'][mask]
+        try:
+            if (
+                hasattr(self, "color_combo")
+                and self.color_combo.currentText() == "By Domain"
+                and getattr(self, "domain_ids", None) is not None
+                and len(self.domain_ids) == len(self.atoms_data["x"])
+            ):
+                domain_vals = np.asarray(self.domain_ids, dtype=int)[mask]
+                chain_ids = np.array([
+                    f"Domain {int(v) + 1}" if int(v) >= 0 else "Fixed"
+                    for v in domain_vals
+                ], dtype=object)
+        except Exception:
+            chain_ids = self.atoms_data['chain_id'][mask]
+
+        return (self.atoms_data['x'][mask],
                 self.atoms_data['y'][mask],
                 self.atoms_data['z'][mask],
                 self.atoms_data['element'][mask],
-                self.atoms_data['chain_id'][mask],
+                chain_ids,
                 self.atoms_data['b_factor'][mask],
                 mask)
-        
+
+    def _domain_color_from_label(self, domain_label):
+        text = str(domain_label)
+        if text.startswith("Domain "):
+            try:
+                idx = int(text.split(" ", 1)[1]) - 1
+            except Exception:
+                idx = 0
+            return self.chain_colors[idx % len(self.chain_colors)]
+        return (0.55, 0.55, 0.55)
+
     def get_atom_color(self, element, chain_id, b_factor):
         """原子の色を取得"""
         color_scheme = self.color_combo.currentText()
-        
+
         if color_scheme == "By Element":
             base_color = self.element_colors.get(element, self.element_colors['other'])
         elif color_scheme == "By Chain":
             chain_hash = hash(chain_id) % len(self.chain_colors)
             base_color = self.chain_colors[chain_hash]
+        elif color_scheme == "By Domain":
+            base_color = self._domain_color_from_label(chain_id)
         elif color_scheme == "Single Color":
             # Single Colorの場合は選択された色を直接返す
-            base_color = self.current_single_color  
+            base_color = self.current_single_color
             #print(f"Using single color / 単色を使用: {base_color}")  # デバッグ用
         elif color_scheme == "By B-Factor":
             # B-factorを0-1に正規化（0-50の範囲を想定）
@@ -12718,11 +16440,11 @@ Check console for detailed information."""
                 base_color = (1, 1 - 0.5*t, 0)
         else:
             base_color = self.element_colors.get(element, self.element_colors['other'])
-        
+
         # 明るさファクターを適用
         adjusted_color = tuple(min(1.0, c * self.brightness_factor) for c in base_color)
         return adjusted_color
-        
+
     def display_molecule(self):
         """分子の表示"""
         if self.pymol_available:
@@ -12733,89 +16455,21 @@ Check console for detailed information."""
             if self._is_pymol_only():
                 self.apply_structure_rotation(trigger_simulation=False)
                 self._display_pymol_tip_overlay()
+                try:
+                    self._ensure_vtk_molecule_actors_for_overlay()
+                except Exception as e:
+                    print(f"[WARNING] Hidden VTK overlay actor sync failed: {e}")
                 return
 
-        # VTK側を使う場合は初期化を保証
-        self._ensure_vtk_initialized()
-        if not hasattr(self, 'renderer') or self.renderer is None:
-            print("[WARNING] VTK renderer not initialized.")
+        if self._build_vtk_molecule_actors():
+            self._vtk_overlay_signature_cache = self._vtk_overlay_signature()
+        else:
             return
 
-        # 既存のアクターを削除
-        if self.sample_actor:
-            self.renderer.RemoveActor(self.sample_actor)
-        if self.bonds_actor:
-            self.renderer.RemoveActor(self.bonds_actor)
-            
-        x, y, z, elements, chain_ids, b_factors, mask = self.get_filtered_atoms()
-        if x is None:
-            return
-            
-        style = self.style_combo.currentText()
-        size_factor = self.size_slider.value() / 100.0
-        opacity = self.opacity_slider.value() / 100.0
-        quality = self.quality_combo.currentText()
-        
-        # 品質設定
-        if quality == "Fast":
-            resolution = 8
-            max_atoms = 5000
-        elif quality == "Good":
-            resolution = 12
-            max_atoms = 10000
-        else:  # High
-            resolution = 16
-            max_atoms = 20000
-        
-        # サンプリング処理
-        sampled_indices = None
-        if len(x) > max_atoms:
-            sampled_indices = np.random.choice(len(x), max_atoms, replace=False)
-            x, y, z = x[sampled_indices], y[sampled_indices], z[sampled_indices]
-            elements = elements[sampled_indices]
-            chain_ids = chain_ids[sampled_indices]
-            b_factors = b_factors[sampled_indices]
-        
-        # スタイルに応じた表示
-        if style == "Ball & Stick":
-            self.sample_actor = self.create_ball_stick_display(
-                x, y, z, elements, chain_ids, b_factors, size_factor, resolution)
-        elif style == "Stick Only":
-            self.sample_actor = self.create_stick_display(
-                x, y, z, elements, chain_ids, b_factors, size_factor, resolution)
-        elif style == "Spheres":
-            self.sample_actor = self.create_sphere_display(
-                x, y, z, elements, chain_ids, b_factors, size_factor, resolution)
-        elif style == "Points":
-            self.sample_actor = self.create_point_display(
-                x, y, z, elements, chain_ids, b_factors, size_factor)
-        elif style == "Wireframe":
-            self.sample_actor = self.create_wireframe_display(x, y, z)
-        elif style == "Simple Cartoon":
-            # Cartoon表示は元のデータを使用（サンプリングなし）
-            self.sample_actor = self.create_simple_cartoon_display_safe()
-        elif style == "Ribbon":
-            # Ribbon表示はCα原子を使用（サンプリングなし）
-            self.sample_actor = self.create_ribbon_display(size_factor)
-        
-        # 透明度設定
-        if self.sample_actor and hasattr(self.sample_actor, 'GetProperty'):
-            self.sample_actor.GetProperty().SetOpacity(opacity)
-            
-        # アクターを追加
-        if self.sample_actor:
-            self.renderer.AddActor(self.sample_actor)
-            
-        # 結合表示（Stick系の場合）
-        if style in ["Ball & Stick", "Stick Only"]:
-            self.create_bonds_display(x, y, z, elements, chain_ids, b_factors, 
-                                    size_factor * 0.3, resolution)
-        
-        # 現在の回転設定をアクターに適用
-        self.apply_structure_rotation()
+        self.apply_structure_rotation(trigger_simulation=False)
         if self.selected_residue_keys:
             self._apply_vtk_residue_highlight()
-        
+
         # 初期回転角度を保存（Reset Allで使用）
         if hasattr(self, 'rotation_widgets'):
             self.initial_rotation_angles = {
@@ -12823,115 +16477,115 @@ Check console for detailed information."""
                 'Y': self.rotation_widgets['Y']['spin'].value(),
                 'Z': self.rotation_widgets['Z']['spin'].value()
             }
-            
+
         self.request_render()
-        
+
     def create_sphere_display(self, x, y, z, elements, chain_ids, b_factors, size_factor, resolution):
         """球体表示"""
         points = vtk.vtkPoints()
         colors = vtk.vtkUnsignedCharArray()
         colors.SetNumberOfComponents(3)
         colors.SetName("Colors")
-        
+
         # 全ての点と色を設定（Single Colorでも個別に設定）
         for i in range(len(x)):
             points.InsertNextPoint(x[i], y[i], z[i])
-            
+
             # 色を取得（Single Colorでも get_atom_color を通す）
             color = self.get_atom_color(elements[i], chain_ids[i], b_factors[i])
             colors.InsertNextTuple3(int(color[0]*255), int(color[1]*255), int(color[2]*255))
-        
+
         polydata = vtk.vtkPolyData()
         polydata.SetPoints(points)
         polydata.GetPointData().SetScalars(colors)
         polydata.Modified()
-        
+
         # 球体ソース
         sphere = vtk.vtkSphereSource()
         sphere.SetRadius(0.15 * size_factor)
         sphere.SetPhiResolution(resolution)
         sphere.SetThetaResolution(resolution)
-        
+
         glyph = vtk.vtkGlyph3D()
         glyph.SetInputData(polydata)
         glyph.SetSourceConnection(sphere.GetOutputPort())
         glyph.SetScaleModeToDataScalingOff()
         glyph.SetColorModeToColorByScalar()  # 重要：色をスカラーで制御
         glyph.Update()
-        
+
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(glyph.GetOutputPort())
         mapper.ScalarVisibilityOn()  # 常にOn
         mapper.SetScalarModeToUsePointData()  # ポイントデータを使用
         mapper.Update()
-        
+
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
         actor.GetProperty().SetSpecular(0.4)
         actor.GetProperty().SetSpecularPower(20)
-        
+
         return actor
-        
+
     def create_point_display(self, x, y, z, elements, chain_ids, b_factors, size_factor):
         """点表示"""
         points = vtk.vtkPoints()
         colors = vtk.vtkUnsignedCharArray()
         colors.SetNumberOfComponents(3)
         colors.SetName("Colors")
-        
+
         for i in range(len(x)):
             points.InsertNextPoint(x[i], y[i], z[i])
             color = self.get_atom_color(elements[i], chain_ids[i], b_factors[i])
             colors.InsertNextTuple3(int(color[0]*255), int(color[1]*255), int(color[2]*255))
-        
+
         polydata = vtk.vtkPolyData()
         polydata.SetPoints(points)
         polydata.GetPointData().SetScalars(colors)
         polydata.Modified()  # 追加
-        
+
         vertex_filter = vtk.vtkVertexGlyphFilter()
         vertex_filter.SetInputData(polydata)
         vertex_filter.Update()  # 追加
-        
+
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(vertex_filter.GetOutputPort())
         mapper.ScalarVisibilityOn()  # 追加
         mapper.Update()  # 追加
-        
+
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
         actor.GetProperty().SetPointSize(max(1, size_factor * 5))
-        
+
         return actor
-        
+
     def create_wireframe_display(self, x, y, z):
         """ワイヤーフレーム表示"""
         points = vtk.vtkPoints()
         for i in range(len(x)):
             points.InsertNextPoint(x[i], y[i], z[i])
-        
+
         polydata = vtk.vtkPolyData()
         polydata.SetPoints(points)
-        
+
         # Delaunay 3D
         delaunay = vtk.vtkDelaunay3D()
         delaunay.SetInputData(polydata)
-        
+
         # 表面抽出
         surface_filter = vtk.vtkDataSetSurfaceFilter()
         surface_filter.SetInputConnection(delaunay.GetOutputPort())
-        
+
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(surface_filter.GetOutputPort())
-        
+
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
         actor.GetProperty().SetRepresentationToWireframe()
         actor.GetProperty().SetColor(0.7, 0.7, 0.7)
         actor.GetProperty().SetLineWidth(1.5)
-        
+
         return actor
-        
+
     def create_simple_cartoon_display_safe(self):
         """
         簡易的なCartoon表示を作成（スプライン補間などを行わない安全な実装）
@@ -12940,47 +16594,47 @@ Check console for detailed information."""
         mask = (self.atoms_data['atom_name'] == 'CA')
         if not np.any(mask):
             return None
-            
+
         ca_x = self.atoms_data['x'][mask]
         ca_y = self.atoms_data['y'][mask]
         ca_z = self.atoms_data['z'][mask]
         chain_ids = self.atoms_data['chain_id'][mask]
         residue_ids = self.atoms_data['residue_id'][mask]
-        
+
         # チェーンごとにソート
         unique_chains = np.unique(chain_ids)
-        
+
         append_poly = vtk.vtkAppendPolyData()
-        
+
         for chain in unique_chains:
             chain_mask = (chain_ids == chain)
             c_x = ca_x[chain_mask]
             c_y = ca_y[chain_mask]
             c_z = ca_z[chain_mask]
             c_res_id = residue_ids[chain_mask]
-            
+
             # 残基ID順にソート
             sort_idx = np.argsort(c_res_id)
             c_x = c_x[sort_idx]
             c_y = c_y[sort_idx]
             c_z = c_z[sort_idx]
-            
+
             if len(c_x) < 2:
                 continue
-                
+
             points = vtk.vtkPoints()
             lines = vtk.vtkCellArray()
-            
+
             lines.InsertNextCell(len(c_x))
-            
+
             for i in range(len(c_x)):
                 points.InsertNextPoint(c_x[i], c_y[i], c_z[i])
                 lines.InsertCellPoint(i)
-                
+
             poly = vtk.vtkPolyData()
             poly.SetPoints(points)
             poly.SetLines(lines)
-            
+
             # チューブフィルターで太さを持たせる
             tube = vtk.vtkTubeFilter()
             tube.SetInputData(poly)
@@ -12988,21 +16642,21 @@ Check console for detailed information."""
             tube.SetNumberOfSides(8)
             tube.CappingOn()
             tube.Update()
-            
+
             append_poly.AddInputData(tube.GetOutput())
-            
+
         append_poly.Update()
-        
+
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(append_poly.GetOutputPort())
-        
+
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        
+
         # 色は一律（またはチェーンごとに変えるなど改善の余地あり）
         # 这里ではAtomごとの色を取得して適用
         # 簡易実装では単色などにするが、既存動作に合わせる
-        
+
         return actor
 
     def create_ribbon_display(self, size_factor):
@@ -13019,7 +16673,7 @@ Check console for detailed information."""
             mask = (self.atoms_data['atom_name'] == 'P')
             if not np.any(mask):
                 return None
-            
+
         ca_x = self.atoms_data['x'][mask]
         ca_y = self.atoms_data['y'][mask]
         ca_z = self.atoms_data['z'][mask]
@@ -13027,11 +16681,11 @@ Check console for detailed information."""
         chain_ids = self.atoms_data['chain_id'][mask]
         residue_ids = self.atoms_data['residue_id'][mask]
         b_factors = self.atoms_data['b_factor'][mask]
-        
+
         unique_chains = np.unique(chain_ids)
-        
+
         append_poly = vtk.vtkAppendPolyData()
-        
+
         for chain in unique_chains:
             # チェーン内の原子を抽出
             chain_mask = (chain_ids == chain)
@@ -13041,7 +16695,7 @@ Check console for detailed information."""
             c_res_id = residue_ids[chain_mask]
             c_elements = elements[chain_mask]
             c_b_factors = b_factors[chain_mask]
-            
+
             # 残基ID順にソート
             sort_idx = np.argsort(c_res_id)
             c_x = c_x[sort_idx]
@@ -13050,47 +16704,47 @@ Check console for detailed information."""
             c_res_id_sorted = c_res_id[sort_idx]
             c_elements = c_elements[sort_idx]
             c_b_factors = c_b_factors[sort_idx]
-            
+
             if len(c_x) < 4:  # スプライン補間のため最低4点必要
                 continue
-            
+
             # 各残基の二次構造タイプを取得
             ss_types = []
             for res_id in c_res_id_sorted:
                 key = (chain, res_id)
                 ss_type = self.secondary_structure.get(key, 'C')  # デフォルトはコイル
                 ss_types.append(ss_type)
-            
+
             # Catmull-Romスプラインで滑らかに補間
             num_points = len(c_x)
             subdivisions = 10  # 各セグメント間の分割数
-            
+
             interpolated_points = []
             interpolated_colors = []
             interpolated_ss = []  # 二次構造タイプも補間点に関連付け
-            
+
             for i in range(num_points - 1):
                 # Catmull-Romスプライン用の4点を取得
                 p0_idx = max(0, i - 1)
                 p1_idx = i
                 p2_idx = i + 1
                 p3_idx = min(num_points - 1, i + 2)
-                
+
                 p0 = np.array([c_x[p0_idx], c_y[p0_idx], c_z[p0_idx]])
                 p1 = np.array([c_x[p1_idx], c_y[p1_idx], c_z[p1_idx]])
                 p2 = np.array([c_x[p2_idx], c_y[p2_idx], c_z[p2_idx]])
                 p3 = np.array([c_x[p3_idx], c_y[p3_idx], c_z[p3_idx]])
-                
+
                 # 色（p1とp2の間を補間）
                 color1 = self.get_atom_color(c_elements[p1_idx], chain, c_b_factors[p1_idx])
                 color2 = self.get_atom_color(c_elements[p2_idx], chain, c_b_factors[p2_idx])
-                
+
                 # 二次構造タイプ（p1を使用）
                 ss_type = ss_types[p1_idx]
-                
+
                 for j in range(subdivisions):
                     t = j / subdivisions
-                    
+
                     # Catmull-Romスプライン補間
                     point = 0.5 * (
                         (2 * p1) +
@@ -13098,9 +16752,9 @@ Check console for detailed information."""
                         (2*p0 - 5*p1 + 4*p2 - p3) * t**2 +
                         (-p0 + 3*p1 - 3*p2 + p3) * t**3
                     )
-                    
+
                     interpolated_points.append(point)
-                    
+
                     # 色を線形補間
                     interp_color = tuple(
                         color1[k] * (1 - t) + color2[k] * t
@@ -13108,27 +16762,27 @@ Check console for detailed information."""
                     )
                     interpolated_colors.append(interp_color)
                     interpolated_ss.append(ss_type)
-            
+
             # 最後の点を追加
             interpolated_points.append(np.array([c_x[-1], c_y[-1], c_z[-1]]))
             color_last = self.get_atom_color(c_elements[-1], chain, c_b_factors[-1])
             interpolated_colors.append(color_last)
             interpolated_ss.append(ss_types[-1])
-            
+
             # NumPy配列に変換
             interpolated_points = np.array(interpolated_points)
             n_interp = len(interpolated_points)
-            
+
             if n_interp < 3:
                 continue
-            
+
             # リボンメッシュを構築（二次構造に応じて幅を変える）
             points = vtk.vtkPoints()
             triangles = vtk.vtkCellArray()
             colors = vtk.vtkUnsignedCharArray()
             colors.SetNumberOfComponents(3)
             colors.SetName("Colors")
-            
+
             # 各補間点でリボンの左右の点を生成
             for i in range(n_interp):
                 # 二次構造に応じた幅を決定
@@ -13139,7 +16793,7 @@ Check console for detailed information."""
                     ribbon_width = 0.8 * size_factor
                 else:  # コイル
                     ribbon_width = 0.2 * size_factor
-                
+
                 # 接線ベクトル（進行方向）
                 if i == 0:
                     tangent = interpolated_points[1] - interpolated_points[0]
@@ -13147,20 +16801,20 @@ Check console for detailed information."""
                     tangent = interpolated_points[i] - interpolated_points[i-1]
                 else:
                     tangent = interpolated_points[i+1] - interpolated_points[i-1]
-                
+
                 tangent_norm = np.linalg.norm(tangent)
                 if tangent_norm > 1e-6:
                     tangent = tangent / tangent_norm
                 else:
                     tangent = np.array([1.0, 0.0, 0.0])
-                
+
                 # リボンの幅方向を計算
                 up = np.array([0.0, 0.0, 1.0])
-                
+
                 # 接線がZ軸と平行な場合は別の軸を使用
                 if abs(np.dot(tangent, up)) > 0.99:
                     up = np.array([1.0, 0.0, 0.0])
-                
+
                 # リボンの幅方向
                 width_dir = np.cross(tangent, up)
                 width_norm = np.linalg.norm(width_dir)
@@ -13168,201 +16822,201 @@ Check console for detailed information."""
                     width_dir = width_dir / width_norm
                 else:
                     width_dir = np.array([0.0, 1.0, 0.0])
-                
+
                 # 前の点との一貫性を保つため、必要に応じて方向を反転
                 if i > 0:
                     if np.dot(width_dir, prev_width_dir) < 0:
                         width_dir = -width_dir
-                
+
                 prev_width_dir = width_dir.copy()
-                
+
                 # リボンの左右の点
                 half_width = ribbon_width / 2.0
                 center = interpolated_points[i]
                 left_point = center - width_dir * half_width
                 right_point = center + width_dir * half_width
-                
+
                 # 点を追加
                 points.InsertNextPoint(left_point[0], left_point[1], left_point[2])
                 points.InsertNextPoint(right_point[0], right_point[1], right_point[2])
-                
+
                 # 色を設定
                 color = interpolated_colors[i]
                 color_tuple = (int(color[0]*255), int(color[1]*255), int(color[2]*255))
                 colors.InsertNextTuple3(*color_tuple)
                 colors.InsertNextTuple3(*color_tuple)
-                
+
                 # 三角形メッシュを構築
                 if i > 0:
                     prev_left = (i - 1) * 2
                     prev_right = (i - 1) * 2 + 1
                     curr_left = i * 2
                     curr_right = i * 2 + 1
-                    
+
                     # 三角形1
                     triangle1 = vtk.vtkTriangle()
                     triangle1.GetPointIds().SetId(0, prev_left)
                     triangle1.GetPointIds().SetId(1, curr_left)
                     triangle1.GetPointIds().SetId(2, prev_right)
                     triangles.InsertNextCell(triangle1)
-                    
+
                     # 三角形2
                     triangle2 = vtk.vtkTriangle()
                     triangle2.GetPointIds().SetId(0, curr_left)
                     triangle2.GetPointIds().SetId(1, curr_right)
                     triangle2.GetPointIds().SetId(2, prev_right)
                     triangles.InsertNextCell(triangle2)
-            
+
             # PolyDataを作成
             poly = vtk.vtkPolyData()
             poly.SetPoints(points)
             poly.SetPolys(triangles)
             poly.GetPointData().SetScalars(colors)
-            
+
             append_poly.AddInputData(poly)
-            
+
         append_poly.Update()
-        
+
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(append_poly.GetOutputPort())
         mapper.ScalarVisibilityOn()
         mapper.SetScalarModeToUsePointData()
-        
+
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        
+
         # マテリアル設定
         actor.GetProperty().SetSpecular(0.5)
         actor.GetProperty().SetSpecularPower(40)
         actor.GetProperty().SetAmbient(0.3)
         actor.GetProperty().SetDiffuse(0.7)
-        
+
         return actor
-    
+
     def create_simple_ca_points(self, ca_x, ca_y, ca_z, ca_chains):
         """CAアトムの点表示（フォールバック用）"""
         points = vtk.vtkPoints()
         colors = vtk.vtkUnsignedCharArray()
         colors.SetNumberOfComponents(3)
         colors.SetName("Colors")
-        
+
         for i in range(len(ca_x)):
             points.InsertNextPoint(ca_x[i], ca_y[i], ca_z[i])
-            
+
             # チェーン色
             chain_hash = hash(ca_chains[i]) % len(self.chain_colors)
             color = self.chain_colors[chain_hash]
             colors.InsertNextTuple3(int(color[0]*255), int(color[1]*255), int(color[2]*255))
-        
+
         polydata = vtk.vtkPolyData()
         polydata.SetPoints(points)
         polydata.GetPointData().SetScalars(colors)
-        
+
         # 球体で表示
         sphere = vtk.vtkSphereSource()
         sphere.SetRadius(0.3)
         sphere.SetPhiResolution(12)
         sphere.SetThetaResolution(12)
-        
+
         glyph = vtk.vtkGlyph3D()
         glyph.SetInputData(polydata)
         glyph.SetSourceConnection(sphere.GetOutputPort())
         glyph.SetScaleModeToDataScalingOff()
-        
+
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(glyph.GetOutputPort())
-        
+
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
         actor.GetProperty().SetSpecular(0.4)
         actor.GetProperty().SetSpecularPower(20)
-        
+
         return actor
-        
-    def create_ball_stick_display(self, x, y, z, elements, chain_ids, b_factors, 
+
+    def create_ball_stick_display(self, x, y, z, elements, chain_ids, b_factors,
                                 size_factor, resolution):
         """ボール&スティック表示"""
-        return self.create_sphere_display(x, y, z, elements, chain_ids, b_factors, 
+        return self.create_sphere_display(x, y, z, elements, chain_ids, b_factors,
                                         size_factor * 0.7, resolution)
-        
-    def create_stick_display(self, x, y, z, elements, chain_ids, b_factors, 
+
+    def create_stick_display(self, x, y, z, elements, chain_ids, b_factors,
                            size_factor, resolution):
         """スティック表示"""
-        return self.create_sphere_display(x, y, z, elements, chain_ids, b_factors, 
+        return self.create_sphere_display(x, y, z, elements, chain_ids, b_factors,
                                         size_factor * 0.3, resolution)
-        
-    def create_bonds_display(self, x, y, z, elements, chain_ids, b_factors, 
+
+    def create_bonds_display(self, x, y, z, elements, chain_ids, b_factors,
                            bond_radius, resolution):
         """結合の表示"""
         if self.bonds_actor:
             self.renderer.RemoveActor(self.bonds_actor)
-            
+
         # 簡単な距離ベース結合判定
         points = vtk.vtkPoints()
         lines = vtk.vtkCellArray()
         colors = vtk.vtkUnsignedCharArray()
         colors.SetNumberOfComponents(3)
         colors.SetName("Colors")
-        
+
         # 全ての点を追加
         for i in range(len(x)):
             points.InsertNextPoint(x[i], y[i], z[i])
-        
+
         # 近接原子間で結合を作成（効率化のため制限）
         max_bonds = 10000
         bond_count = 0
-        
+
         for i in range(len(x)):
             if bond_count >= max_bonds:
                 break
-                
+
             for j in range(i + 1, min(i + 20, len(x))):  # 近くの原子のみチェック
                 if bond_count >= max_bonds:
                     break
-                    
+
                 dist = np.sqrt((x[i] - x[j])**2 + (y[i] - y[j])**2 + (z[i] - z[j])**2)
-                
+
                 # 結合距離判定
                 if dist < 0.18:  # 1.8 Å
                     line = vtk.vtkLine()
                     line.GetPointIds().SetId(0, i)
                     line.GetPointIds().SetId(1, j)
                     lines.InsertNextCell(line)
-                    
+
                     # 結合の色（平均色）
                     color1 = self.get_atom_color(elements[i], chain_ids[i], b_factors[i])
                     color2 = self.get_atom_color(elements[j], chain_ids[j], b_factors[j])
                     avg_color = [(color1[k] + color2[k])/2 for k in range(3)]
                     colors.InsertNextTuple3(
-                        int(avg_color[0]*255), 
-                        int(avg_color[1]*255), 
+                        int(avg_color[0]*255),
+                        int(avg_color[1]*255),
                         int(avg_color[2]*255)
                     )
-                    
+
                     bond_count += 1
-        
+
         if bond_count > 0:
             polydata = vtk.vtkPolyData()
             polydata.SetPoints(points)
             polydata.SetLines(lines)
             polydata.GetCellData().SetScalars(colors)
-            
+
             # チューブフィルター
             tube_filter = vtk.vtkTubeFilter()
             tube_filter.SetInputData(polydata)
             tube_filter.SetRadius(bond_radius)
             tube_filter.SetNumberOfSides(max(4, resolution // 2))
-            
+
             mapper = vtk.vtkPolyDataMapper()
             mapper.SetInputConnection(tube_filter.GetOutputPort())
-            
+
             self.bonds_actor = vtk.vtkActor()
             self.bonds_actor.SetMapper(mapper)
             self.bonds_actor.GetProperty().SetSpecular(0.3)
             self.bonds_actor.GetProperty().SetSpecularPower(20)
-            
+
             self.renderer.AddActor(self.bonds_actor)
-        
+
     def _get_tip_position_nm(self):
         """Return current tip position in pyNuD/simulation coordinates (nm)."""
         x = self.tip_x_slider.value() / 5.0 if hasattr(self, 'tip_x_slider') else 0.0
@@ -13605,15 +17259,15 @@ Check console for detailed information."""
             return
         if self.tip_actor:
             self.renderer.RemoveActor(self.tip_actor)
-            
+
         tip_shape = self.tip_shape_combo.currentText().lower()
         radius = self.tip_radius_spin.value()
         angle = self.tip_angle_spin.value()
         # ★★★ 追加: 新しいUIからminitipの半径を取得 ★★★
         minitip_radius = self.minitip_radius_spin.value()
-        
+
         #print(f"Creating tip: {tip_shape}, radius={radius}nm, angle={angle}°, minitip_radius={minitip_radius}nm")
-        
+
         if tip_shape == "cone":
             self.tip_actor = self.create_cone_tip(radius, angle)
         elif tip_shape == "sphere":
@@ -13621,7 +17275,7 @@ Check console for detailed information."""
             self.tip_actor = self.create_sphere_tip(radius, angle, minitip_radius)
         else:  # paraboloid
             self.tip_actor = self.create_paraboloid_tip(radius)
-        
+
         if self.tip_actor:
             self.update_tip_position()
             self.renderer.AddActor(self.tip_actor)
@@ -13645,7 +17299,7 @@ Check console for detailed information."""
         if half_angle < 1.0: half_angle = 1.0
         if half_angle >= 89.0: half_angle = 89.0
         half_angle_rad = np.radians(float(half_angle))
-        
+
         # 形状が球から円錐に切り替わる臨界半径
         r_crit = tip_radius * np.cos(half_angle_rad)
         # 円錐部分が滑らかに接続するためのZオフセット
@@ -13653,24 +17307,24 @@ Check console for detailed information."""
 
         # --- 点群グリッドの生成 ---
         resolution = 101  # グリッドの解像度 (奇数にすると中心点ができます)
-        
+
         # ★★★ 変更点1: コーンを長くするため、高さを大きく設定 ★★★
         max_height = tip_radius * 50.0  # 以前は 25.0 でした
-        
+
         max_radius = (max_height + z_offset) * np.tan(half_angle_rad)
-        
+
         points = vtk.vtkPoints()
-        
+
         # グリッド上の各点の3D座標を計算
         for i in range(resolution):
             for j in range(resolution):
                 # グリッド座標(i, j)を物理座標(x, y)に変換
                 x = (j - (resolution - 1) / 2.0) * (2 * max_radius / (resolution - 1))
                 y = (i - (resolution - 1) / 2.0) * (2 * max_radius / (resolution - 1))
-                
+
                 # 中心からの距離rを計算
                 r = np.sqrt(x**2 + y**2)
-                
+
                 # Igorの数式を使ってz座標(高さ)を計算
                 if r <= r_crit:
                     # 球状部分の計算式
@@ -13679,14 +17333,14 @@ Check console for detailed information."""
                 else:
                     # 円錐状部分の計算式
                     z = (r / np.tan(half_angle_rad)) - z_offset
-                
+
                 # ★★★ 変更点2: 先端が-Z方向を向くように、Z座標を反転 ★★★
                 points.InsertNextPoint(x, y, z)
 
         # --- 点群からサーフェスメッシュを生成 ---
         polydata = vtk.vtkPolyData()
         polydata.SetPoints(points)
-        
+
         # Delaunay2Dアルゴリズムで点群から三角形メッシュを生成
         delaunay = vtk.vtkDelaunay2D()
         delaunay.SetInputData(polydata)
@@ -13694,12 +17348,12 @@ Check console for detailed information."""
 
         # --- ★★★ 変更点3: Z反転を直接行ったため、後処理が不要に ★★★
         # 以前のtransformやnormalsの処理は不要になり、コードがシンプルになりました。
-        
+
         # --- アクターの作成 ---
         mapper = vtk.vtkPolyDataMapper()
         # Delaunayの結果を直接マッパーに接続します
         mapper.SetInputConnection(delaunay.GetOutputPort())
-        
+
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
 
@@ -13708,12 +17362,12 @@ Check console for detailed information."""
         actor.GetProperty().SetSpecular(0.9)         # 高い鏡面反射で金属感を強調
         actor.GetProperty().SetSpecularPower(100)    # 光沢を強くする
         actor.GetProperty().SetDiffuse(0.6)          # 拡散反射
-        actor.GetProperty().SetAmbient(0.3)    
+        actor.GetProperty().SetAmbient(0.3)
 
         #print(f"SUCCESS: Flipped and elongated cone tip created: radius={tip_radius:.1f}nm, angle={half_angle}°")
-        
+
         return actor
-    
+
     # +++ この関数で既存のcreate_sphere_tipを置き換えてください +++
     # +++ この関数で既存のcreate_sphere_tipを置き換えてください +++
     def create_sphere_tip(self, tip_radius, half_angle, minitip_radius):
@@ -13726,15 +17380,15 @@ Check console for detailed information."""
         # --- 部品1: 先端に突き出る球を作成 ---
         # ★★★ 変更点: 引数で渡されたminitip_radiusを使用 ★★★
         sphere_radius = minitip_radius
-        
+
         sphere_source = vtk.vtkSphereSource()
         sphere_source.SetRadius(sphere_radius)
         sphere_source.SetPhiResolution(50)
         sphere_source.SetThetaResolution(50)
-        
+
         sphere_transform = vtk.vtkTransform()
         sphere_transform.Translate(0, 0, sphere_radius)
-        
+
         sphere_filter = vtk.vtkTransformPolyDataFilter()
         sphere_filter.SetInputConnection(sphere_source.GetOutputPort())
         sphere_filter.SetTransform(sphere_transform)
@@ -13744,35 +17398,35 @@ Check console for detailed information."""
         if half_angle < 1.0: half_angle = 1.0
         if half_angle >= 89.0: half_angle = 89.0
         half_angle_rad = np.radians(float(half_angle))
-        
+
         r_crit_cone = tip_radius * np.cos(half_angle_rad)
         z_offset_cone = (tip_radius / np.sin(half_angle_rad)) - tip_radius
-        
+
         resolution = 101
         max_height_cone = tip_radius * 50.0
         max_radius_cone = (max_height_cone + z_offset_cone) * np.tan(half_angle_rad)
-        
+
         cone_points = vtk.vtkPoints()
         for i in range(resolution):
             for j in range(resolution):
                 x = (j - (resolution - 1) / 2.0) * (2 * max_radius_cone / (resolution - 1))
                 y = (i - (resolution - 1) / 2.0) * (2 * max_radius_cone / (resolution - 1))
                 r = np.sqrt(x**2 + y**2)
-                
+
                 if r <= r_crit_cone:
                     z = tip_radius - np.sqrt(max(0, tip_radius**2 - r**2))
                 else:
                     z = (r / np.tan(half_angle_rad)) - z_offset_cone
                 cone_points.InsertNextPoint(x, y, z)
-        
+
         cone_polydata = vtk.vtkPolyData()
         cone_polydata.SetPoints(cone_points)
         cone_delaunay = vtk.vtkDelaunay2D()
         cone_delaunay.SetInputData(cone_polydata)
-        
+
         cone_transform = vtk.vtkTransform()
         cone_transform.Translate(0, 0, 2 * sphere_radius)
-        
+
         cone_filter = vtk.vtkTransformPolyDataFilter()
         cone_filter.SetInputConnection(cone_delaunay.GetOutputPort())
         cone_filter.SetTransform(cone_transform)
@@ -13800,7 +17454,7 @@ Check console for detailed information."""
 
         print(f"SUCCESS: Composite 'Sphere' created. Cone R={tip_radius:.1f}, Minitip R={minitip_radius:.1f}")
         return actor
-    
+
     def create_paraboloid_tip(self, tip_radius):
         """
         Igor Proの数式に基づき、先端が下(-Z)を向く放物面探針を生成します。
@@ -13810,18 +17464,18 @@ Check console for detailed information."""
 
         # --- グリッドと点群の準備 ---
         resolution = 101
-        display_height = 20.0 
+        display_height = 20.0
         max_radius = np.sqrt(2 * tip_radius * display_height)
         points = vtk.vtkPoints()
-        
+
         for i in range(resolution):
             for j in range(resolution):
                 x = (j - (resolution - 1) / 2.0) * (2 * max_radius / (resolution - 1))
                 y = (i - (resolution - 1) / 2.0) * (2 * max_radius / (resolution - 1))
-                
+
                 # Igorの数式 z = (x^2 + y^2) / (2 * R)
                 z = (x**2 + y**2) / (2 * tip_radius)
-                
+
                 # ★★★ 修正点: 先端が下(-Z)を向くようにZ座標を反転 ★★★
                 points.InsertNextPoint(x, y, z)
 
@@ -13848,8 +17502,8 @@ Check console for detailed information."""
 
         print(f"SUCCESS: Paraboloid tip created (pointing down): R={tip_radius:.1f}nm")
         return actor
-    
-        
+
+
     def update_display(self):
         """表示の更新"""
         if self.atoms_data is not None:
@@ -13857,18 +17511,17 @@ Check console for detailed information."""
             #print(f"Updating display with color scheme: {current_scheme}")
             ##if current_scheme == "Single Color":
                 #print(f"Single color value: {self.current_single_color}")
-            
+
             self.display_molecule()
-            
-            # レンダリングを強制実行
             self.request_render()
-    
+        self._queue_impose_overlay_refresh(0)
+
     def update_tip_info(self):
         """探針情報の更新"""
         shape = self.tip_shape_combo.currentText()
         radius = self.tip_radius_spin.value()
         angle = self.tip_angle_spin.value()
-        
+
         if shape == "Cone":
             height = radius * 3
             base_radius = radius + height * np.tan(np.radians(angle))
@@ -13877,15 +17530,15 @@ Check console for detailed information."""
             info = f"Sphere: {radius}nm radius"
         else:
             info = f"Paraboloid: {radius}nm radius\nAngle: {angle}°"
-        
+
         self.tip_info_label.setText(info)
-            
+
     def update_tip(self):
         """探針の更新（パラメーター変更時）"""
         #print("Tip parameters changed - updating display...")
         self.create_tip()
         self.update_tip_info()  # 追加
-        
+
         # AFMパラメーターも更新
         self.afm_params.update({
             'tip_radius': self.tip_radius_spin.value(),
@@ -13895,7 +17548,7 @@ Check console for detailed information."""
 
         # スレッドの安全性をチェックしてからシミュレーションを実行
         self.trigger_interactive_simulation()
-    
+
     def trigger_interactive_simulation(self):
         """インタラクティブモードがONの場合にシミュレーションを実行する汎用トリガー"""
         if getattr(self, '_pose_estimation_running', False):
@@ -13906,30 +17559,30 @@ Check console for detailed information."""
         # スライダー操作中は実行しない
         if hasattr(self, 'tip_slider_pressed') and self.tip_slider_pressed:
             return
-        
+
         # 既にシミュレーションが実行中の場合は実行しない
         if self.is_worker_running(getattr(self, 'sim_worker_silent', None), attr_name='sim_worker_silent'):
             return
-            
+
         if self.interactive_update_check.isChecked():
             # ★★★ 通常のInteractive Updateでも軽量版を使用 ★★★
             self.run_simulation_silent()
-        
+
     def on_tip_slider_pressed(self):
         """Tip positionスライダーが押された時の処理"""
         # スライダー操作中のフラグを設定
         self.tip_slider_pressed = True
-        
+
     def on_tip_slider_released(self):
         """Tip positionスライダーが離された時の処理"""
         # スライダー操作完了のフラグを設定
         self.tip_slider_pressed = False
-        
+
         # スライダー操作完了後にシミュレーションを実行（Interactive UpdateがONの場合のみ）
         if self.interactive_update_check.isChecked():
             # 遅延実行でシミュレーションをトリガー
             QTimer.singleShot(100, self.trigger_interactive_simulation)
-    
+
     # Scan Size関連のイベントハンドラー
     def scan_size_value_changed(self, value):
         """Scan Size値変更時の処理（マウス/ボタン操作時は即時更新）"""
@@ -13941,12 +17594,12 @@ Check console for detailed information."""
             self.scan_size_debounce_timer.setSingleShot(True)
             self.scan_size_debounce_timer.timeout.connect(self.trigger_interactive_simulation)
             self.scan_size_debounce_timer.start(100)  # 100ms後に実行
-    
+
     def scan_size_editing_finished(self):
         """Scan Size編集完了時の処理（キー入力時はリターンで更新）"""
         self.scan_size_keyboard_input = False
         self.trigger_interactive_simulation()
-    
+
     # Tip Radius関連のイベントハンドラー
     def tip_radius_value_changed(self, value):
         """Tip Radius値変更時の処理（マウス/ボタン操作時は即時更新）"""
@@ -13958,12 +17611,12 @@ Check console for detailed information."""
             self.tip_radius_debounce_timer.setSingleShot(True)
             self.tip_radius_debounce_timer.timeout.connect(self.update_tip)
             self.tip_radius_debounce_timer.start(100)
-    
+
     def tip_radius_editing_finished(self):
         """Tip Radius編集完了時の処理（キー入力時はリターンで更新）"""
         self.tip_radius_keyboard_input = False
         self.update_tip()
-    
+
     # Minitip Radius関連のイベントハンドラー
     def minitip_radius_value_changed(self, value):
         """Minitip Radius値変更時の処理（マウス/ボタン操作時は即時更新）"""
@@ -13975,12 +17628,12 @@ Check console for detailed information."""
             self.minitip_radius_debounce_timer.setSingleShot(True)
             self.minitip_radius_debounce_timer.timeout.connect(self.update_tip)
             self.minitip_radius_debounce_timer.start(100)
-    
+
     def minitip_radius_editing_finished(self):
         """Minitip Radius編集完了時の処理（キー入力時はリターンで更新）"""
         self.minitip_radius_keyboard_input = False
         self.update_tip()
-    
+
     # Tip Angle関連のイベントハンドラー
     def tip_angle_value_changed(self, value):
         """Tip Angle値変更時の処理（マウス/ボタン操作時は即時更新）"""
@@ -13992,61 +17645,61 @@ Check console for detailed information."""
             self.tip_angle_debounce_timer.setSingleShot(True)
             self.tip_angle_debounce_timer.timeout.connect(self.update_tip)
             self.tip_angle_debounce_timer.start(100)
-    
+
     def tip_angle_editing_finished(self):
         """Tip Angle編集完了時の処理（キー入力時はリターンで更新）"""
         self.tip_angle_keyboard_input = False
         self.update_tip()
-    
+
     # キープレスイベントハンドラー
     def scan_size_key_press_event(self, widget, event):
         """Scan Sizeキー入力時の処理"""
         # 数字キーや編集キーが押された場合はキーボード入力フラグを設定
-        if event.key() in [Qt.Key_0, Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4, 
+        if event.key() in [Qt.Key_0, Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4,
                           Qt.Key_5, Qt.Key_6, Qt.Key_7, Qt.Key_8, Qt.Key_9,
                           Qt.Key_Backspace, Qt.Key_Delete, Qt.Key_Left, Qt.Key_Right]:
             self.scan_size_keyboard_input = True
         QDoubleSpinBox.keyPressEvent(widget, event)
-    
+
     def tip_radius_key_press_event(self, event):
         """Tip Radiusキー入力時の処理"""
-        if event.key() in [Qt.Key_0, Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4, 
+        if event.key() in [Qt.Key_0, Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4,
                           Qt.Key_5, Qt.Key_6, Qt.Key_7, Qt.Key_8, Qt.Key_9,
                           Qt.Key_Backspace, Qt.Key_Delete, Qt.Key_Left, Qt.Key_Right]:
             self.tip_radius_keyboard_input = True
         QDoubleSpinBox.keyPressEvent(self.tip_radius_spin, event)
-    
+
     def minitip_radius_key_press_event(self, event):
         """Minitip Radiusキー入力時の処理"""
-        if event.key() in [Qt.Key_0, Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4, 
+        if event.key() in [Qt.Key_0, Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4,
                           Qt.Key_5, Qt.Key_6, Qt.Key_7, Qt.Key_8, Qt.Key_9,
                           Qt.Key_Backspace, Qt.Key_Delete, Qt.Key_Left, Qt.Key_Right]:
             self.minitip_radius_keyboard_input = True
         QDoubleSpinBox.keyPressEvent(self.minitip_radius_spin, event)
-    
+
     def tip_angle_key_press_event(self, event):
         """Tip Angleキー入力時の処理"""
-        if event.key() in [Qt.Key_0, Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4, 
+        if event.key() in [Qt.Key_0, Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4,
                           Qt.Key_5, Qt.Key_6, Qt.Key_7, Qt.Key_8, Qt.Key_9,
                           Qt.Key_Backspace, Qt.Key_Delete, Qt.Key_Left, Qt.Key_Right]:
             self.tip_angle_keyboard_input = True
         QDoubleSpinBox.keyPressEvent(self.tip_angle_spin, event)
-    
+
     def update_tip_position(self):
         """探針位置の更新（適切な範囲）"""
         # スライダー値をnm単位に変換（範囲を調整）
         x, y, z = self._get_tip_position_nm()
-        
+
         if getattr(self, 'tip_actor', None):
             self.tip_actor.SetPosition(x, y, z)
-        
+
         if hasattr(self, 'tip_x_label'):
             self.tip_x_label.setText(f"{x:.1f}")
         if hasattr(self, 'tip_y_label'):
             self.tip_y_label.setText(f"{y:.1f}")
         if hasattr(self, 'tip_z_label'):
             self.tip_z_label.setText(f"{z:.1f}")
-        
+
         # AFMパラメーターも更新
         self.afm_params.update({
             'tip_x': x,
@@ -14055,13 +17708,13 @@ Check console for detailed information."""
         })
         if self._is_pymol_active():
             self._display_pymol_tip_overlay()
-        
+
         self.request_render()
-        
+
         # スライダー操作中はシミュレーションを実行しない
         if hasattr(self, 'tip_slider_pressed') and self.tip_slider_pressed:
             return
-        
+
     def toggle_molecule_visibility(self, visible):
         """分子表示の切り替え"""
         if self._is_pymol_active():
@@ -14078,7 +17731,7 @@ Check console for detailed information."""
         if self.sample_actor:
             self.sample_actor.SetVisibility(visible)
             self.vtk_widget.GetRenderWindow().Render()
-            
+
     def _update_tip_visual_state(self, visible=None):
         """Apply tip visibility and opacity based on checkbox and current view."""
         if self._is_pymol_active():
@@ -14117,7 +17770,7 @@ Check console for detailed information."""
         if self._is_pymol_active():
             self._display_pymol_tip_overlay()
         self._update_tip_visual_state(visible)
-            
+
     def toggle_bonds_visibility(self, visible):
         """結合表示の切り替え"""
         if self._is_pymol_only():
@@ -14125,6 +17778,7 @@ Check console for detailed information."""
         if self.bonds_actor:
             self.bonds_actor.SetVisibility(visible)
             self.vtk_widget.GetRenderWindow().Render()
+        self._queue_impose_overlay_refresh(0)
 
     def get_rotated_atom_coords(self):
         """Applies the current rotation transform to the base atom coordinates."""
@@ -14144,7 +17798,7 @@ Check console for detailed information."""
         try:
             # Get the 4x4 transformation matrix from the combined_transform (base + local)
             vtk_matrix = self.combined_transform.GetMatrix()
-            
+
             # 変換行列の値を安全に取得
             transform_matrix = np.zeros((4, 4))
             for i in range(4):
@@ -14155,46 +17809,73 @@ Check console for detailed information."""
                         print(f"[WARNING] Invalid transform matrix element [{i},{j}]: {element}")
                         return np.column_stack([x, y, z])
                     transform_matrix[i, j] = element
-            
+
             # 変換行列の妥当性をチェック（単位行列に近いかどうか）
             identity = np.eye(4)
             if np.allclose(transform_matrix, identity, atol=1e-6):
                 # 変換がない場合は元の座標を返す
                 return np.column_stack([x, y, z])
-            
+
             # 座標を同次座標に変換
             original_coords = np.vstack([x, y, z, np.ones(num_atoms)])
-            
+
             # 変換を適用
             with np.errstate(all='ignore'):  # 警告を無視
                 rotated_coords_homogeneous = transform_matrix @ original_coords
-            
+
             # NaNやInfをチェック
             if not np.all(np.isfinite(rotated_coords_homogeneous)):
                 print("[WARNING] Non-finite values in rotation calculation, using original coordinates")
                 return np.column_stack([x, y, z])
-            
+
             # 3D座標に変換
             rotated_coords = rotated_coords_homogeneous[:3, :].T
-            
+
             # 結果の妥当性をチェック
             if not np.all(np.isfinite(rotated_coords)):
                 print("[WARNING] Non-finite values in rotated coordinates, using original coordinates")
                 return np.column_stack([x, y, z])
-            
+
             # 座標が異常に大きくなっていないかチェック
             max_coord = np.max(np.abs(rotated_coords))
             if max_coord > 1e6:
                 print(f"[WARNING] Rotated coordinates too large (max: {max_coord}), using original coordinates")
                 return np.column_stack([x, y, z])
-            
+
             return rotated_coords
-            
+
         except Exception as e:
             print(f"[WARNING] Error in rotation calculation: {e}, using original coordinates")
             return np.column_stack([x, y, z])
-        
-    
+
+    def _apply_current_rotation_to_coords(self, coords):
+        """Apply the current Estimate Pose/display rotation matrix to arbitrary coords."""
+        arr = np.asarray(coords, dtype=float)
+        if arr.ndim != 2 or arr.shape[1] != 3:
+            return None
+        if not hasattr(self, 'combined_transform') or self.combined_transform is None:
+            return np.array(arr, copy=True)
+        try:
+            vtk_matrix = self.combined_transform.GetMatrix()
+            transform_matrix = np.zeros((4, 4), dtype=float)
+            for i in range(4):
+                for j in range(4):
+                    element = float(vtk_matrix.GetElement(i, j))
+                    if not np.isfinite(element) or abs(element) > 1e6:
+                        return np.array(arr, copy=True)
+                    transform_matrix[i, j] = element
+            if np.allclose(transform_matrix, np.eye(4), atol=1e-6):
+                return np.array(arr, copy=True)
+            hom = np.vstack([arr[:, 0], arr[:, 1], arr[:, 2], np.ones(arr.shape[0])])
+            rotated_hom = transform_matrix @ hom
+            rotated = rotated_hom[:3, :].T
+            if not np.all(np.isfinite(rotated)):
+                return np.array(arr, copy=True)
+            return rotated
+        except Exception:
+            return np.array(arr, copy=True)
+
+
     def _connect_worker_delete_later(self, worker):
         """ワーカー終了時にdeleteLaterで安全に破棄する（重複接続は避ける）"""
         if worker is None:
@@ -14379,7 +18060,7 @@ Check console for detailed information."""
             if not stopped:
                 print("[INFO] sim_worker still running; skipping new simulation start.")
                 return
-        
+
         self.sim_worker = AFMSimulationWorker(
             self, sim_params, tasks,
             self.atoms_data['element'] if sim_params['use_vdw'] and self.atoms_data is not None else None,
@@ -14405,7 +18086,7 @@ Check console for detailed information."""
             print("Cancel request sent.")
             self.status_label.setText("Cancelling...")
             self.sim_worker.cancel()
-    
+
     def show_afm_result(self, z_map):
         import matplotlib.pyplot as plt
         from matplotlib.colors import Normalize
@@ -14415,14 +18096,14 @@ Check console for detailed information."""
             return
 
         fig, ax = plt.subplots(figsize=(6, 5))
-        im = ax.imshow(z_map, cmap='viridis', origin='lower', 
+        im = ax.imshow(z_map, cmap='viridis', origin='lower',
                     interpolation='nearest',
                     extent=[-0.5, 0.5, -0.5, 0.5])  # 正規化不要なら適宜修正
         ax.set_title("Simulated AFM Topography")
         plt.colorbar(im, ax=ax, label="Height [nm]")
         plt.tight_layout()
         plt.show()
-        
+
     def _simulation_worker(self):
         """シミュレーションワーカー（デバッグ用レガシーコード）"""
         # UIからパラメータを取得
@@ -14430,11 +18111,11 @@ Check console for detailed information."""
         scan_y = self.spinScanYNm.value()
         nx = self.spinNx.value()
         ny = self.spinNy.value()
-        
+
         # スキャン範囲を計算
         x_coords = np.linspace(-scan_x/2.0, scan_x/2.0, nx)
         y_coords = np.linspace(-scan_y/2.0, scan_y/2.0, ny)
-        
+
         height_map = np.zeros((ny, nx))
 
         # 衝突判定用の原子データを準備
@@ -14446,7 +18127,7 @@ Check console for detailed information."""
 
         total_steps = resolution * resolution
         current_step = 0
-        
+
         # ★追加: 分子の統計情報を表示
         mol_center_x = np.mean(atom_x)
         mol_center_y = np.mean(atom_y)
@@ -14454,7 +18135,7 @@ Check console for detailed information."""
         mol_size_x = np.max(atom_x) - np.min(atom_x)
         mol_size_y = np.max(atom_y) - np.min(atom_y)
         mol_size_z = np.max(atom_z) - np.min(atom_z)
-        
+
         print(f"=== AFM Simulation Started (FIXED v2) ===")
         print(f"Scan size: {scan_size}nm, Resolution: {resolution}x{resolution}")
         print(f"Total atoms: {len(atom_x)}")
@@ -14476,7 +18157,7 @@ Check console for detailed information."""
                 # 衝突高さ計算
                 z_height = self.find_collision_height(x, y, atom_x, atom_y, atom_z, atom_radii)
                 height_map[iy, ix] = z_height
-                
+
                 # ★改良: より多様な位置でデバッグ出力
                 if debug_count < 10:  # 最初の10点
                     print(f"Point ({x:6.2f}, {y:6.2f}) -> Z={z_height:8.3f}nm")
@@ -14492,13 +18173,13 @@ Check console for detailed information."""
 
         # ★追加: 詳細な統計情報
         valid_heights = height_map[height_map > mol_center_z - 10]  # 明らかに低すぎる値を除外
-        
+
         print(f"=== Simulation Completed ===")
         print(f"Height range: {np.min(height_map):.3f} to {np.max(height_map):.3f}nm")
         print(f"Valid heights: {np.min(valid_heights):.3f} to {np.max(valid_heights):.3f}nm")
         print(f"Mean height: {np.mean(valid_heights):.3f}nm")
         print(f"Height std: {np.std(valid_heights):.3f}nm")
-        
+
         # 完了シグナルを送信
         self.simulation_done.emit(height_map)
 
@@ -14507,29 +18188,29 @@ Check console for detailed information."""
         if self.atoms_data is None:
             print("No molecule loaded")
             return
-        
+
         # 現在の探針位置を取得
         tip_x = self.afm_params['tip_x']
-        tip_y = self.afm_params['tip_y'] 
+        tip_y = self.afm_params['tip_y']
         tip_z = self.afm_params['tip_z']
-        
+
         # 分子の統計
         mol_x_range = (np.min(self.atoms_data['x']), np.max(self.atoms_data['x']))
         mol_y_range = (np.min(self.atoms_data['y']), np.max(self.atoms_data['y']))
         mol_z_range = (np.min(self.atoms_data['z']), np.max(self.atoms_data['z']))
-        
+
         print(f"\n=== Position Check ===")
         print(f"Tip position: ({tip_x:.2f}, {tip_y:.2f}, {tip_z:.2f})nm")
         print(f"Molecule X range: {mol_x_range[0]:.2f} to {mol_x_range[1]:.2f}nm")
-        print(f"Molecule Y range: {mol_y_range[0]:.2f} to {mol_y_range[1]:.2f}nm") 
+        print(f"Molecule Y range: {mol_y_range[0]:.2f} to {mol_y_range[1]:.2f}nm")
         print(f"Molecule Z range: {mol_z_range[0]:.2f} to {mol_z_range[1]:.2f}nm")
-        
+
         # 探針が分子の上にあるかチェック
-        tip_over_molecule = (mol_x_range[0] <= tip_x <= mol_x_range[1] and 
+        tip_over_molecule = (mol_x_range[0] <= tip_x <= mol_x_range[1] and
                             mol_y_range[0] <= tip_y <= mol_y_range[1])
-        
+
         print(f"Tip over molecule: {tip_over_molecule}")
-        
+
         if tip_z <= mol_z_range[1]:
             print(f"WARNING: Tip Z position ({tip_z:.2f}) is too low! Molecule top is at {mol_z_range[1]:.2f}nm")
 
@@ -14540,16 +18221,16 @@ Check console for detailed information."""
         tip_pixel_radius = int(np.ceil(R * 3 / pixel_size))
         size = 2 * tip_pixel_radius + 1
         footprint = np.zeros((size, size))
-        
+
         center = tip_pixel_radius
         alpha = np.radians(alpha_deg)
         ca, sa = np.cos(alpha), np.sin(alpha)
-        
+
         for iy in range(size):
             for ix in range(size):
                 # ピクセル中心からの物理的な距離
                 r_2d = np.sqrt(((ix - center) * pixel_size)**2 + ((iy - center) * pixel_size)**2)
-                
+
                 # 探針の高さを計算 (反転させた形状)
                 r_crit = R * ca
                 if r_2d <= r_crit:
@@ -14558,21 +18239,21 @@ Check console for detailed information."""
                     z = (r_2d * sa + R * (1 - ca)) / ca # 修正された円錐式
 
                 footprint[iy, ix] = -z # Dilationでは反転した探針を使う
-        
+
         return footprint
-    
+
     def on_task_finished(self, z_map, target_panel):
         """個別の計算タスクが完了した際に呼び出されるスロット"""
         if z_map is not None and target_panel is not None:
             image_key = target_panel.objectName()
-            
+
             # ★★★ 修正箇所: 生データを保存し、表示更新関数を呼び出す ★★★
             # 1. フィルターをかける前の「生」データを保存
             self.raw_simulation_results[image_key] = z_map
-            
+
             # 2. フィルター適用と表示更新を行う関数を呼び出す
             self.process_and_display_single_image(image_key)
-    
+
     def process_and_display_single_image(self, image_key):
         """指定されたキーの画像を処理して表示する"""
         if image_key not in self.raw_simulation_results:
@@ -14580,10 +18261,10 @@ Check console for detailed information."""
 
         raw_data = self.raw_simulation_results[image_key]
         ny, nx = raw_data.shape
-        
+
         scan_x = self.spinScanXNm.value()
         scan_y = self.spinScanYNm.value()
-        
+
         # フィルターが有効かチェック
         if self.apply_filter_check.isChecked():
             cutoff_wl = self.filter_cutoff_spin.value()
@@ -14602,7 +18283,7 @@ Check console for detailed information."""
 
         # 表示用と保存用のデータを更新
         self.simulation_results[image_key] = processed_data
-        
+
         # 対応するパネルを見つけて表示を更新
         target_panel = self.findChild(QFrame, image_key)
         if target_panel:
@@ -14615,7 +18296,7 @@ Check console for detailed information."""
             if aligned_panel is not None:
                 self.display_afm_image(processed_data, aligned_panel)
 
-    
+
     def process_and_display_all_images(self):
         """現在表示されている全ての画像を再処理・再表示する"""
         #print("Filter settings changed, updating all views...")
@@ -14626,12 +18307,12 @@ Check console for detailed information."""
         """フィルターのカットオフ値変更時にタイマーで更新を遅延させる"""
         if not self.apply_filter_check.isChecked():
             return # フィルターがOFFの時は何もしない
-            
+
         if not hasattr(self, 'filter_update_timer'):
             self.filter_update_timer = QTimer(self)  # 親ウィンドウを設定
             self.filter_update_timer.setSingleShot(True)
             self.filter_update_timer.timeout.connect(self.process_and_display_all_images)
-        
+
         self.filter_update_timer.start(500) # 500ミリ秒後に更新
 
     def on_simulation_finished(self, result):
@@ -14660,31 +18341,38 @@ Check console for detailed information."""
             #print("Simulation finished, but no results were generated (or it was cancelled).")
             pass
 
-        
 
 
-    
+
+
+    def _height_map_to_rgb(self, height_map):
+        """Convert a height map to an (H, W, 3) uint8 RGB array using the main display method.
+
+        This is the single source of truth for how simulated AFM height maps are
+        colored on screen. The imposed-model overlay reuses it so it always matches
+        the main display method (e.g. if the colormap changes, the overlay follows).
+        """
+        import matplotlib.cm as cm
+        valid_pixels = height_map[height_map > -1e8]
+        if valid_pixels.size < 2:
+            return np.zeros((height_map.shape[0], height_map.shape[1], 3), dtype=np.uint8)
+        min_h, max_h = np.min(valid_pixels), np.max(valid_pixels)
+        if max_h <= min_h:
+            return np.full((height_map.shape[0], height_map.shape[1], 3), 128, dtype=np.uint8)
+        clipped_map = np.clip(height_map, min_h, max_h)
+        norm_map = (clipped_map - min_h) / (max_h - min_h)
+        return (cm.gray(norm_map)[:, :, :3] * 255).astype(np.uint8)
+
     def display_afm_image(self, height_map, target_panel):
         """
         計算された高さマップをグレイスケールでUIに表示します。
         """
         if target_panel is None or height_map is None: return
-        
-        import matplotlib.cm as cm
+
         from PyQt5.QtGui import QImage, QPixmap
-        
-        # --- 正規化処理 ---
-        valid_pixels = height_map[height_map > -1e8]
-        if valid_pixels.size < 2:
-            image_data = np.zeros((height_map.shape[0], height_map.shape[1], 3), dtype=np.uint8)
-        else:
-            min_h, max_h = np.min(valid_pixels), np.max(valid_pixels)
-            if max_h <= min_h:
-                image_data = np.full((height_map.shape[0], height_map.shape[1], 3), 128, dtype=np.uint8)
-            else:
-                clipped_map = np.clip(height_map, min_h, max_h)
-                norm_map = (clipped_map - min_h) / (max_h - min_h)
-                image_data = (cm.gray(norm_map)[:, :, :3] * 255).astype(np.uint8)
+
+        # --- 正規化処理（メイン表示方式: _height_map_to_rgb に集約）---
+        image_data = self._height_map_to_rgb(height_map)
 
         # ★★★ ここからが修正箇所 ★★★
         # 3Dビューの上下方向 (Y軸が上) と2D画像の表示 (Y軸が下) を合わせるため、
@@ -14771,7 +18459,11 @@ Check console for detailed information."""
             except Exception:
                 pass
 
-   
+        if panel_name == "REAL_AFM_Frame":
+            try:
+                self._update_model_overlay(force=True)
+            except Exception:
+                pass
 
     def find_collision_height(self, x, y, atom_x, atom_y, atom_z, atom_radii):
         """VTKで作成されたtip_actorと分子との衝突Z高さを返す"""
@@ -14825,7 +18517,7 @@ Check console for detailed information."""
         for i in range(len(atom_x)):
             atom_pos = (atom_x[i], atom_y[i], atom_z[i])
             tip_apex = (tip_x, tip_y, tip_z)
-            
+
             # 探針表面から原子中心までの距離を計算
             if tip_shape == "cone":
                 dist_surface = self.dist_point_to_cone_tip(
@@ -14836,11 +18528,11 @@ Check console for detailed information."""
             else:  # Paraboloid
                 dist_surface = self.dist_point_to_paraboloid_tip(
                     atom_pos, tip_apex, tip_radius)
-            
+
             # 衝突判定：探針表面から原子中心までの距離が原子半径以下なら衝突
             if dist_surface <= atom_radii[i]:
                 return True
-                
+
         return False
 
     def dist_point_to_cone_tip(self, p, tip_apex, R, alpha_deg):
@@ -14848,21 +18540,21 @@ Check console for detailed information."""
         alpha = np.radians(alpha_deg)
         px, py, pz = p
         tx, ty, tz = tip_apex
-        
+
         # 探針の先端（apex）を原点とした相対座標
         dx, dy, dz = px - tx, py - ty, pz - tz
         r_2d = np.sqrt(dx**2 + dy**2)
-        
+
         # 修正1: 円錐の幾何学を正確に計算
         cos_alpha = np.cos(alpha)
         sin_alpha = np.sin(alpha)
-        
+
         # 球状先端部分の中心位置を修正
         sphere_center_z = R  # 球の中心は先端からR上方
-        
+
         # 球との境界半径を正確に計算
         r_crit = R * sin_alpha  # 球と円錐の接続部の半径
-        
+
         # 修正2: 距離計算を改善
         if r_2d <= r_crit and dz <= sphere_center_z:
             # 球状部分との距離
@@ -14873,15 +18565,15 @@ Check console for detailed information."""
             # 円錐の母線方向の単位ベクトル：(sin_alpha, 0, cos_alpha)
             # 点から円錐軸（Z軸）への垂直距離：r_2d
             # 点のZ座標から適切な円錐面までの距離を計算
-            
+
             # 円錐面上の対応点のZ座標
             z_on_cone = sphere_center_z + (r_2d - r_crit) / np.tan(alpha)
-            
+
             # 修正3: 符号付き距離を正確に計算
             # 円錐面の法線ベクトル：(-sin_alpha, 0, cos_alpha)
             # 点から円錐面への符号付き距離
             dist_surface = (r_2d - r_crit) * cos_alpha + (dz - z_on_cone) * sin_alpha
-            
+
         return dist_surface
 
     def dist_point_to_sphere_tip(self, p, tip_apex, R_cone, alpha_deg, R_sphere):
@@ -14907,23 +18599,23 @@ Check console for detailed information."""
         """背景色選択ダイアログ"""
         # 現在の背景色を取得
         current_color = QColor()
-        current_color.setRgbF(self.current_bg_color[0], 
-                             self.current_bg_color[1], 
+        current_color.setRgbF(self.current_bg_color[0],
+                             self.current_bg_color[1],
                              self.current_bg_color[2])
-        
+
         color = QColorDialog.getColor(current_color, self, "Choose Background Color")
         if color.isValid():
             # RGB値を0-1範囲に変換
             self.current_bg_color = (color.redF(), color.greenF(), color.blueF())
             self._apply_current_background_color()
-    
+
     def clear_mrc_data(self):
         """MRCデータとアクターをクリア"""
         # MRCアクターをレンダラーから削除
         if hasattr(self, 'mrc_actor') and self.mrc_actor is not None:
             self.renderer.RemoveActor(self.mrc_actor)
             self.mrc_actor = None
-        
+
         # MRCデータをクリア
         if hasattr(self, 'mrc_data'):
             self.mrc_data = None
@@ -14939,25 +18631,26 @@ Check console for detailed information."""
         if self.current_structure_type == "mrc":
             self.current_structure_path = None
             self.current_structure_type = None
-        
+
         # MRCラベルをリセット
         if hasattr(self, 'file_label'):
             self.file_label.setText("File Name: (none)")
-        
+
         # MRCグループを無効化
         if hasattr(self, 'mrc_group'):
             self.mrc_group.setEnabled(False)
-        
+
         # 回転ウィジェットも無効化（PDBデータがない場合）
         if not hasattr(self, 'atoms_data') or self.atoms_data is None:
             if hasattr(self, 'rotation_widgets'):
                 for axis in ['X', 'Y', 'Z']:
                     self.rotation_widgets[axis]['spin'].setEnabled(False)
                     self.rotation_widgets[axis]['slider'].setEnabled(False)
-        
+
         # レンダリング更新
+        self._update_single_color_control_state()
         self.request_render()
-    
+
     def clear_pdb_data(self):
         """PDBデータとアクターをクリア"""
         # PDBアクターをレンダラーから削除
@@ -14967,7 +18660,7 @@ Check console for detailed information."""
         if hasattr(self, 'bonds_actor') and self.bonds_actor is not None:
             self.renderer.RemoveActor(self.bonds_actor)
             self.bonds_actor = None
-        
+
         # PDBデータをクリア
         if hasattr(self, 'atoms_data'):
             self.atoms_data = None
@@ -14982,22 +18675,23 @@ Check console for detailed information."""
         self.current_structure_type = None
         self.pymol_esp_object = None
         self.original_atoms_data = None
-        
+        self._clear_domain_state()
+
         # PDBラベルをリセット
         if hasattr(self, 'file_label'):
             self.file_label.setText("File Name: (none)")
-        
+
         # 統計情報をリセット
         if hasattr(self, 'stats_label'):
             self.stats_label.setText("No data loaded")
-        
+
         # 回転ウィジェットも無効化（MRCデータがない場合）
         if not (hasattr(self, 'mrc_data') and self.mrc_data is not None):
             if hasattr(self, 'rotation_widgets'):
                 for axis in ['X', 'Y', 'Z']:
                     self.rotation_widgets[axis]['spin'].setEnabled(False)
                     self.rotation_widgets[axis]['slider'].setEnabled(False)
-        
+
         # PyMOLオブジェクトを削除
         if self._is_pymol_active():
             try:
@@ -15011,8 +18705,9 @@ Check console for detailed information."""
             self.pymol_loaded_path = None
 
         # レンダリング更新
+        self._update_single_color_control_state()
         self.request_render()
-    
+
     def update_mrc_actor_color(self):
         """既存のMRCアクターの色を更新"""
         if hasattr(self, 'mrc_actor') and self.mrc_actor is not None:
@@ -15020,20 +18715,46 @@ Check console for detailed information."""
             mapper = self.mrc_actor.GetMapper()
             if mapper:
                 mapper.ScalarVisibilityOff()
-            
+
             prop = self.mrc_actor.GetProperty()
             # MRCは常に選択された色を使用（カラースキームは関係ない）
-           
+
             prop.SetColor(self.current_single_color[0], self.current_single_color[1], self.current_single_color[2])
+            self.update_actor_materials()
             self.request_render()
-    
+
     def on_color_scheme_changed(self):
         """カラースキーム変更時の処理"""
         print(f"Color scheme changed to: {self.color_combo.currentText()}")
+        self._update_single_color_control_state()
         if self.atoms_data is not None:
             self.update_display()
         # MRCデータの場合はカラースキームは関係ないので何もしない
-    
+
+    def _update_single_color_control_state(self):
+        """Enable Single Color picker only when it affects the current view."""
+        btn = getattr(self, 'single_color_btn', None)
+        if btn is None:
+            return
+        color_mode = self.color_combo.currentText() if hasattr(self, 'color_combo') else ""
+        mrc_active = (
+            getattr(self, 'current_structure_type', None) == "mrc"
+            or (
+                getattr(self, 'atoms_data', None) is None
+                and getattr(self, 'mrc_data', None) is not None
+            )
+        )
+        enabled = (color_mode == "Single Color") or mrc_active
+        btn.setEnabled(enabled)
+        if mrc_active:
+            tip = "Choose the MRC surface color."
+        elif color_mode == "Single Color":
+            tip = "Choose the color used by Display Settings > Color: Single Color."
+        else:
+            tip = "Enabled when Display Settings > Color is Single Color."
+        btn.setToolTip(tip)
+        btn.setStatusTip(tip)
+
     def choose_single_color(self):
         """単色モード用カラー選択"""
         # 現在の単色を取得
@@ -15041,14 +18762,14 @@ Check console for detailed information."""
         current_color.setRgbF(self.current_single_color[0],
                             self.current_single_color[1],
                             self.current_single_color[2])
-        
+
         color = QColorDialog.getColor(current_color, self, "Choose Single Color")
         if color.isValid():
             # RGB値を0-1範囲に変換
             old_color = self.current_single_color
             self.current_single_color = (color.redF(), color.greenF(), color.blueF())
-            
-           
+
+
             # ボタンの色を更新
             self.single_color_btn.setStyleSheet(f"""
                 QPushButton {{
@@ -15060,20 +18781,25 @@ Check console for detailed information."""
                 QPushButton:hover {{
                     border-color: #777;
                 }}
+                QPushButton:disabled {{
+                    background-color: #b8b8b8;
+                    color: #666;
+                    border-color: #aaa;
+                }}
             """)
-            
+
             # 表示を更新
-            if self.atoms_data is not None:                
+            if self.atoms_data is not None:
                 self.update_display()
             elif hasattr(self, 'mrc_data') and self.mrc_data is not None:             # MRCデータの場合も色を更新
                 self.update_mrc_actor_color()
-    
+
     def update_brightness(self):
         """明るさ調整"""
         brightness = self.brightness_slider.value()
         self.brightness_factor = brightness / 100.0
         self.brightness_label.setText(f"{brightness}%")
-        
+
         # ライティングを更新
         if self._is_pymol_active():
             self._apply_pymol_lighting()
@@ -15082,37 +18808,38 @@ Check console for detailed information."""
         if not self._is_pymol_only():
             self.update_lighting_intensity()
         self.request_render()
-    
+
     def update_lighting(self):
         """環境光設定の更新"""
         ambient = self.ambient_slider.value()
         self.ambient_label.setText(f"{ambient}%")
-        
+
         # レンダラーの環境光を設定
         if self._is_pymol_active():
             self._apply_pymol_lighting()
         if not self._is_pymol_only():
             ambient_factor = ambient / 100.0
             self.renderer.SetAmbient(ambient_factor, ambient_factor, ambient_factor)
+            self.update_actor_materials()
         self.request_render()
-    
+
     def update_material(self):
         """マテリアル設定の更新"""
         specular = self.specular_slider.value()
         self.specular_label.setText(f"{specular}%")
-        
+
         # 全てのアクターのスペキュラを更新
         if self._is_pymol_active():
             self._apply_pymol_lighting()
         if not self._is_pymol_only():
             self.update_actor_materials()
         self.request_render()
-    
+
     def update_lighting_intensity(self):
         """ライトの強度を明るさファクターで調整"""
         lights = self.renderer.GetLights()
         lights.InitTraversal()
-        
+
         light = lights.GetNextItem()
         while light:
             # 元の強度に明るさファクターを適用
@@ -15122,26 +18849,46 @@ Check console for detailed information."""
                 # 初回は現在の強度を保存
                 light._original_intensity = light.GetIntensity()
                 light.SetIntensity(light._original_intensity * self.brightness_factor)
-            
+
             light = lights.GetNextItem()
-    
+
     def update_actor_materials(self):
         """全アクターのマテリアル特性を更新"""
         specular_factor = self.specular_slider.value() / 100.0
-        
+        ambient_factor = self.ambient_slider.value() / 100.0 if hasattr(self, 'ambient_slider') else 0.15
+        material_ambient = min(1.0, ambient_factor * 2.0)
+
         # 分子アクター
         if self.sample_actor and hasattr(self.sample_actor, 'GetProperty'):
-            self.sample_actor.GetProperty().SetSpecular(specular_factor)
-            self.sample_actor.GetProperty().SetSpecularPower(50)
-        
+            prop = self.sample_actor.GetProperty()
+            prop.SetAmbient(material_ambient)
+            prop.SetSpecular(specular_factor)
+            prop.SetSpecularPower(50)
+
         # 結合アクター
         if self.bonds_actor and hasattr(self.bonds_actor, 'GetProperty'):
-            self.bonds_actor.GetProperty().SetSpecular(specular_factor * 0.5)
-        
+            prop = self.bonds_actor.GetProperty()
+            prop.SetAmbient(material_ambient)
+            prop.SetSpecular(specular_factor * 0.5)
+
         # 探針アクター
         if self.tip_actor and hasattr(self.tip_actor, 'GetProperty'):
-            self.tip_actor.GetProperty().SetSpecular(min(0.9, specular_factor * 1.5))
-    
+            prop = self.tip_actor.GetProperty()
+            prop.SetAmbient(material_ambient)
+            prop.SetSpecular(min(0.9, specular_factor * 1.5))
+
+        if getattr(self, 'mrc_actor', None) is not None and hasattr(self.mrc_actor, 'GetProperty'):
+            prop = self.mrc_actor.GetProperty()
+            prop.SetAmbient(material_ambient)
+            prop.SetSpecular(specular_factor)
+            prop.SetSpecularPower(50)
+
+        if getattr(self, 'sequence_highlight_actor', None) is not None:
+            prop = self.sequence_highlight_actor.GetProperty()
+            prop.SetAmbient(material_ambient)
+            prop.SetSpecular(specular_factor)
+            prop.SetSpecularPower(50)
+
     def apply_dark_theme(self):
         """ダークテーマプリセット適用"""
         # 背景をダークグレーに
@@ -15150,7 +18897,7 @@ Check console for detailed information."""
             self._pymol_set_background(self.current_bg_color)
         if not self._is_pymol_only():
             self.renderer.SetBackground(*self.current_bg_color)
-        
+
         # ボタンの色を更新
         self.bg_color_btn.setStyleSheet("""
             QPushButton {
@@ -15163,48 +18910,48 @@ Check console for detailed information."""
                 border-color: #777;
             }
         """)
-        
+
         # 明るさを100%に
         self.brightness_slider.setValue(100)
         self.brightness_factor = 1.0
         self.brightness_label.setText("100%")
-        
+
         # 環境光を15%に
         self.ambient_slider.setValue(15)
         self.ambient_label.setText("15%")
         if not self._is_pymol_only():
             self.renderer.SetAmbient(0.15, 0.15, 0.15)
-        
+
         # スペキュラを60%に
         self.specular_slider.setValue(60)
         self.specular_label.setText("60%")
-        
+
         # 設定を適用
         if self._is_pymol_active():
             self._apply_pymol_lighting()
         if not self._is_pymol_only():
             self.update_lighting_intensity()
             self.update_actor_materials()
-        
+
         # 表示を更新
         if self.atoms_data is not None:
             self.update_display()
 
         self.request_render()
-        
+
         QMessageBox.information(self, "Theme Applied", "Dark theme applied successfully!")
-    
+
     def load_settings(self):
         """起動時にウィンドウの位置、サイズ、スプリッターの状態を復元する"""
         try:
             if os.path.exists(self.settings_file):
                 with open(self.settings_file, 'r') as f:
                     settings = json.load(f)
-                
+
                 # ウィンドウのジオメトリ（位置とサイズ）を復元
                 if 'geometry' in settings:
                     self.setGeometry(*settings['geometry'])
-                
+
                 # 各スプリッターの状態を復元
                 if 'main_splitter' in settings:
                     self.main_splitter.setSizes(settings['main_splitter'])
@@ -15215,7 +18962,7 @@ Check console for detailed information."""
 
                 if 'last_import_dir' in settings:
                     self.last_import_dir = settings['last_import_dir']
-                
+
                 # MRCのZ軸フリップ状態を復元（デフォルトはTrue）
                 if 'mrc_z_flip' in settings:
                     self.mrc_z_flip = settings['mrc_z_flip']
@@ -15230,13 +18977,13 @@ Check console for detailed information."""
                     except Exception:
                         pass
                 self._apply_current_background_color()
-                
+
                 # チェックボックスの状態を確実に設定
                 if hasattr(self, 'mrc_z_flip_check'):
                     self.mrc_z_flip_check.blockSignals(True)  # シグナルを一時的にブロック
                     self.mrc_z_flip_check.setChecked(self.mrc_z_flip)
                     self.mrc_z_flip_check.blockSignals(False)  # シグナルを再有効化
-                
+
                 #print("Settings loaded successfully.")
 
         except (IOError, json.JSONDecodeError, KeyError) as e:
@@ -15299,13 +19046,13 @@ Check console for detailed information."""
             scan['nx'] = int(self.spinNx.value())
         if hasattr(self, 'spinNy'):
             scan['ny'] = int(self.spinNy.value())
-            
+
         # Optional backward compatibility in saved JSON
         if 'scan_x_nm' in scan:
             scan['size_nm'] = scan['scan_x_nm']
         if 'nx' in scan:
             scan['resolution'] = f"{scan['nx']}x{scan['nx']}"
-            
+
         if scan:
             params['scan'] = scan
 
@@ -15379,9 +19126,9 @@ Check console for detailed information."""
             display['opacity'] = int(self.opacity_slider.value())
         if hasattr(self, 'quality_combo'):
             display['quality'] = self.quality_combo.currentText()
-        if hasattr(self, 'renderer_combo'):
+        if self._has_renderer_combo():
             display['renderer'] = self.renderer_combo.currentText()
-        if hasattr(self, 'esp_check'):
+        if self._has_esp_check():
             display['esp'] = bool(self.esp_check.isChecked())
         if display:
             params['display'] = display
@@ -15487,6 +19234,8 @@ Check console for detailed information."""
             try:
                 widget.blockSignals(True)
                 widget.setValue(value)
+                if hasattr(self, '_sync_appearance_slider_from_spin'):
+                    self._sync_appearance_slider_from_spin(widget)
             finally:
                 widget.blockSignals(False)
 
@@ -15545,12 +19294,12 @@ Check console for detailed information."""
                 _set_spin(self.spinScanXNm, float(scan['scan_x_nm']))
             elif hasattr(self, 'spinScanXNm') and 'size_nm' in scan: # Migration
                 _set_spin(self.spinScanXNm, float(scan['size_nm']))
-                
+
             if hasattr(self, 'spinScanYNm') and 'scan_y_nm' in scan:
                 _set_spin(self.spinScanYNm, float(scan['scan_y_nm']))
             elif hasattr(self, 'spinScanYNm') and 'size_nm' in scan: # Migration
                 _set_spin(self.spinScanYNm, float(scan['size_nm']))
-                
+
             if hasattr(self, 'spinNx') and 'nx' in scan:
                 _set_spin(self.spinNx, int(scan['nx']))
             elif hasattr(self, 'spinNx') and 'resolution' in scan: # Migration
@@ -15558,7 +19307,7 @@ Check console for detailed information."""
                     res = int(str(scan['resolution']).split('x')[0])
                     _set_spin(self.spinNx, res)
                 except: pass
-                
+
             if hasattr(self, 'spinNy') and 'ny' in scan:
                 _set_spin(self.spinNy, int(scan['ny']))
             elif hasattr(self, 'spinNy') and 'resolution' in scan: # Migration
@@ -15566,7 +19315,7 @@ Check console for detailed information."""
                     res = int(str(scan['resolution']).split('x')[0])
                     _set_spin(self.spinNy, res)
                 except: pass
-                
+
             if hasattr(self, 'resolution_combo') and 'resolution' in scan:
                 _set_combo(self.resolution_combo, scan['resolution'])
 
@@ -15649,9 +19398,9 @@ Check console for detailed information."""
                 _set_slider(self.opacity_slider, int(display['opacity']))
             if hasattr(self, 'quality_combo') and 'quality' in display:
                 _set_combo(self.quality_combo, display['quality'])
-            if hasattr(self, 'renderer_combo') and 'renderer' in display:
+            if self._has_renderer_combo() and 'renderer' in display:
                 _set_combo(self.renderer_combo, display['renderer'])
-            if hasattr(self, 'esp_check') and 'esp' in display:
+            if self._has_esp_check() and 'esp' in display:
                 esp_state = bool(display['esp'])
                 _set_check(self.esp_check, esp_state)
 
@@ -15806,7 +19555,7 @@ Check console for detailed information."""
         except Exception:
             pass
         try:
-            if hasattr(self, 'renderer_combo'):
+            if self._has_renderer_combo():
                 self.on_renderer_changed(self.renderer_combo.currentText())
         except Exception:
             pass
@@ -15847,7 +19596,7 @@ Check console for detailed information."""
         except Exception:
             pass
         try:
-            if esp_state is not None and hasattr(self, 'display_electrostatics'):
+            if esp_state is not None and self._has_esp_check() and hasattr(self, 'display_electrostatics'):
                 self.display_electrostatics(bool(self.esp_check.isChecked()))
         except Exception:
             pass
@@ -15883,6 +19632,8 @@ Check console for detailed information."""
 
     def save_session_json(self, json_path):
         """Save current session (params + structure) to JSON."""
+        pose_state = self.pose if isinstance(self.pose, dict) else {}
+        center_x_nm, center_y_nm = self._get_tip_center_xy_nm()
         doc = {
             'schema_version': 2,
             'app': 'pyNuD_simulator',
@@ -15891,10 +19642,14 @@ Check console for detailed information."""
             'params': self.collect_sim_params(),
             'real_asd_path': self.real_asd_path,
             'pose': {
-                'theta_deg': float(self.pose.get('theta_deg', 0.0)) if isinstance(self.pose, dict) else 0.0,
-                'dx_px': float(self.pose.get('dx_px', 0.0)) if isinstance(self.pose, dict) else 0.0,
-                'dy_px': float(self.pose.get('dy_px', 0.0)) if isinstance(self.pose, dict) else 0.0,
-                'mirror_mode': str(self.pose.get('mirror_mode', 'none')) if isinstance(self.pose, dict) else 'none',
+                'theta_deg': float(pose_state.get('theta_deg', 0.0)),
+                'dx_px': float(pose_state.get('dx_px', 0.0)),
+                'dy_px': float(pose_state.get('dy_px', 0.0)),
+                'mirror_mode': str(pose_state.get('mirror_mode', 'none')),
+                'center_x_nm': float(pose_state.get('center_x_nm', center_x_nm)),
+                'center_y_nm': float(pose_state.get('center_y_nm', center_y_nm)),
+                'shift_x_nm': float(pose_state.get('shift_x_nm', 0.0)),
+                'shift_y_nm': float(pose_state.get('shift_y_nm', 0.0)),
                 'rotation_axes': self._get_pose_rotation_axes(),
             },
         }
@@ -15970,6 +19725,10 @@ Check console for detailed information."""
                     'dx_px': float(pose_doc.get('dx_px', 0.0)),
                     'dy_px': float(pose_doc.get('dy_px', 0.0)),
                     'mirror_mode': str(pose_doc.get('mirror_mode', 'none')),
+                    'center_x_nm': float(pose_doc.get('center_x_nm', 0.0)),
+                    'center_y_nm': float(pose_doc.get('center_y_nm', 0.0)),
+                    'shift_x_nm': float(pose_doc.get('shift_x_nm', 0.0)),
+                    'shift_y_nm': float(pose_doc.get('shift_y_nm', 0.0)),
                     'score': None,
                 }
                 pose_axes = pose_doc.get('rotation_axes', None)
@@ -16060,7 +19819,7 @@ Check console for detailed information."""
             self.request_render()
         except Exception:
             pass
-    
+
     def handle_save_asd(self):
         """「Save as ASD...」ボタンが押されたときの処理"""
         if not self.simulation_results:
@@ -16069,17 +19828,17 @@ Check console for detailed information."""
 
          # 保存可能なデータの名前（キー）を取得
         available_keys = list(self.simulation_results.keys())
-        
+
         # ユーザーに表示するための分かりやすい名前の辞書
         display_names = {
             "XY_Frame": "XY View",
             "YZ_Frame": "YZ View",
             "ZX_Frame": "ZX View"
         }
-        
+
         # 選択肢リストを作成
         choices = [display_names.get(key, key) for key in available_keys]
-        
+
         selected_key = None
         if len(available_keys) > 1:
             # データが複数ある場合、ダイアログで選択させる
@@ -16100,7 +19859,7 @@ Check console for detailed information."""
 
         if selected_key is None:
             return
-                
+
         data_to_save = self.simulation_results[selected_key]
         image_key_name = display_names.get(selected_key, selected_key).replace(" ", "") # ファイル名用
         default_id = self.get_active_dataset_id()
@@ -16110,7 +19869,7 @@ Check console for detailed information."""
         # 最後に使用したディレクトリが存在し、アクセス可能かチェック
         if self.last_import_dir and os.path.isdir(self.last_import_dir):
             directory = self.last_import_dir
-        
+
         # ファイル名と安全なディレクトリを結合して、最終的なデフォルトパスを作成
         default_save_path = os.path.join(directory, default_filename)
 
@@ -16122,23 +19881,23 @@ Check console for detailed information."""
         if not save_path:
             return
 
-        try:            
+        try:
             # --- シミュレーション条件を収集 ---
             rot_x = self.rotation_widgets['X']['spin'].value()
             rot_y = self.rotation_widgets['Y']['spin'].value()
             rot_z = self.rotation_widgets['Z']['spin'].value()
-            
+
             tip_shape = self.tip_shape_combo.currentText()
             tip_radius = self.tip_radius_spin.value()
             tip_angle = self.tip_angle_spin.value()
-            
+
             scan_x = self.spinScanXNm.value()
             scan_y = self.spinScanYNm.value()
             nx = self.spinNx.value()
             ny = self.spinNy.value()
             center_x = self.tip_x_slider.value() / 5.0
             center_y = self.tip_y_slider.value() / 5.0
-            
+
             use_vdw = "Yes" if self.use_vdw_check.isChecked() else "No"
             sim_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -16163,7 +19922,7 @@ Check console for detailed information."""
                 f"Shape: {tip_shape}",
                 f"Radius: {tip_radius:.2f} nm",
             ]
-            
+
             if tip_shape == "Cone":
                 comment_lines.append(f"Angle: {tip_angle:.1f} deg")
             elif tip_shape == "Sphere":
@@ -16182,9 +19941,9 @@ Check console for detailed information."""
                 f"[Calculation Method]",
                 f"Consider vdW: {use_vdw}",
             ])
-            
+
             comment = "\n".join(comment_lines)
-            
+
             # # save_simulation_as_asd を呼び出す
             success = self.save_simulation_as_asd(save_path, comment, data_to_save)
             if success:
@@ -16213,13 +19972,13 @@ Check console for detailed information."""
             # ★★★ 修正点2: comment_bytes を正しく使用する ★★★
             ope_name_bytes = "Nobody".encode('utf-8')
             comment_bytes = comment_string.encode('utf-8')
-            
+
             # Igorコードの `165` は固定ヘッダーのバイト数
             file_header_size = 165 + len(ope_name_bytes) + len(comment_bytes)
             frame_header_size = 32
 
             now = datetime.datetime.now()
-            
+
             with open(save_path, 'wb') as f:
                 # --- ファイルヘッダー書き込み ---
                 f.write(struct.pack('<i', 1))
@@ -16261,7 +20020,7 @@ Check console for detailed information."""
                 f.write(struct.pack('<f', 1.0))
                 f.write(struct.pack('<f', 20.0))
                 f.write(struct.pack('<f', 2.0))
-                
+
                 f.write(ope_name_bytes)
                 f.write(comment_bytes) # ★★★ 正しいコメント本体を書き込む ★★★
 
@@ -16285,7 +20044,7 @@ Check console for detailed information."""
                 # --- 画像データ書き込み ---
                 piezo_const_z = 20.0
                 driver_gain_z = 2.0
-                
+
                 for y in range(y_pixels):
                     for x in range(x_pixels):
                         height_value = height_map[y, x]
@@ -16293,13 +20052,13 @@ Check console for detailed information."""
                         data = (5.0 - height_value / piezo_const_z / driver_gain_z) * 4096.0 / 10.0
                         f.write(struct.pack('<h', int(data)))
             return True
-            
+
         except Exception as e:
             print(f"[ERROR] SaveASD failed: {e}")
             import traceback
             traceback.print_exc()
             return False
-    
+
     def handle_save_3d_view(self):
         """現在の3Dビューを画像ファイルとして保存する"""
         if self.pdb_name == "":
@@ -16311,9 +20070,9 @@ Check console for detailed information."""
         directory = ""
         if self.last_import_dir and os.path.isdir(self.last_import_dir):
             directory = self.last_import_dir
-        
+
         default_save_path = os.path.join(directory, default_filename)
-        
+
         # ユーザーにファイル名と保存形式を選択させる
         filters = "PNG Image (*.png);;TIFF Image (*.tif)"
         save_path, selected_filter = QFileDialog.getSaveFileName(
@@ -16346,9 +20105,9 @@ Check console for detailed information."""
             window_to_image_filter = vtk.vtkWindowToImageFilter()
             window_to_image_filter.SetInput(self.vtk_widget.GetRenderWindow())
             # アルファチャンネル（透明度）を含めずにRGBのみをキャプチャ
-            window_to_image_filter.SetInputBufferTypeToRGB() 
+            window_to_image_filter.SetInputBufferTypeToRGB()
             # スケーリングを無効にし、ウィンドウの解像度でキャプチャ
-            window_to_image_filter.SetScale(1) 
+            window_to_image_filter.SetScale(1)
             window_to_image_filter.Update()
 
             # 2. 選択されたファイル形式に応じて適切なライターを選択
@@ -16369,22 +20128,22 @@ Check console for detailed information."""
             writer.SetFileName(save_path)
             writer.SetInputConnection(window_to_image_filter.GetOutputPort())
             writer.Write()
-            
+
             QMessageBox.information(self, "Save Successful", f"3D view successfully saved to:\n{save_path}")
 
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"An error occurred while saving the 3D view:\n{e}")
-    
+
     def handle_save_image(self):
         """Export one or more simulated AFM images (PNG) with optional incremental rotation."""
         if not self.simulation_results:
             QMessageBox.warning(self, "No Data", "No simulation data available to save.")
             return
-        
+
         # Build available (only those already simulated)
         available_keys = list(self.simulation_results.keys())
         display_names = {"XY_Frame": "XY View", "YZ_Frame": "YZ View", "ZX_Frame": "ZX View"}
-        
+
         dlg = SaveAFMImageDialog(available_keys, display_names, self.get_active_dataset_id(), self)
         if dlg.exec_() != QDialog.Accepted:
             return
@@ -16392,11 +20151,11 @@ Check console for detailed information."""
         selected_view_keys = result['selected_views']
         rot_inc = result['drot']
         base_name = result['base_name']
-        
+
         if not selected_view_keys:
             QMessageBox.warning(self, "No Selection", "No views selected.")
             return
-        
+
         # Map for filename friendly
         def key_to_short(k):
             return {
@@ -16404,21 +20163,21 @@ Check console for detailed information."""
                 "YZ_Frame": "YZ",
                 "ZX_Frame": "ZX"
             }.get(k, k.replace("_Frame", ""))
-        
+
         # Prepare directory & ensure last_import_dir is valid
         directory = ""
         if self.last_import_dir and os.path.isdir(self.last_import_dir):
             directory = self.last_import_dir
         if not directory:
             directory = os.getcwd()
-        
+
         # Save original rotation
         orig_rx = self.rotation_widgets['X']['spin'].value()
         orig_ry = self.rotation_widgets['Y']['spin'].value()
         orig_rz = self.rotation_widgets['Z']['spin'].value()
-        
+
         apply_rotation = any(abs(v) > 1e-6 for v in rot_inc.values())
-        
+
         try:
             if apply_rotation:
                 # Apply incremental rotation (add to current)
@@ -16428,7 +20187,7 @@ Check console for detailed information."""
                 # Force apply transform & run simulation for required views
                 self.apply_structure_rotation()
                 self.simulate_views_blocking(selected_view_keys)
-            
+
             # Export each selected view
             export_count = 0
             for key in selected_view_keys:
@@ -16441,7 +20200,7 @@ Check console for detailed information."""
                     norm = np.zeros_like(data, dtype=np.uint8)
                 else:
                     norm = ((data - mn) / (mx - mn) * 255).astype(np.uint8)
-                
+
                 # Resize to 512x512
                 try:
                     from PIL import Image
@@ -16451,7 +20210,7 @@ Check console for detailed information."""
                 img = Image.fromarray(norm, mode='L')
                 resample_filter = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS
                 img = img.resize((512, 512), resample=resample_filter)
-                
+
                 fname = f"{base_name}_{key_to_short(key)}_dx{rot_inc['x']:+.0f}_dy{rot_inc['y']:+.0f}_dz{rot_inc['z']:+.0f}.png"
                 save_path = os.path.join(directory, fname)
                 try:
@@ -16459,12 +20218,12 @@ Check console for detailed information."""
                     export_count += 1
                 except Exception as e:
                     print(f"[ERROR] Failed to save {save_path}: {e}")
-            
+
             if export_count:
                 QMessageBox.information(self, "Export Complete", f"Exported {export_count} image(s) to:\n{directory}")
             else:
                 QMessageBox.warning(self, "No Export", "No images were exported.")
-        
+
         finally:
             # Restore original rotation if we changed it
             if apply_rotation:
@@ -16474,7 +20233,7 @@ Check console for detailed information."""
                 self.apply_structure_rotation()
                 # (Optionally regenerate original visible views if needed)
                 # self.simulate_views_blocking(available_keys)
-    
+
     def run_simulation_on_view_change(self, is_checked):
         """
         View選択チェックボックスがONになった時にシミュレーションを自動実行するスロット。
@@ -16643,11 +20402,11 @@ Check console for detailed information."""
             self.spinNy.setValue(res)
             self.spinNx.blockSignals(False)
             self.spinNy.blockSignals(False)
-            
+
             # Interactive Updateが有効な場合、新しい解像度を高解像度として記憶
             if self.interactive_update_check.isChecked():
                 self.user_selected_resolution = f"{res}x{res}"
-            
+
             self.trigger_interactive_simulation()
         except (ValueError, IndexError):
             pass
@@ -16660,7 +20419,7 @@ Check console for detailed information."""
         coords, mode = self.get_simulation_coords()
         if coords is None:
             return
-        
+
         # 既に別のシミュレーションが実行中の場合は何もしない（改良版）
         if self.is_worker_running(getattr(self, 'sim_worker', None), attr_name='sim_worker') or \
            self.is_worker_running(getattr(self, 'sim_worker_silent', None), attr_name='sim_worker_silent'):
@@ -16722,7 +20481,7 @@ Check console for detailed information."""
                 self.stop_worker(self.sim_worker_silent, timeout_ms=50, allow_terminate=True, worker_name="sim_worker_silent")
             except Exception as e:
                 print(f"[WARNING] Error stopping sim_worker_silent: {e}")
-        
+
         # 軽量ワーカーを作成（UI変更なし）
         self.sim_worker_silent = AFMSimulationWorker(
             self, sim_params, tasks,
@@ -16746,11 +20505,11 @@ Check console for detailed information."""
         # データが読み込まれていない場合は何もしない
         if self.atoms_data is None and not (hasattr(self, 'mrc_data') and self.mrc_data is not None):
             return
-        
+
         # 以前のタイマーが作動中であれば停止する
         if hasattr(self, 'interactive_timer'):
             self.interactive_timer.stop()
-        
+
         # ★★★ 軽量シミュレーションを実行（ドラッグ中はXYのみ） ★★★
         self.run_simulation_silent(only_xy=True)
 
@@ -16762,25 +20521,25 @@ Check console for detailed information."""
         # データが読み込まれていない場合は何もしない
         if self.atoms_data is None and not (hasattr(self, 'mrc_data') and self.mrc_data is not None):
             return
-        
+
         # 以前のタイマーが作動中であれば停止する
         if hasattr(self, 'interactive_timer'):
             self.interactive_timer.stop()
-        
+
         # ★★★ 前のシミュレーションが完了するまで待機 ★★★
         if self.is_worker_running(getattr(self, 'sim_worker_silent', None), attr_name='sim_worker_silent'):
             # 前のシミュレーションが実行中の場合は、ドラッグ中の更新をスキップ
             return
-        
+
         # ★★★ 最小更新間隔の制御を強化 ★★★
         current_time = QTime.currentTime()
         if hasattr(self, 'last_drag_simulation_time'):
             time_diff = self.last_drag_simulation_time.msecsTo(current_time)
             if time_diff < 300:  # 300ms未満の場合はスキップ（200msから増加）
                 return
-        
+
         self.last_drag_simulation_time = current_time
-        
+
         # 軽量シミュレーションを実行（ドラッグ中はXYのみ）
         self.run_simulation_silent(only_xy=True)
 
@@ -16800,7 +20559,7 @@ Check console for detailed information."""
         # 既存のタイマーが動作中であれば停止
         if hasattr(self, 'high_res_timer'):
             self.high_res_timer.stop()
-        
+
         # 新しいタイマーを設定（1秒後に実行）
         self.high_res_timer = QTimer(self)  # 親ウィンドウを設定
         self.high_res_timer.setSingleShot(True)
@@ -16816,14 +20575,14 @@ Check console for detailed information."""
         if getattr(self, 'block_transform_dragging', False):
             self.schedule_high_res_simulation()
             return
-        
+
         # UI上の解像度表示は変更せず、内部で高解像度計算を実行
         if hasattr(self, 'user_selected_resolution') and self.user_selected_resolution:
             target_resolution = self.user_selected_resolution
         else:
             target_resolution = "256x256"  # デフォルト高解像度
-   
-        
+
+
         # 高解像度シミュレーションを実行（UI表示は変更しない）
         self.run_simulation_silent_high_res(target_resolution)
 
@@ -16834,7 +20593,7 @@ Check console for detailed information."""
         coords, mode = self.get_simulation_coords()
         if coords is None:
             return
-        
+
         # 既に別のシミュレーションが実行中の場合は何もしない
         if self.is_worker_running(getattr(self, 'sim_worker', None), attr_name='sim_worker'):
             return
@@ -16847,7 +20606,7 @@ Check console for detailed information."""
         try:
             if 'x' in target_resolution:
                 target_nx = int(target_resolution.split('x')[0])
-                target_ny = int(target_resolution.split('x')[int('x' in target_resolution)]) # logic for potentially split 
+                target_ny = int(target_resolution.split('x')[int('x' in target_resolution)]) # logic for potentially split
                 # simplification:
                 target_nx = int(target_resolution.split('x')[0])
                 target_ny = int(target_resolution.split('x')[1])
@@ -16894,7 +20653,7 @@ Check console for detailed information."""
         # 既存の高解像度ワーカーを停止
         if self.is_worker_running(getattr(self, 'sim_worker_high_res', None), attr_name='sim_worker_high_res'):
             self.stop_worker(self.sim_worker_high_res, timeout_ms=300, allow_terminate=False, worker_name="sim_worker_high_res")
-        
+
         # 高解像度ワーカーを作成
         self.sim_worker_high_res = AFMSimulationWorker(
             self, sim_params, tasks,
@@ -16916,15 +20675,15 @@ Check console for detailed information."""
         if self.simulation_results:
             self.save_image_button.setEnabled(True)
             self.save_asd_button.setEnabled(True)
-        
+
         # UI上の解像度表示は変更しない（既に正しい解像度が表示されている）
-       
+
 
     def on_task_finished_silent(self, z_map, target_panel):
         """軽量シミュレーション用のタスク完了処理（UI変更最小限）"""
         if z_map is not None and target_panel is not None:
             image_key = target_panel.objectName()
-            
+
             # 生データを保存し、表示更新関数を呼び出す
             self.raw_simulation_results[image_key] = z_map
             self.process_and_display_single_image(image_key)
@@ -16947,11 +20706,11 @@ Check console for detailed information."""
             return
         if self.is_worker_running(getattr(self, 'sim_worker', None), attr_name='sim_worker'):
             return
-        
+
         # 以前のタイマーが作動中であれば停止する
         if hasattr(self, 'interactive_timer'):
             self.interactive_timer.stop()
-        
+
         # 新しいタイマーを設定
         self.interactive_timer = QTimer(self)  # 親ウィンドウを設定
         self.interactive_timer.setSingleShot(True)  # 一度だけ実行
@@ -16966,7 +20725,7 @@ Check console for detailed information."""
         """実行中のスレッドを適切にクリーンアップする（完全版）"""
         try:
             print("Starting thread cleanup...")
-            
+
             # スレッドのリストを作成
             workers = []
             if hasattr(self, 'sim_worker') and self.sim_worker:
@@ -16975,7 +20734,7 @@ Check console for detailed information."""
                 workers.append(('sim_worker_silent', self.sim_worker_silent))
             if hasattr(self, 'sim_worker_high_res') and self.sim_worker_high_res:
                 workers.append(('sim_worker_high_res', self.sim_worker_high_res))
-            
+
             # 各ワーカーを停止
             for worker_name, worker in workers:
                 try:
@@ -16985,12 +20744,12 @@ Check console for detailed information."""
                         print(f"Stopped {worker_name} gracefully")
                     else:
                         print(f"[WARNING] {worker_name} may still be running")
-                        
+
                 except Exception as e:
                     print(f"[WARNING] Error stopping {worker_name}: {e}")
-            
+
             print("Thread cleanup completed")
-                
+
         except Exception as e:
             print(f"[WARNING] Error during thread cleanup: {e}")
 
@@ -17009,10 +20768,10 @@ Check console for detailed information."""
                             timer.deleteLater()  # タイマーを完全に削除
                         except Exception as e:
                             print(f"[WARNING] Failed to stop {timer_attr}: {e}")
-            
+
             # ★★★ スレッドの適切なクリーンアップ（同期的に実行） ★★★
             self.cleanup_threads()
-            
+
             # ヘルプウィンドウを閉じる
             if hasattr(self, 'help_window') and self.help_window:
                 try:
@@ -17036,21 +20795,21 @@ Check console for detailed information."""
                             print(f"[WARNING] {label} C++ object already deleted")
                         except Exception as e:
                             print(f"[WARNING] Failed to close {label}: {e}")
-            
+
             # スタンドアロンアプリケーションなのでwindow_managerは使用しない
-            
+
             # ウィンドウの位置とサイズを保存
             try:
                 self.save_geometry()
             except Exception as e:
                 print(f"[WARNING] Failed to save geometry: {e}")
-            
+
             # 設定を保存
             try:
                 self.save_settings()
             except Exception as e:
                 print(f"[WARNING] Failed to save settings: {e}")
-            
+
             # Qtのデフォルトのクローズ処理
             try:
                 super().closeEvent(event)
@@ -17058,9 +20817,9 @@ Check console for detailed information."""
                 print("[WARNING] C++ object already deleted during super().closeEvent()")
             except Exception as e:
                 print(f"[WARNING] Failed to call super().closeEvent(): {e}")
-            
+
             event.accept()
-            
+
         except Exception as e:
             print(f"[ERROR] Unexpected error in pyNuD_simulator closeEvent: {e}")
             import traceback
@@ -17073,7 +20832,7 @@ Check console for detailed information."""
         # 必要なライブラリのインポート
         import mrcfile
         from vtkmodules.util import numpy_support
-        
+
         # PDBデータをクリア（MRCファイルimport時）
         self.clear_pdb_data()
 
@@ -17088,42 +20847,42 @@ Check console for detailed information."""
             self.mrc_data_original = mrc.data.copy()
             # デフォルトでZ flipを適用（読み込み時にFlipさせて管理）
             self.mrc_data = np.flip(self.mrc_data_original, axis=0).copy()
-            
+
             if mrc.voxel_size.x:
-                voxel_size_angstrom = mrc.voxel_size.x 
+                voxel_size_angstrom = mrc.voxel_size.x
             else:
                 voxel_size_angstrom = 1.0
             self.mrc_voxel_size_nm = voxel_size_angstrom / 10.0
-            
+
         # MRCファイル名を表示
         self.mrc_name = os.path.basename(file_path)
         self.mrc_id = ""
         self.mrc_id = os.path.splitext(self.mrc_name)[0]
         self.file_label.setText(f"File Name: {self.mrc_name} (MRC)")
-        
+
         self.mrc_group.setEnabled(True)
         # Z flipの状態に応じてmrc_surface_coordsを初期化
         self.mrc_surface_coords = self._get_mrc_surface_coords()
         self.update_mrc_display()
         self.simulate_btn.setEnabled(True)
-        
+
         # 回転ウィジェットも有効化
         if hasattr(self, 'rotation_widgets'):
             for axis in ['X', 'Y', 'Z']:
                 self.rotation_widgets[axis]['spin'].setEnabled(True)
                 self.rotation_widgets[axis]['slider'].setEnabled(True)
-        
+
         # チェックボックスの状態を確実に設定（デフォルトでTrue）
         if hasattr(self, 'mrc_z_flip_check'):
             self.mrc_z_flip_check.blockSignals(True)
             self.mrc_z_flip_check.setChecked(True)
             self.mrc_z_flip_check.blockSignals(False)
             self.mrc_z_flip = True
-        
+
         # 回転状態をリセット（MRCファイル読み込み時）
         self.reset_structure_rotation()
         self.set_standard_view('xy')
-        
+
         # Interactive Updateが有効な場合は初期シミュレーションを実行
         if hasattr(self, 'interactive_update_check') and self.interactive_update_check.isChecked():
             self.run_simulation_interactively()
@@ -17132,17 +20891,17 @@ Check console for detailed information."""
         """スライダーの値が変更されたときに呼ばれる（リアルタイム更新用）"""
         # ラベルを更新
         self.mrc_threshold_label.setText(f"Value: {value/100.0:.2f}")
-        
+
         # Interactive Updateが有効な場合は疑似AFM像を自動更新
         if hasattr(self, 'interactive_update_check') and self.interactive_update_check.isChecked():
             self.mrc_threshold = value / 100.0
             self.run_simulation_interactively()
-    
+
     def on_mrc_threshold_released(self):
         """スライダーが離されたときに呼ばれ、しきい値を更新して再描画する"""
         self.mrc_threshold = self.mrc_threshold_slider.value() / 100.0
         self.update_mrc_display()
-        
+
         # Interactive Updateが有効な場合は疑似AFM像も自動更新
         if hasattr(self, 'interactive_update_check') and self.interactive_update_check.isChecked():
             self.run_simulation_interactively()
@@ -17150,7 +20909,7 @@ Check console for detailed information."""
     def on_mrc_z_flip_changed(self, state):
         """Z軸フリップチェックボックスの状態変更時の処理"""
         self.mrc_z_flip = state == Qt.Checked
-        
+
         # mrc_data_originalが存在しない場合は、現在のmrc_dataを元データとして使用
         if not hasattr(self, 'mrc_data_original') or self.mrc_data_original is None:
             if hasattr(self, 'mrc_data') and self.mrc_data is not None:
@@ -17158,11 +20917,11 @@ Check console for detailed information."""
                 self.mrc_data_original = self.mrc_data.copy()
             else:
                 return
-        
+
         if self.mrc_data_original is not None:
             # フリップ状態変更時に回転状態をリセット（ジャンプを防ぐ）
             self.reset_structure_rotation()
-            
+
             # チェック時：フリップ済みデータを使用（現在の状態を維持）
             # アンチェック時：元のデータを使用（元の向きに戻す）
             if self.mrc_z_flip:
@@ -17171,7 +20930,7 @@ Check console for detailed information."""
             else:
                 # アンチェック時：元のデータ（元の向きに戻す）
                 self.mrc_data = self.mrc_data_original.copy()
-            
+
             # 座標データを再生成
             self.mrc_surface_coords = self._get_mrc_surface_coords()
             self.update_mrc_display()
@@ -17180,7 +20939,7 @@ Check console for detailed information."""
         """MRCデータから表面座標を取得する"""
         if not hasattr(self, 'mrc_data') or self.mrc_data is None:
             return None
-        
+
         from vtkmodules.util import numpy_support
 
         # 現在のフリップ状態に応じたデータを使用
@@ -17307,6 +21066,8 @@ Check console for detailed information."""
         # 新しいアクターにも現在の回転を適用
         if hasattr(self, 'mrc_actor') and self.mrc_actor is not None:
             self.mrc_actor.SetUserTransform(self.molecule_transform)
+        self._update_single_color_control_state()
+        self.update_actor_materials()
         # カメラ視点をリセットしない（ResetCamera()を削除）
         self.vtk_widget.GetRenderWindow().Render()
 
@@ -17338,7 +21099,7 @@ Check console for detailed information."""
             return coords, 'pdb'
         else:
             return None, None
-    
+
     def get_active_dataset_id(self):
         """
         Return an identifier for current dataset (PDB or MRC).
@@ -17355,8 +21116,8 @@ Check console for detailed information."""
             return "PDB"
         if getattr(self, 'mrc_id', ''):
             return "MRC"
-        return "Unknown"   
-    
+        return "Unknown"
+
 class SaveAFMImageDialog(QDialog):
     """
     Custom dialog to select multiple AFM views and specify incremental rotations
@@ -17372,12 +21133,12 @@ class SaveAFMImageDialog(QDialog):
         self.setMinimumWidth(420)
         self._result = None
         self._build_ui()
-    
+
     def _build_ui(self):
         main = QVBoxLayout(self)
         main.setContentsMargins(12, 12, 12, 12)
         main.setSpacing(10)
-        
+
         # Views group
         views_group = QGroupBox("Select Views to Export")
         vg = QVBoxLayout(views_group)
@@ -17403,7 +21164,7 @@ class SaveAFMImageDialog(QDialog):
         btn_row.addWidget(sel_none)
         vg.addLayout(btn_row)
         main.addWidget(views_group)
-        
+
         # Rotation increments
         rot_group = QGroupBox("Incremental Rotation (°)  (applied once before export)")
         rg = QGridLayout(rot_group)
@@ -17414,7 +21175,7 @@ class SaveAFMImageDialog(QDialog):
         rg.addWidget(QLabel("ΔY:"), 0, 2); rg.addWidget(self.dy_spin, 0, 3)
         rg.addWidget(QLabel("ΔZ:"), 0, 4); rg.addWidget(self.dz_spin, 0, 5)
         main.addWidget(rot_group)
-        
+
         # Base filename
         base_group = QGroupBox("Filename Base")
         bg = QHBoxLayout(base_group)
@@ -17423,7 +21184,7 @@ class SaveAFMImageDialog(QDialog):
         self.base_edit.setPlaceholderText("Base name (dataset id)")
         bg.addWidget(self.base_edit)
         main.addWidget(base_group)
-        
+
         # Example label
         self.example_label = QLabel()
         self.example_label.setStyleSheet("color:#555; font-size:11px;")
@@ -17434,7 +21195,7 @@ class SaveAFMImageDialog(QDialog):
                 sp.valueChanged.connect(self._update_example)
             else:
                 sp.textChanged.connect(self._update_example)
-        
+
         # Buttons
         btns = QHBoxLayout()
         btns.addStretch()
@@ -17445,31 +21206,31 @@ class SaveAFMImageDialog(QDialog):
         btns.addWidget(self.ok_btn)
         btns.addWidget(cancel_btn)
         main.addLayout(btns)
-        
+
         self._update_ok_state()
-    
+
     def _init_rot_spin(self, spin):
         spin.setRange(-360.0, 360.0)
         spin.setDecimals(1)
         spin.setSingleStep(1.0)
         spin.setValue(0.0)
         spin.setKeyboardTracking(False)
-    
+
     def _set_all(self, state):
         for cb in self.view_checks.values():
             cb.setChecked(state)
         self._update_ok_state()
-    
+
     def _update_ok_state(self):
         any_checked = any(cb.isChecked() for cb in self.view_checks.values())
         self.ok_btn.setEnabled(any_checked)
-    
+
     def _update_example(self):
         base = self.base_edit.text().strip() or "AFM"
         dx = self.dx_spin.value(); dy = self.dy_spin.value(); dz = self.dz_spin.value()
         example = f"Example filename: {base}_XY_dx{dx:+.0f}_dy{dy:+.0f}_dz{dz:+.0f}.png"
         self.example_label.setText(example)
-    
+
     def get_result(self):
         selected = [k for k, cb in self.view_checks.items() if cb.isChecked()]
         return {
@@ -17483,6 +21244,7 @@ class AFMSimulator(pyNuD_simulator):
     """pyNuD plugin variant with Real AFM synchronized to pyNuD selection."""
 
     def __init__(self, main_window=None):
+        self._vtk_only_plugin = True
         self.main_window = main_window
         self._pynud_frame_signal_connected = False
         self._pynud_pending_frame_index = None
@@ -17518,36 +21280,11 @@ class AFMSimulator(pyNuD_simulator):
             return
         super().show()
 
-    def setup_pymol(self):
-        """VTK-only, lightweight setup for the in-pyNuD plugin.
-
-        The plugin never imports or launches PyMOL: that keeps startup fast
-        and avoids the fragile native PyMOL dependency inside pyNuD's runtime.
-        All non-PyMOL features are identical to the standalone pyNuD Simulator.
-        """
-        self.render_backend = "vtk"
-        self.pymol_available = False
-        self.user_render_backend_preference = "vtk"
-        if hasattr(self, "esp_check"):
-            self.esp_check.setEnabled(False)
-        self._setup_vtk_legacy()
-        try:
-            self.on_pymol_unavailable(phase="startup")
-        except Exception:
-            pass
-
-    def on_pymol_unavailable(self, detail="", phase="runtime"):
-        """Hook called by core simulator when PyMOL is not usable.
-
-        Plugin policy: no popup warning, silently enforce VTK-only view.
-        """
-        try:
-            self.pymol_available = False
-            self.user_render_backend_preference = "vtk"
-            self._set_render_backend("vtk")
-            self._update_renderer_combo()
-        except Exception:
-            pass
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._is_vtk_only_plugin():
+            if self._ensure_vtk_interactor_ready():
+                self._schedule_vtk_flush(0)
 
     # ------------------------------------------------------------------
     # Live bridge to the standalone "pyNuD Simulator" (pull model)
@@ -17792,18 +21529,18 @@ class AFMSimulator(pyNuD_simulator):
             return
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Question)
-        box.setWindowTitle("pyNuD Simulator (PyMOL)")
+        box.setWindowTitle("pyNuD Simulator")
         box.setTextFormat(Qt.RichText)
         box.setText(
-            "<b>PyMOL 対応の standalone「pyNuD Simulator」が見つかりました。</b><br><br>"
-            "そちらを起動しますか？ 起動する場合、このプラグインの VTK 表示は開かず、"
+            "<b>standalone「pyNuD Simulator」が見つかりました。</b><br><br>"
+            "そちらを起動しますか？ PyMOL 表示や ESP など高度な 3D 表示は standalone 版で利用できます。"
+            "起動する場合、このプラグイン（VTK）のウィンドウは開かず、"
             "pyNuD で表示中のフレームを standalone へ送る役だけを行います。<br>"
-            "<span style='color:#555;'>Launch the standalone pyNuD Simulator (native "
-            "PyMOL) instead of this VTK plugin window? The plugin will stay hidden and "
-            "just feed the displayed frame to it.</span>"
+            "<span style='color:#555;'>Launch the standalone pyNuD Simulator instead of this "
+            "VTK plugin window? The plugin will stay hidden and feed the displayed frame.</span>"
         )
-        launch_btn = box.addButton("pyNuD Simulator を起動 / Launch", QMessageBox.AcceptRole)
-        box.addButton("このプラグイン (VTK) / Use plugin", QMessageBox.RejectRole)
+        launch_btn = box.addButton("pyNuD Simulator を起動 / Launch standalone", QMessageBox.AcceptRole)
+        box.addButton("このプラグイン (VTK) / Use VTK plugin", QMessageBox.RejectRole)
         box.setDefaultButton(launch_btn)
         cb = QCheckBox("今後この選択を記憶する / Remember my choice")
         box.setCheckBox(cb)
@@ -17937,6 +21674,10 @@ class AFMSimulator(pyNuD_simulator):
         self._update_real_afm_frame_controls()
         if sync:
             self.sync_sim_params_to_real()
+        try:
+            self._update_model_overlay(force=True)
+        except Exception:
+            pass
         # Publish to the shared bridge so a running pyNuD Simulator can pull it.
         self._publish_bridge_frame()
         return True
@@ -18089,7 +21830,7 @@ def main():
     # VTKのエラー出力を抑制
     vtk.vtkObject.GlobalWarningDisplayOff()
 
-    window = AFMSimulator()
+    window = pyNuD_simulator()
     window.show()
 
     sys.exit(app.exec_())
@@ -18100,7 +21841,15 @@ def create_plugin(main_window):
     return AFMSimulator(main_window=main_window)
 
 
-__all__ = ["PLUGIN_NAME", "create_plugin", "AFMSimulator", "pyNuD_simulator", "APP_NAME"]
+__all__ = [
+    "PLUGIN_NAME",
+    "create_plugin",
+    "AFMSimulator",
+    "pyNuD_simulator",
+    "APP_NAME",
+    "apply_domain_transforms",
+    "detect_domains_enm",
+]
 
 
 if __name__ == "__main__":
