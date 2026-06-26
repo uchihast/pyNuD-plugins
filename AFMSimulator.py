@@ -4,10 +4,10 @@
 pyNuD Simulator - Standalone application for AFM image simulation from PDB/CIF/MRC.
 Uses native PyMOL rendering with VTK fallback for speed and reliability.
 
-Version: 1.2.0
+Version: 1.2.1
 """
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 import sys
 import numpy as np
