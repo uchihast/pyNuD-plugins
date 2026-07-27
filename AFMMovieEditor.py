@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import sys
 import tempfile
 import textwrap
@@ -47,6 +46,11 @@ except Exception:
 
 PLUGIN_NAME = "AFM Movie Editor"
 
+_MAX_SESSION_JSON_BYTES = 4 * 1024 * 1024
+_MAX_EMBEDDED_DATA_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_SESSION_COMPRESSION_RATIO = 200.0
+_SESSION_COPY_CHUNK_BYTES = 1024 * 1024
+
 
 TRANSITIONS = ["Cut", "Cross Dissolve", "Fade Black", "Wipe Left"]
 TRIMMED_OUTPUT_MODES = ["Skip Trimmed", "Show Trimmed"]
@@ -73,6 +77,456 @@ COLOR_MAPS = {
     "Jet": "COLORMAP_JET",
     "Bone": "COLORMAP_BONE",
 }
+
+HELP_CSS = """
+<style>
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+  font-size: 13px;
+  line-height: 1.55;
+  color: #20242a;
+}
+h2 {
+  font-size: 18px;
+  margin: 0 0 10px 0;
+}
+h3 {
+  font-size: 15px;
+  margin: 16px 0 6px 0;
+}
+p {
+  margin: 6px 0 10px 0;
+}
+ol, ul {
+  margin-top: 6px;
+  margin-bottom: 10px;
+  padding-left: 24px;
+}
+li {
+  margin: 5px 0;
+}
+table {
+  border-collapse: collapse;
+  margin: 8px 0 12px 0;
+  width: 100%;
+}
+th, td {
+  border: 1px solid #d8dde6;
+  padding: 6px 8px;
+  vertical-align: top;
+}
+th {
+  background: #eef2f7;
+}
+.note {
+  background: #fff7df;
+  border: 1px solid #efd37a;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 10px 0;
+}
+.good {
+  background: #eaf7ef;
+  border: 1px solid #9ed3ad;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 10px 0;
+}
+.term {
+  font-weight: 600;
+  color: #111827;
+}
+code {
+  background: #f0f2f5;
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+</style>
+"""
+
+HELP_TABS_JA = [
+    (
+        "最短手順",
+        """
+        <h2>まずはこの順番で作る</h2>
+        <ol>
+          <li>pyNuD本体でAFMデータを開き、表示色・tone・スケールバーを必要な状態に整えます。</li>
+          <li><span class="term">Refresh Frames</span> を押して、現在のAFMフレームをMovie Editorへ読み込みます。</li>
+          <li><span class="term">Source Frames</span> で使いたい範囲を選び、<span class="term">Add Source Clip</span> を押します。</li>
+          <li><span class="term">Output frame</span> スライダーで全体の流れを確認します。</li>
+          <li>必要に応じて <span class="term">Title</span>、<span class="term">Text Overlays</span>、<span class="term">Shape Overlays</span> を追加します。</li>
+          <li><span class="term">Play</span> でプレビューし、<span class="term">Export Movie</span> でMP4/AVIを書き出します。</li>
+        </ol>
+        <div class="note">
+          <b>大事な考え方:</b><br>
+          Source Frames は元のAFMフレームです。Clips は動画に使う区間です。
+          Output frame は、タイトル・trim・transitionを含めた「完成動画側のフレーム番号」です。
+        </div>
+        <h3>最初に試す設定</h3>
+        <ul>
+          <li>短い確認用なら <span class="term">FPS</span> は 5-10 程度から始めると見やすいです。</li>
+          <li>論文・発表用なら、まず小さめのサイズで試し書き出ししてから最終サイズにします。</li>
+          <li>表示色やcontrastはMovie Editor内ではなく、pyNuD本体側の表示状態を基準にします。</li>
+        </ul>
+        """,
+    ),
+    (
+        "画面の見方",
+        """
+        <h2>画面の役割</h2>
+        <table>
+          <tr><th>場所</th><th>役割</th><th>よく使う操作</th></tr>
+          <tr>
+            <td><span class="term">Preview</span></td>
+            <td>完成動画の1フレームを表示します。テキスト、図形、Color barもここで位置調整します。</td>
+            <td>ドラッグで移動、右クリックでstyle設定、テキストはダブルクリックで編集。</td>
+          </tr>
+          <tr>
+            <td><span class="term">Source Frames</span></td>
+            <td>読み込み済みAFMフレームの一覧です。</td>
+            <td>範囲選択してSource Clipを作成。右ドラッグでサムネイルサイズ変更。</td>
+          </tr>
+          <tr>
+            <td><span class="term">Clips</span></td>
+            <td>完成動画に並ぶ区間です。source clipとtitle clipが入ります。</td>
+            <td>選択してtransition、trim、順序変更を行います。</td>
+          </tr>
+          <tr>
+            <td><span class="term">Text / Shape Overlays</span></td>
+            <td>完成動画の上に重ねる文字・図形です。</td>
+            <td>Start/Endで表示期間を決め、Preview上で位置や形を調整します。</td>
+          </tr>
+          <tr>
+            <td><span class="term">Export</span></td>
+            <td>プレビュー再生、FPS、サイズ、形式、スケールバー、書き出しを管理します。</td>
+            <td>Playで確認し、Export Movieで保存します。</td>
+          </tr>
+        </table>
+        <div class="good">
+          Previewに見えている状態が、基本的に書き出し画像の基準です。
+          迷ったらOutput frameスライダーを動かして、目的のフレームで表示を確認してください。
+        </div>
+        """,
+    ),
+    (
+        "クリップ編集",
+        """
+        <h2>Clips の使い方</h2>
+        <h3>Source Clipを作る</h3>
+        <ol>
+          <li>Source Framesで使いたい開始フレームから終了フレームまでを選択します。</li>
+          <li><span class="term">Add Source Clip</span> を押します。</li>
+          <li>Clips表にsource clipが追加されます。</li>
+        </ol>
+        <h3>分割・trim・順序変更</h3>
+        <ul>
+          <li><span class="term">Output frame</span> スライダーを右クリックすると、現在位置でactive source clipを分割できます。</li>
+          <li><span class="term">Trim</span> は選択clipを通常出力から外します。</li>
+          <li><span class="term">Trimmed clips</span> で、trim済みclipをpreview timelineに表示するかを切り替えます。</li>
+          <li><span class="term">Move Up / Move Down</span> でclipの順序を変えます。</li>
+        </ul>
+        <h3>Transition</h3>
+        <ul>
+          <li><span class="term">Transition to next</span> は、選択clipから次のclipへ移る効果です。</li>
+          <li><span class="term">frames</span> はtransitionに使うフレーム数です。0なら即時切り替えです。</li>
+          <li><span class="term">black</span> はFade Black用の黒画面保持フレームです。</li>
+          <li><span class="term">Preview</span> を押すと、選択clip境界付近へ移動してtransitionを確認できます。</li>
+        </ul>
+        <div class="note">
+          Cross DissolveやFadeを使うと、clipの境界付近では前後のclipが混ざります。
+          overlayの表示タイミングは完成動画側のOutput frame番号で指定します。
+        </div>
+        """,
+    ),
+    (
+        "文字・図形",
+        """
+        <h2>Title / Text Overlay / Shape Overlay</h2>
+        <h3>Title</h3>
+        <ul>
+          <li><span class="term">Add Title at Start</span> は、動画の先頭にtitle clipを入れます。</li>
+          <li>Title clipはsource frameとは別のclipなので、Durationで長さを決めます。</li>
+          <li>既存title clipをClips表で選ぶと、内容やstyleを編集できます。</li>
+        </ul>
+        <h3>Text Overlays</h3>
+        <ul>
+          <li>本文とStart/Endを決めて <span class="term">Add Overlay</span> を押します。</li>
+          <li>Start/Endは完成動画側のOutput frame番号です。</li>
+          <li>Preview上でドラッグして位置を変えます。</li>
+          <li>Preview上の文字をダブルクリックすると直接編集できます。</li>
+          <li>右クリックするとfont、position、alignmentなどを調整できます。</li>
+        </ul>
+        <h3>Shape Overlays</h3>
+        <ul>
+          <li>Shape typeとStart/Endを決めて <span class="term">Add Shape</span> を押します。</li>
+          <li>Preview上でドラッグして移動、ハンドルでサイズ変更できます。</li>
+          <li>LineやArrowは端点を動かして向きと長さを調整します。</li>
+          <li>右クリックで色、線幅、fill、line style、arrowheadなどを変更できます。</li>
+        </ul>
+        <div class="good">
+          実用的には、最初にStart/Endを広めに入れてから、Output frameスライダーで確認しながら範囲を詰めると速いです。
+        </div>
+        """,
+    ),
+    (
+        "表示・書き出し",
+        """
+        <h2>Preview と Export</h2>
+        <h3>Preview</h3>
+        <ul>
+          <li><span class="term">Play</span> は現在のOutput frameから再生します。</li>
+          <li><span class="term">Loop</span> をONにすると、Loop rangeのStart-Endだけを繰り返します。</li>
+          <li>transitionや短いoverlayを確認するときはLoop rangeを狭くすると便利です。</li>
+        </ul>
+        <h3>Export設定</h3>
+        <table>
+          <tr><th>項目</th><th>意味</th></tr>
+          <tr><td>FPS</td><td>動画の再生速度です。大きいほど速く再生されます。</td></tr>
+          <tr><td>Width / Height</td><td>書き出す動画サイズです。偶数pixelに丸められます。</td></tr>
+          <tr><td>Quality</td><td>MP4/AVI再エンコード時の品質目安です。高いほどファイルが大きくなりやすいです。</td></tr>
+          <tr><td>Channel</td><td>1ch/2chデータのどちらを描画するかです。2chが無いデータでは2chは無効です。</td></tr>
+          <tr><td>Time stamp</td><td>pyNuD本体のtime stamp設定を使って表示します。</td></tr>
+          <tr><td>X scale bar</td><td>pyNuD本体のscale bar設定を使って表示します。</td></tr>
+          <tr><td>Color bar</td><td>現在のcolor/tone設定を使ってheight color barを表示します。</td></tr>
+        </table>
+        <h3>Session</h3>
+        <ul>
+          <li><span class="term">Save Session</span> はclip、overlay、transition、preview/export設定を保存します。</li>
+          <li>source dataもsession archiveへ含められるため、あとで作業を再開しやすくなります。</li>
+          <li><span class="term">Load Session</span> で保存時の状態を復元します。</li>
+        </ul>
+        """,
+    ),
+    (
+        "困ったとき",
+        """
+        <h2>よくあるトラブル</h2>
+        <table>
+          <tr><th>症状</th><th>確認すること</th></tr>
+          <tr>
+            <td>Source Framesが空</td>
+            <td>pyNuD本体でAFMデータが開かれているか確認し、Refresh Framesを押してください。</td>
+          </tr>
+          <tr>
+            <td>2chを選べない</td>
+            <td>読み込んでいるデータに2chが無い場合、Channelの2chは無効になります。</td>
+          </tr>
+          <tr>
+            <td>overlayが出ない</td>
+            <td>Start/Endが現在のOutput frameを含んでいるか確認してください。</td>
+          </tr>
+          <tr>
+            <td>transitionが見えない</td>
+            <td>Transition framesが0でないか、次のclipが存在するかを確認してください。</td>
+          </tr>
+          <tr>
+            <td>書き出しが遅い</td>
+            <td>Width/Heightを小さくする、Color barや多数のoverlayを一時的に減らす、短いrangeで試す、の順で確認してください。</td>
+          </tr>
+          <tr>
+            <td>色やcontrastが期待と違う</td>
+            <td>Movie EditorはpyNuD本体の表示色・tone設定を参照します。本体側の表示を整えてからRefresh/Previewしてください。</td>
+          </tr>
+        </table>
+        <div class="note">
+          迷ったら、短いclipを1つだけ作り、overlayを1つずつ追加してPreviewで確認してください。
+          複雑な編集は、Session保存をこまめに使うと戻りやすくなります。
+        </div>
+        """,
+    ),
+]
+
+HELP_TABS_EN = [
+    (
+        "Quick Start",
+        """
+        <h2>Build a movie in this order</h2>
+        <ol>
+          <li>Open AFM data in pyNuD and adjust the display color, tone, contrast, and scale-bar settings first.</li>
+          <li>Click <span class="term">Refresh Frames</span> to load the current AFM frames into Movie Editor.</li>
+          <li>Select the frame range you want in <span class="term">Source Frames</span>, then click <span class="term">Add Source Clip</span>.</li>
+          <li>Move the <span class="term">Output frame</span> slider to check the movie flow.</li>
+          <li>Add <span class="term">Title</span>, <span class="term">Text Overlays</span>, and <span class="term">Shape Overlays</span> as needed.</li>
+          <li>Use <span class="term">Play</span> to preview, then <span class="term">Export Movie</span> to write MP4 or AVI.</li>
+        </ol>
+        <div class="note">
+          <b>Core idea:</b><br>
+          Source Frames are the original AFM frames. Clips are the ranges used in the movie.
+          Output frame is the final movie timeline after titles, trims, and transitions are applied.
+        </div>
+        <h3>Good first settings</h3>
+        <ul>
+          <li>For quick checks, start around <span class="term">5-10 FPS</span>.</li>
+          <li>For presentation or publication movies, export a small test movie before the final size.</li>
+          <li>Color and contrast are based on the pyNuD main display, not an independent Movie Editor setting.</li>
+        </ul>
+        """,
+    ),
+    (
+        "Views",
+        """
+        <h2>What each area does</h2>
+        <table>
+          <tr><th>Area</th><th>Purpose</th><th>Common actions</th></tr>
+          <tr>
+            <td><span class="term">Preview</span></td>
+            <td>Shows one exported movie frame. Text, shapes, and Color bar positions are edited here.</td>
+            <td>Drag to move items, double-click text to edit it, and right-click supported items for style settings.</td>
+          </tr>
+          <tr>
+            <td><span class="term">Source Frames</span></td>
+            <td>Thumbnail list of loaded AFM frames.</td>
+            <td>Select a range for a source clip. Right-drag to resize thumbnails.</td>
+          </tr>
+          <tr>
+            <td><span class="term">Clips</span></td>
+            <td>Movie timeline made of source clips and title clips.</td>
+            <td>Select rows to edit transition, trim state, or ordering.</td>
+          </tr>
+          <tr>
+            <td><span class="term">Text / Shape Overlays</span></td>
+            <td>Text and drawings placed on top of the movie.</td>
+            <td>Set Start/End output frames, then adjust position and shape in Preview.</td>
+          </tr>
+          <tr>
+            <td><span class="term">Export</span></td>
+            <td>Controls preview playback, FPS, size, format, scale bars, and movie writing.</td>
+            <td>Check with Play, then save with Export Movie.</td>
+          </tr>
+        </table>
+        <div class="good">
+          The Preview is the best guide to the exported result.
+          If you are unsure, scrub the Output frame slider and inspect the frame you care about.
+        </div>
+        """,
+    ),
+    (
+        "Clip Editing",
+        """
+        <h2>Using Clips</h2>
+        <h3>Create a source clip</h3>
+        <ol>
+          <li>Select the start and end frames in Source Frames.</li>
+          <li>Click <span class="term">Add Source Clip</span>.</li>
+          <li>A source clip is added to the Clips table.</li>
+        </ol>
+        <h3>Split, trim, and reorder</h3>
+        <ul>
+          <li>Right-click the <span class="term">Output frame</span> slider to split the active source clip at the current position.</li>
+          <li><span class="term">Trim</span> removes the selected clip from normal output.</li>
+          <li><span class="term">Trimmed clips</span> chooses whether trimmed clips remain visible in the preview timeline.</li>
+          <li><span class="term">Move Up / Move Down</span> changes clip order.</li>
+        </ul>
+        <h3>Transitions</h3>
+        <ul>
+          <li><span class="term">Transition to next</span> applies from the selected clip to the next clip.</li>
+          <li><span class="term">frames</span> is the transition length. Zero means an immediate cut.</li>
+          <li><span class="term">black</span> is the black hold duration for Fade Black transitions.</li>
+          <li><span class="term">Preview</span> jumps near the selected clip boundary so you can inspect the transition.</li>
+        </ul>
+        <div class="note">
+          Cross Dissolve and Fade transitions mix neighboring clips around the boundary.
+          Overlay timing is specified in output-frame numbers on the final movie timeline.
+        </div>
+        """,
+    ),
+    (
+        "Text and Shapes",
+        """
+        <h2>Title / Text Overlay / Shape Overlay</h2>
+        <h3>Title</h3>
+        <ul>
+          <li><span class="term">Add Title at Start</span> inserts a title clip at the beginning.</li>
+          <li>A title clip is separate from source frames; set its length with Duration.</li>
+          <li>Select an existing title clip in the Clips table to edit its content and style.</li>
+        </ul>
+        <h3>Text Overlays</h3>
+        <ul>
+          <li>Enter text and Start/End, then click <span class="term">Add Overlay</span>.</li>
+          <li>Start/End are output-frame numbers on the final movie timeline.</li>
+          <li>Drag text in Preview to move it.</li>
+          <li>Double-click text in Preview to edit directly.</li>
+          <li>Right-click text to edit font, position, alignment, color, and background.</li>
+        </ul>
+        <h3>Shape Overlays</h3>
+        <ul>
+          <li>Choose a shape type and Start/End, then click <span class="term">Add Shape</span>.</li>
+          <li>Drag in Preview to move shapes, and use handles to resize them.</li>
+          <li>For Line and Arrow, move endpoints to adjust direction and length.</li>
+          <li>Right-click to edit color, line width, fill, line style, and arrowhead settings.</li>
+        </ul>
+        <div class="good">
+          A practical workflow is to enter a broad Start/End range first, then scrub the Output frame slider and tighten the range.
+        </div>
+        """,
+    ),
+    (
+        "Preview and Export",
+        """
+        <h2>Preview and Export</h2>
+        <h3>Preview</h3>
+        <ul>
+          <li><span class="term">Play</span> starts playback from the current Output frame.</li>
+          <li>When <span class="term">Loop</span> is ON, only the Loop range Start-End is repeated.</li>
+          <li>Use a narrow loop range to check transitions or short overlays.</li>
+        </ul>
+        <h3>Export settings</h3>
+        <table>
+          <tr><th>Item</th><th>Meaning</th></tr>
+          <tr><td>FPS</td><td>Playback speed. Larger values play faster.</td></tr>
+          <tr><td>Width / Height</td><td>Exported movie size. Values are rounded to even pixels when needed.</td></tr>
+          <tr><td>Quality</td><td>Encoding quality for MP4/AVI. Higher values usually create larger files.</td></tr>
+          <tr><td>Channel</td><td>AFM channel to render. 2ch is disabled if the loaded data has no second channel.</td></tr>
+          <tr><td>Time stamp</td><td>Uses the pyNuD main time-stamp settings.</td></tr>
+          <tr><td>X scale bar</td><td>Uses the pyNuD scale-bar settings.</td></tr>
+          <tr><td>Color bar</td><td>Shows the height color bar using the current color and tone settings.</td></tr>
+        </table>
+        <h3>Session</h3>
+        <ul>
+          <li><span class="term">Save Session</span> stores clips, overlays, transitions, preview/export settings, and optional source data.</li>
+          <li>The source data can be included in the session archive so work can be resumed later.</li>
+          <li><span class="term">Load Session</span> restores the saved Movie Editor state.</li>
+        </ul>
+        """,
+    ),
+    (
+        "Troubleshooting",
+        """
+        <h2>Common issues</h2>
+        <table>
+          <tr><th>Symptom</th><th>What to check</th></tr>
+          <tr>
+            <td>Source Frames is empty</td>
+            <td>Check that AFM data is open in pyNuD, then click Refresh Frames.</td>
+          </tr>
+          <tr>
+            <td>2ch cannot be selected</td>
+            <td>2ch is available only when the loaded AFM data contains a second channel.</td>
+          </tr>
+          <tr>
+            <td>An overlay does not appear</td>
+            <td>Check whether Start/End includes the current Output frame.</td>
+          </tr>
+          <tr>
+            <td>A transition is not visible</td>
+            <td>Check that transition frames is not zero and that there is a next clip.</td>
+          </tr>
+          <tr>
+            <td>Export is slow</td>
+            <td>Try smaller Width/Height, temporarily reduce Color bar or overlay complexity, or test a short range first.</td>
+          </tr>
+          <tr>
+            <td>Color or contrast looks wrong</td>
+            <td>Movie Editor uses pyNuD main display color and tone settings. Adjust the main display, then refresh and preview again.</td>
+          </tr>
+        </table>
+        <div class="note">
+          If the project becomes complex, make one short clip first and add overlays one by one.
+          Save Session often while editing.
+        </div>
+        """,
+    ),
+]
 
 SESSION_GV_KEYS = [
     "active_display_channel",
@@ -235,7 +689,9 @@ class PluginMovieScaleWidget(QtWidgets.QWidget):
 
     def _value_color(self) -> QtGui.QColor:
         color = self._values_style().get("color", QtGui.QColor(255, 255, 255))
-        if isinstance(color, QtGui.QColor):
+        if isinstance(color, QtGui.QColor) and not (
+            color.red() == 0 and color.green() == 0 and color.blue() == 0
+        ):
             return color
         return QtGui.QColor(255, 255, 255)
 
@@ -617,10 +1073,94 @@ class AFMMovieEditorWindow(QtWidgets.QWidget):
         widget.setStatusTip(plain_text)
         widget.setWhatsThis(wrapped_text)
 
+    @staticmethod
+    def _help_html(body: str) -> str:
+        return f"<html><head>{HELP_CSS}</head><body>{body}</body></html>"
+
+    def _show_help(self) -> None:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"{PLUGIN_NAME} Help")
+        dialog.resize(900, 720)
+
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        lang_row = QtWidgets.QHBoxLayout()
+        lang_row.addWidget(QtWidgets.QLabel("Language / 言語:"))
+        btn_ja = QtWidgets.QPushButton("日本語", dialog)
+        btn_en = QtWidgets.QPushButton("English", dialog)
+        btn_ja.setCheckable(True)
+        btn_en.setCheckable(True)
+        lang_group = QtWidgets.QButtonGroup(dialog)
+        lang_group.addButton(btn_ja)
+        lang_group.addButton(btn_en)
+        lang_group.setExclusive(True)
+        selected_style = "QPushButton { background-color: #007aff; color: white; font-weight: bold; }"
+        normal_style = "QPushButton { background-color: #e5e5e5; color: black; }"
+        lang_row.addWidget(btn_ja)
+        lang_row.addWidget(btn_en)
+        lang_row.addStretch(1)
+        layout.addLayout(lang_row)
+
+        heading = QtWidgets.QLabel("AFM Movie Editor Help")
+        heading_font = heading.font()
+        heading_font.setPointSize(max(heading_font.pointSize() + 3, 14))
+        heading_font.setBold(True)
+        heading.setFont(heading_font)
+        layout.addWidget(heading)
+
+        summary = QtWidgets.QLabel("")
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        tabs = QtWidgets.QTabWidget()
+        tabs.setDocumentMode(True)
+        layout.addWidget(tabs, stretch=1)
+
+        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        def set_lang(use_ja: bool) -> None:
+            btn_ja.setChecked(use_ja)
+            btn_en.setChecked(not use_ja)
+            btn_ja.setStyleSheet(selected_style if use_ja else normal_style)
+            btn_en.setStyleSheet(selected_style if not use_ja else normal_style)
+            heading.setText("AFM Movie Editor Help")
+            summary.setText(
+                "AFMフレームから発表用動画を作るための操作ガイドです。"
+                "左から順に読むと、最短手順から細かい編集まで追えます。"
+                if use_ja
+                else "Operation guide for building presentation-ready movies from AFM frames. "
+                "Read from left to right for the basic workflow, editing, export, and troubleshooting."
+            )
+            tabs.clear()
+            for title, html_text in (HELP_TABS_JA if use_ja else HELP_TABS_EN):
+                browser = QtWidgets.QTextBrowser()
+                browser.setOpenExternalLinks(False)
+                browser.setHtml(self._help_html(html_text))
+                browser.setMinimumWidth(720)
+                tabs.addTab(browser, title)
+
+        btn_ja.clicked.connect(lambda: set_lang(True))
+        btn_en.clicked.connect(lambda: set_lang(False))
+        set_lang(False)
+
+        dialog.exec_()
+
     def _setup_ui(self) -> None:
         tip = self._set_tip
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
+
+        menu_bar = QtWidgets.QMenuBar(self)
+        menu_bar.setNativeMenuBar(False)
+        help_menu = menu_bar.addMenu("Help")
+        manual_action = help_menu.addAction("Manual")
+        manual_action.setStatusTip("Open AFM Movie Editor help.")
+        manual_action.triggered.connect(self._show_help)
+        root.setMenuBar(menu_bar)
 
         self.main_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         root.addWidget(self.main_splitter, stretch=1)
@@ -1383,14 +1923,18 @@ class AFMMovieEditorWindow(QtWidgets.QWidget):
         session_layout.setSpacing(8)
         self.save_session_button = QtWidgets.QPushButton("Save Session")
         self.load_session_button = QtWidgets.QPushButton("Load Session")
+        self.help_button = QtWidgets.QPushButton("Help")
         self.save_session_button.clicked.connect(self._save_session)
         self.load_session_button.clicked.connect(self._load_session)
+        self.help_button.clicked.connect(self._show_help)
         tip(self.save_session_button, "Save clips, overlays, transitions, preview/export settings, and optional source data to an .afmmoviesession file.")
         tip(self.load_session_button, "Load an .afmmoviesession file and restore the saved Movie Editor state.")
-        for button in (self.save_session_button, self.load_session_button):
+        tip(self.help_button, "Open the AFM Movie Editor manual with the basic workflow, editing guide, export settings, and troubleshooting tips.")
+        for button in (self.save_session_button, self.load_session_button, self.help_button):
             button.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         session_layout.addWidget(self.save_session_button, 0, QtCore.Qt.AlignLeft)
         session_layout.addWidget(self.load_session_button, 0, QtCore.Qt.AlignLeft)
+        session_layout.addWidget(self.help_button, 0, QtCore.Qt.AlignLeft)
         session_layout.addStretch(1)
         right_layout.addWidget(session_group)
 
@@ -1820,10 +2364,49 @@ class AFMMovieEditorWindow(QtWidgets.QWidget):
     def _read_session_archive(self, session_path: str) -> Dict[str, Any]:
         if zipfile.is_zipfile(session_path):
             with zipfile.ZipFile(session_path, "r") as zf:
+                info = self._validated_session_member(
+                    zf,
+                    "session.json",
+                    _MAX_SESSION_JSON_BYTES,
+                )
                 with zf.open("session.json", "r") as f:
-                    return json.loads(f.read().decode("utf-8"))
-        with open(session_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+                    raw = f.read(info.file_size + 1)
+                if len(raw) > _MAX_SESSION_JSON_BYTES:
+                    raise ValueError("Session metadata exceeds the allowed size.")
+                return json.loads(raw.decode("utf-8"))
+        if os.path.getsize(session_path) > _MAX_SESSION_JSON_BYTES:
+            raise ValueError("Session metadata exceeds the allowed size.")
+        with open(session_path, "rb") as f:
+            raw = f.read(_MAX_SESSION_JSON_BYTES + 1)
+        if len(raw) > _MAX_SESSION_JSON_BYTES:
+            raise ValueError("Session metadata exceeds the allowed size.")
+        return json.loads(raw.decode("utf-8"))
+
+    @staticmethod
+    def _validated_session_member(
+        zf: zipfile.ZipFile,
+        member_name: str,
+        max_uncompressed_bytes: int,
+    ) -> zipfile.ZipInfo:
+        try:
+            info = zf.getinfo(member_name)
+        except KeyError as exc:
+            raise ValueError(f"Session archive is missing {member_name}.") from exc
+        if info.is_dir() or info.file_size < 0:
+            raise ValueError(f"Invalid session archive member: {member_name}")
+        if info.file_size > max_uncompressed_bytes:
+            raise ValueError(
+                f"Session archive member is too large: {member_name} "
+                f"({info.file_size} bytes)."
+            )
+        if info.file_size > _SESSION_COPY_CHUNK_BYTES:
+            compressed_size = max(1, int(info.compress_size))
+            ratio = float(info.file_size) / compressed_size
+            if ratio > _MAX_SESSION_COMPRESSION_RATIO:
+                raise ValueError(
+                    f"Session archive member has an unsafe compression ratio: {member_name}"
+                )
+        return info
 
     def _session_cache_dir(self, session_path: str) -> str:
         try:
@@ -1847,9 +2430,33 @@ class AFMMovieEditorWindow(QtWidgets.QWidget):
             cache_dir = self._session_cache_dir(session_path)
             os.makedirs(cache_dir, exist_ok=True)
             out_path = os.path.join(cache_dir, basename)
+            partial_path = f"{out_path}.part"
             with zipfile.ZipFile(session_path, "r") as zf:
-                with zf.open(member_name, "r") as src, open(out_path, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
+                info = self._validated_session_member(
+                    zf,
+                    member_name,
+                    _MAX_EMBEDDED_DATA_BYTES,
+                )
+                copied = 0
+                try:
+                    with zf.open(info, "r") as src, open(partial_path, "wb") as dst:
+                        while True:
+                            chunk = src.read(_SESSION_COPY_CHUNK_BYTES)
+                            if not chunk:
+                                break
+                            copied += len(chunk)
+                            if copied > _MAX_EMBEDDED_DATA_BYTES:
+                                raise ValueError("Embedded AFM data exceeds the allowed size.")
+                            dst.write(chunk)
+                    if copied != info.file_size:
+                        raise ValueError("Embedded AFM data is truncated.")
+                    os.replace(partial_path, out_path)
+                except Exception:
+                    try:
+                        os.remove(partial_path)
+                    except FileNotFoundError:
+                        pass
+                    raise
             return out_path
         original_path = str(source.get("original_path", "") or "")
         if original_path and os.path.isfile(original_path):
@@ -4495,8 +5102,11 @@ class AFMMovieEditorWindow(QtWidgets.QWidget):
         spec = self._color_bar_text_style.get("unit", {})
         unit_label.setFont(self._color_bar_font(spec, orientation))
         color = spec.get("color", QtGui.QColor(255, 255, 255))
-        if isinstance(color, QtGui.QColor):
-            unit_label.setStyleSheet(f"color: rgb({color.red()}, {color.green()}, {color.blue()});")
+        if not isinstance(color, QtGui.QColor) or (
+            color.red() == 0 and color.green() == 0 and color.blue() == 0
+        ):
+            color = QtGui.QColor(255, 255, 255)
+        unit_label.setStyleSheet(f"color: rgb({color.red()}, {color.green()}, {color.blue()});")
         unit_label.setAlignment(self._color_bar_align_for_position(str(spec.get("align", "Center"))))
         position = str(spec.get("position", "Top"))
         if getattr(cbw, "_plugin_unit_position", None) == position:
@@ -4561,6 +5171,12 @@ class AFMMovieEditorWindow(QtWidgets.QWidget):
             part_spec = shared.get(part)
             if isinstance(part_spec, dict):
                 self._color_bar_text_style.setdefault(part, {}).update(part_spec)
+            # Black is unreadable on the Color Bar background; coerce to white.
+            color = self._color_bar_text_style.get(part, {}).get("color")
+            if not isinstance(color, QtGui.QColor) or (
+                color.red() == 0 and color.green() == 0 and color.blue() == 0
+            ):
+                self._color_bar_text_style.setdefault(part, {})["color"] = QtGui.QColor(255, 255, 255)
 
     def _sync_color_bar_text_style_to_gv(self) -> None:
         if gv is None:

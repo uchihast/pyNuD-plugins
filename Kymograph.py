@@ -7716,35 +7716,6 @@ class KymographHistogramWindow(QtWidgets.QWidget):
         # 親ウィンドウへの参照を保存
         self.parent_window = parent
         
-    def closeEvent(self, event):
-        """ウィンドウが閉じられる時の処理"""
-        try:
-            # ウィンドウ管理システムから登録を削除
-            try:
-                from window_manager import unregister_pyNuD_window
-                unregister_pyNuD_window(self)
-            except ImportError:
-                pass
-            except Exception as e:
-                print(f"[WARNING] Failed to unregister KymographHistogramWindow: {e}")
-            
-            # Qtのデフォルトのクローズ処理
-            try:
-                super().closeEvent(event)
-            except RuntimeError:
-                print("[WARNING] C++ object already deleted during super().closeEvent()")
-            except Exception as e:
-                print(f"[WARNING] Failed to call super().closeEvent(): {e}")
-            
-            event.accept()
-            
-        except Exception as e:
-            print(f"[ERROR] Unexpected error in KymographHistogramWindow closeEvent: {e}")
-            import traceback
-            traceback.print_exc()
-            # エラーが発生してもイベントは受け入れる
-            event.accept()
-    
     def setupUI(self):
         layout = QtWidgets.QVBoxLayout(self)
         
@@ -7952,10 +7923,18 @@ class KymographHistogramWindow(QtWidgets.QWidget):
         
     def closeEvent(self, event):
         """ウィンドウが閉じられた時の処理"""
+        try:
+            from window_manager import unregister_pyNuD_window
+            unregister_pyNuD_window(self)
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"[WARNING] Failed to unregister KymographHistogramWindow: {e}")
+
         # 親ウィンドウの参照をクリア
         if hasattr(self.parent_window, 'histogram_window'):
             self.parent_window.histogram_window = None
-        event.accept()
+        super().closeEvent(event)
 
 
 def create_plugin(main_window):
