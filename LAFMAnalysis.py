@@ -6,6 +6,8 @@ import sys
 import time
 import os # <<< osモジュールをインポート
 import json
+import datetime
+import struct
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
 from scipy.ndimage import maximum_filter, gaussian_filter, zoom, rotate, shift
@@ -1052,6 +1054,21 @@ class LAFMPanelWindow(QtWidgets.QWidget):
 
     def closeEvent(self, event):
         """ウィンドウが閉じられるときに設定を保存する"""
+        thread = getattr(self, "thread", None)
+        try:
+            thread_is_running = thread is not None and thread.isRunning()
+        except RuntimeError:
+            thread_is_running = False
+        if thread_is_running:
+            event.ignore()
+            QtWidgets.QMessageBox.information(
+                self,
+                "Processing in progress",
+                "L-AFM processing is still running.\n"
+                "処理が完了してからウィンドウを閉じてください。",
+            )
+            return
+
         try:
             if not hasattr(gv, 'windowSettings'):
                 gv.windowSettings = {}
@@ -1443,6 +1460,8 @@ class LAFMPanelWindow(QtWidgets.QWidget):
         self.worker.finished.connect(on_finish)
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
+        self.worker.error.connect(self.thread.quit)
+        self.worker.error.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.started.connect(self.worker.run)
         self.thread.start()
@@ -2656,9 +2675,6 @@ class LAFMPanelWindow(QtWidgets.QWidget):
     def _save_lafm_as_asd(self, save_path, comment, image_data):
         """LAFMの2D画像を、輝度を正しく正規化してASD形式で保存する（堅牢版）"""
         try:
-            import struct
-            import datetime
-
             # --- ステップ1: ヘッダー情報の準備 ---
             y_pixels, x_pixels = image_data.shape
 
@@ -2668,7 +2684,7 @@ class LAFMPanelWindow(QtWidgets.QWidget):
             
             # 必須ヘッダー情報の存在をチェックし、なければデフォルト値を使用
             required_params = {
-                'FileType': 1, 'FrameHeaderSize': 64, 'TextEncoding': 0, 'DataType1ch': 20564,
+                'FileType': 1, 'FrameHeaderSize': 32, 'TextEncoding': 932, 'DataType1ch': 20564,
                 'DataType2ch': 0, 'ScanDirection': 0, 'ScanTryNum': 1, 'AveFlag': 0, 'AveNum': 1,
                 'XRound': 0, 'YRound': 0, 'FrameTime': 1000.0, 'Sensitivity': 1.0, 'PhaseSens': 1.0, 
                 'MachineNo': 0, 'ADRange': 0, 'ADResolution': 0, 'PiezoConstX': 1.0,
@@ -2677,6 +2693,15 @@ class LAFMPanelWindow(QtWidgets.QWidget):
             header_values = {}
             for param, default in required_params.items():
                 header_values[param] = getattr(gv, param, default)
+
+            header_values['FileType'] = 1
+            header_values['FrameHeaderSize'] = 32
+            header_values['TextEncoding'] = 932
+            if header_values['ADRange'] not in {
+                0x00000001, 0x00000002, 0x00000004,
+                0x00010000, 0x00020000, 0x00040000, 0x00800000,
+            }:
+                header_values['ADRange'] = 0x00040000
 
             # LAFM 2D保存は高さ[nm]として扱う（DataType1ch=20564）を強制する
             header_values['DataType1ch'] = 20564
@@ -2707,22 +2732,14 @@ class LAFMPanelWindow(QtWidgets.QWidget):
             else:
                 ope_name = gv.OpeName
 
-            # UTF-8エンコード
-            ope_name_bytes = ope_name.encode('utf-8')
-            comment_bytes = comment.encode('utf-8')
+            # TextEncoding=932 と実際の文字列バイト列を一致させる。
+            ope_name_bytes = ope_name.encode('cp932', errors='replace')
+            comment_bytes = comment.encode('cp932', errors='replace')
             ope_name_size = len(ope_name_bytes)
             comment_size_for_save = len(comment_bytes)
 
-            # ファイルヘッダーサイズを計算
-            original_file_header_size = getattr(gv, 'FileHeaderSize', 0)
-            original_comment_size = getattr(gv, 'CommentSize', 0)
-            
-            if original_file_header_size > 0 and original_comment_size > 0:
-                size = original_file_header_size - original_comment_size
-                file_header_size_for_save = size + comment_size_for_save
-            else:
-                fixed_header_size = 37 * 4 + 1  # 37個の4byte値 + AveFlag(1byte)
-                file_header_size_for_save = fixed_header_size + ope_name_size + comment_size_for_save
+            # ASD固定ヘッダーは165 bytes。
+            file_header_size_for_save = 165 + ope_name_size + comment_size_for_save
             
             # 時刻情報
             time_params = ['Year', 'Month', 'Day', 'Hour', 'Minute', 'Second']
@@ -2789,7 +2806,7 @@ class LAFMPanelWindow(QtWidgets.QWidget):
                 max_data_int = int(np.max(normalized_data))
                 # フレームヘッダー
                 f.seek(file_header_size_for_save)
-                f.write(struct.pack('<I', 0)); f.write(struct.pack('<H', max_data_int)); f.write(struct.pack('<H', min_data_int))
+                f.write(struct.pack('<I', 1)); f.write(struct.pack('<H', max_data_int)); f.write(struct.pack('<H', min_data_int))
                 f.write(struct.pack('<h', 0)); f.write(struct.pack('<h', 0)); f.write(struct.pack('<f', 0.0)); f.write(struct.pack('<f', 0.0))
                 f.write(struct.pack('<B', 0)); f.write(struct.pack('<B', 0)); f.write(struct.pack('<h', 0)); f.write(struct.pack('<i', 0)); f.write(struct.pack('<i', 0))
 

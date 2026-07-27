@@ -878,6 +878,24 @@ class ParticleClusterWindow(QtWidgets.QMainWindow):
         Saves current settings and notifies the parent window to update 
         toolbar highlights.
         """
+        running_workers = [
+            worker
+            for worker in (
+                getattr(self, "seg_worker", None),
+                getattr(self, "_fit_worker", None),
+            )
+            if worker is not None and worker.isRunning()
+        ]
+        if running_workers:
+            event.ignore()
+            QtWidgets.QMessageBox.information(
+                self,
+                "Analysis in progress",
+                "Segmentation or ellipse fitting is still running.\n"
+                "解析が完了してからウィンドウを閉じてください。",
+            )
+            return
+
         self.saveWindowSettings()
         
         # Disconnect from parent signals to prevent background processing
@@ -894,10 +912,6 @@ class ParticleClusterWindow(QtWidgets.QMainWindow):
             unregister_pyNuD_window(self)
         except ImportError:
             pass
-            
-        # Safety: Ensure worker isstopped
-        if hasattr(self, 'seg_worker') and self.seg_worker and self.seg_worker.isRunning():
-            self.seg_worker.wait(500) # Give it 500ms to finish or it will be abandoned by the OS
             
         if self.parent:
             if hasattr(self.parent, 'particle_cluster_action'): self.parent.setActionHighlight(self.parent.particle_cluster_action, False)
@@ -1186,7 +1200,7 @@ class ParticleClusterWindow(QtWidgets.QMainWindow):
         
         if self.manual_edit_btn.isChecked():
             # Manual Edit: Add or Remove
-            dist_threshold = 0.05 * v1
+            dist_threshold = 0.05 * v1_nm
             if len(self.particles) > 0 and idx != -1 and dists[idx] < dist_threshold:
                 # Remove nearest
                 self.particles = np.delete(self.particles, idx, axis=0)
@@ -1206,7 +1220,7 @@ class ParticleClusterWindow(QtWidgets.QMainWindow):
 
         if len(self.particles) == 0: return
 
-        if dists[idx] > (0.1 * v1): # Far click (10% of V1)
+        if dists[idx] > (0.1 * v1_nm): # Far click (10% of V1)
             self.update_particle_display()
             return
 
@@ -1214,7 +1228,7 @@ class ParticleClusterWindow(QtWidgets.QMainWindow):
         
         # Calculate Neighbors (logic from calculate_finger_tensor)
         try:
-            if v1 <= 0: 
+            if v1_nm <= 0:
                 self.update_particle_display(highlight_idx=idx)
                 return
 
@@ -1224,7 +1238,7 @@ class ParticleClusterWindow(QtWidgets.QMainWindow):
             
             # Neighbors within elliptical cutoff
             diff = coords_nm - coords_nm[idx]
-            ellip_dist_sq = (diff[:, 0] / v1)**2 + (diff[:, 1] / v2)**2
+            ellip_dist_sq = (diff[:, 0] / v1_nm)**2 + (diff[:, 1] / v2)**2
             candidate_indices = np.where((ellip_dist_sq <= 1.0) & (np.arange(len(coords_nm)) != idx))[0]
             
             # Top 6 by actual Euclidean distance
@@ -1235,7 +1249,7 @@ class ParticleClusterWindow(QtWidgets.QMainWindow):
                 neighbors = []
 
             # Display with highlights (ellipse parameters in nm)
-            ellipse_params = (self.particles[idx, 1], self.particles[idx, 0], v1, v2)
+            ellipse_params = (self.particles[idx, 1], self.particles[idx, 0], v1_nm, v2)
             self.update_particle_display(highlight_idx=idx, neighbors=neighbors, ellipse_params=ellipse_params)
             
         except Exception as e:
