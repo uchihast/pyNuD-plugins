@@ -6,35 +6,72 @@ pyNuD Simulator - AFM image simulation from PDB/CIF/MRC.
 - pyNuD plugin (AFM Simulator): VTK-only interactive 3D view.
 - Standalone pyNuD Simulator: PyMOL + VTK (launch via __main__).
 
-Version: 1.2.2
+Version: 2.0.0
 """
 
-__version__ = "1.2.2"
+__version__ = "2.0.0"
 
 import sys
 import numpy as np
 import os
-import json
+import json 
 import html
 import re
-import struct  # ★★★ 追加 ★★★
 import datetime # ★★★ 追加 ★★★
 import time
 import tempfile
 import subprocess
 import math
+import argparse
+import importlib
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                            QHBoxLayout, QGridLayout, QLabel, QPushButton,
+
+# Bundle AFM Simulator support modules next to this file (plugins/ or
+# flat download folder). Prefer them over any older app-installed copies.
+_AFM_SIM_DIR = Path(__file__).resolve().parent
+_afm_sim_dir_str = str(_AFM_SIM_DIR)
+if _afm_sim_dir_str in sys.path:
+    sys.path.remove(_afm_sim_dir_str)
+sys.path.insert(0, _afm_sim_dir_str)
+
+from flexible_fit_backends import (
+    AfmfitRunConfig,
+    FlexibleFitBackendCanceled,
+    FlexibleFitBackendError,
+    NmffRunConfig,
+    NolbRunConfig,
+    align_coordinates_kabsch,
+    estimate_clash_safe_nma_amplitude,
+    estimate_image_correlation_translation,
+    estimate_nma_fit_parameters,
+    estimate_phase_correlation_translation,
+    evaluate_nolb_candidate_safety,
+    estimate_pose_foreground_translation,
+    heavy_atom_indices,
+    is_flexible_fit_score_improvement,
+    introduces_severe_atomic_clash,
+    read_mapped_pdb_coordinate_models,
+    probe_afmfit_environment,
+    prepare_pose_image_correlation_signal,
+    run_afmfit_external,
+    resolve_executable,
+    run_iterative_nmff,
+    run_nolb_ensemble,
+    score_pose_foreground_alignment,
+    select_flexible_fit_coordinates,
+)
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                            QHBoxLayout, QGridLayout, QLabel, QPushButton, 
                             QSlider, QComboBox, QSpinBox, QDoubleSpinBox,
                             QGroupBox, QFileDialog, QMessageBox, QTextEdit,
                             QSplitter, QFrame, QCheckBox, QScrollArea,
                             QColorDialog, QTabWidget, QProgressBar, QInputDialog, QAction,
                             QTreeWidget, QTextBrowser, QTreeWidgetItem, QSpacerItem, QSizePolicy, QLineEdit, QDialog, QProgressDialog,
-                            QStackedLayout, QMenu)
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QTime, QSettings, QEventLoop, QEvent, QObject, QRect
-from PyQt5.QtGui import QFont, QColor, QPixmap, QIcon, QPaintEvent
+                            QStackedLayout, QMenu, QDialogButtonBox)
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QTime, QSettings, QEventLoop, QEvent, QObject, QRect, QUrl
+from PyQt5.QtGui import QFont, QColor, QPixmap, QIcon, QPaintEvent, QDesktopServices
 from PyQt5.QtCore import QThread, pyqtSignal
 
 # Support plugin launch: use globalvals when run from pyNuD, else minimal stub.
@@ -139,6 +176,11 @@ except Exception as e:
 
 STANDARD_FONT = "Helvetica"
 
+# Manual Detect Domains / Rigid Domains UI cap. Auto still searches a smaller
+# range to avoid fragmented high-count assignments on AFM-scale data.
+MAX_FLEXIBLE_FIT_DOMAINS = 24
+AUTO_DOMAIN_SEARCH_MAX = 8
+
 # VTK 9.x compatibility: Try different import methods for Qt integration
 try:
     # Try VTK 9.x import method
@@ -171,8 +213,12 @@ except ImportError:
 # Numbaをインポートして計算を高速化（オプション）
 
 import scipy.ndimage
-
 from scipy.fft import fft2, ifft2, fftshift, ifftshift # ★★★ この行を追加 ★★★
+from scipy.sparse import coo_matrix, diags
+from scipy.sparse.csgraph import connected_components
+from scipy.sparse.linalg import eigsh
+from scipy.spatial import cKDTree
+from scipy.optimize import minimize
 
 # Numbaをインポートして計算を高速化（オプションですが強く推奨します）
 try:
@@ -312,7 +358,6 @@ def _mean_silhouette(features, labels, sample_limit=500):
 
 def _anm_modes_with_prody(ca_coords_nm, cutoff_nm, n_modes):
     """Optional ProDy ANM path. Raises on any issue so fallback remains simple."""
-    import importlib
     prody = importlib.import_module("prody")
     if hasattr(prody, "confProDy"):
         try:
@@ -333,7 +378,6 @@ def _anm_modes_numpy(ca_coords_nm, cutoff_nm, n_modes):
     if n < 2:
         return np.zeros(0, dtype=float), np.zeros((3 * n, 0), dtype=float), "numpy"
 
-    from scipy.spatial import cKDTree
     pairs = list(cKDTree(coords).query_pairs(float(cutoff_nm)))
     if not pairs:
         # Disconnected structures cannot define ANM modes; connect neighbors as
@@ -359,8 +403,6 @@ def _anm_modes_numpy(ca_coords_nm, cutoff_nm, n_modes):
             H[sj, sj] -= off
         eigvals, eigvecs = np.linalg.eigh(H)
     else:
-        from scipy.sparse import coo_matrix
-        from scipy.sparse.linalg import eigsh
         rows = []
         cols = []
         vals = []
@@ -403,31 +445,386 @@ def _features_from_anm_modes(ca_coords_nm, eigvals, eigvecs, n_modes):
     n = coords.shape[0]
     eigvals = np.asarray(eigvals, dtype=float)
     eigvecs = np.asarray(eigvecs, dtype=float)
-    start = min(6, eigvecs.shape[1])
-    stop = min(eigvecs.shape[1], start + int(max(1, n_modes)))
+
+    # ProDy normally omits rigid-body zero modes, while the NumPy path returns
+    # them. Disconnected ENM graphs can have more than six zero modes. Select
+    # modes by eigenvalue instead of unconditionally discarding six columns.
+    if eigvals.size:
+        zero_tol = max(1e-8, float(np.max(np.abs(eigvals))) * 1e-8)
+        mode_indices = np.where(eigvals > zero_tol)[0][:int(max(1, n_modes))]
+    else:
+        mode_indices = np.array([], dtype=int)
     chunks = []
-    for mode_idx in range(start, stop):
+    for mode_idx in mode_indices:
+        if mode_idx >= eigvecs.shape[1]:
+            continue
         lam = max(float(abs(eigvals[mode_idx])) if mode_idx < eigvals.size else 1.0, 1e-8)
         chunks.append(eigvecs[:, mode_idx].reshape(n, 3) / math.sqrt(lam))
     if chunks:
-        features = np.concatenate(chunks, axis=1)
+        mode_features = np.concatenate(chunks, axis=1)
+        mode_features -= np.mean(mode_features, axis=0, keepdims=True)
+        mode_scale = max(float(np.sqrt(np.mean(mode_features * mode_features))), 1e-8)
+        mode_features = mode_features / mode_scale / math.sqrt(max(1, mode_features.shape[1]))
     else:
-        features = coords - np.mean(coords, axis=0)
+        mode_features = np.zeros((n, 0), dtype=float)
 
-    norms = np.linalg.norm(features, axis=1, keepdims=True)
-    if np.any(norms > 1e-12):
-        features = features / np.maximum(norms, 1e-12)
+    # Geometry is required to keep each predicted domain spatially coherent.
+    # Use one isotropic scale (not per-axis standardization), preserving the
+    # distinction between separated lobes even for elongated structures.
+    geometry = coords - np.mean(coords, axis=0, keepdims=True)
+    geometry_scale = max(float(np.sqrt(np.mean(geometry * geometry))), 1e-8)
+    geometry = geometry / geometry_scale
+    if mode_features.shape[1] == 0:
+        return geometry
+    return np.concatenate([geometry, 0.25 * mode_features], axis=1)
+
+
+def prepare_nma_atom_mode_basis(
+    eigvals,
+    eigvecs,
+    n_nodes,
+    atom_to_node,
+    n_modes,
+):
+    """Expand low-frequency node modes to all atoms with 1 nm RMS normalization.
+
+    Returned amplitudes therefore have units of nm RMS displacement. Atoms
+    without a C-alpha/P residue mapping receive zero displacement.
+    """
+    eigvals = np.asarray(eigvals, dtype=float)
+    eigvecs = np.asarray(eigvecs, dtype=float)
+    atom_to_node = np.asarray(atom_to_node, dtype=int)
+    n_nodes = int(n_nodes)
+    if (
+        n_nodes < 1
+        or eigvecs.ndim != 2
+        or eigvecs.shape[0] != 3 * n_nodes
+        or atom_to_node.ndim != 1
+    ):
+        raise ValueError("Invalid NMA eigenvectors or atom-to-node mapping")
+
+    if eigvals.size:
+        zero_tolerance = max(
+            1e-8,
+            float(np.max(np.abs(eigvals))) * 1e-8,
+        )
+        mode_indices = np.where(eigvals > zero_tolerance)[0]
     else:
-        features = coords - np.mean(coords, axis=0)
-    return features
+        mode_indices = np.array([], dtype=int)
+    mode_indices = mode_indices[:max(1, int(n_modes))]
+
+    atom_modes = []
+    selected_eigenvalues = []
+    selected_indices = []
+    valid_atoms = (
+        (atom_to_node >= 0)
+        & (atom_to_node < n_nodes)
+    )
+    for mode_index in mode_indices:
+        if mode_index >= eigvecs.shape[1]:
+            continue
+        node_mode = np.asarray(
+            eigvecs[:, mode_index], dtype=float
+        ).reshape(n_nodes, 3)
+        rms = float(np.sqrt(np.mean(np.sum(node_mode * node_mode, axis=1))))
+        if not np.isfinite(rms) or rms <= 1e-12:
+            continue
+        node_mode = node_mode / rms
+        atom_mode = np.zeros((atom_to_node.size, 3), dtype=float)
+        atom_mode[valid_atoms] = node_mode[atom_to_node[valid_atoms]]
+        atom_modes.append(atom_mode)
+        selected_eigenvalues.append(float(eigvals[mode_index]))
+        selected_indices.append(int(mode_index))
+
+    if not atom_modes:
+        return (
+            np.zeros((0, atom_to_node.size, 3), dtype=float),
+            np.array([], dtype=float),
+            np.array([], dtype=int),
+        )
+    return (
+        np.asarray(atom_modes, dtype=float),
+        np.asarray(selected_eigenvalues, dtype=float),
+        np.asarray(selected_indices, dtype=int),
+    )
 
 
-def detect_domains_enm(ca_coords, cutoff_nm=1.3, n_modes=8, n_domains=None):
-    """Detect likely flexible ENM domains from C-alpha/P coordinates.
+def _normalize_domain_features(features):
+    """Center and isotropically scale one domain-feature block."""
+    values = np.asarray(features, dtype=float)
+    if values.ndim != 2 or values.shape[1] == 0:
+        return np.zeros((values.shape[0], 0), dtype=float)
+    values = values - np.mean(values, axis=0, keepdims=True)
+    scale = max(float(np.sqrt(np.mean(values * values))), 1e-8)
+    return values / scale / math.sqrt(max(1, values.shape[1]))
 
-    Scientific note: ENM domains are a prediction of where the structure can
-    bend, not a ground truth segmentation. Judge validity by whether fitting
-    improves with physically reasonable transforms and penalties.
+
+def _contact_graph_domain_features(
+    coords,
+    chain_ids=None,
+    residue_ids=None,
+    b_factors=None,
+    secondary_structure=None,
+    contact_cutoff_nm=1.2,
+    n_features=6,
+):
+    """Build spectral contact-map features with chain and linker priors."""
+    coords = np.asarray(coords, dtype=float)
+    n = int(coords.shape[0])
+    if n < 2:
+        return np.zeros((n, 0), dtype=float), {
+            "contact_edges": 0,
+            "contact_components": n,
+            "chain_count": 1,
+            "plddt_used": False,
+        }
+
+    if chain_ids is None or len(chain_ids) != n:
+        chains = np.array([" "] * n, dtype=object)
+    else:
+        chains = np.array(
+            [str(value).strip() or " " for value in chain_ids],
+            dtype=object,
+        )
+    residues = (
+        np.asarray(residue_ids)
+        if residue_ids is not None and len(residue_ids) == n else None
+    )
+    secondary = (
+        np.asarray(secondary_structure)
+        if secondary_structure is not None and len(secondary_structure) == n
+        else None
+    )
+    unique_chains = list(dict.fromkeys(chains.tolist()))
+
+    plddt = None
+    if b_factors is not None and len(b_factors) == n:
+        candidate = np.asarray(b_factors, dtype=float)
+        finite = candidate[np.isfinite(candidate)]
+        # Crystallographic B factors and AlphaFold pLDDT share the same field.
+        # Only use it as confidence when the distribution strongly resembles
+        # AlphaFold output; otherwise it remains ordinary temperature-factor data.
+        if (
+            finite.size >= max(4, int(0.8 * n))
+            and np.mean((finite >= 0.0) & (finite <= 100.0)) >= 0.95
+            and np.mean(finite >= 50.0) >= 0.80
+            and float(np.median(finite)) >= 70.0
+            and float(np.percentile(finite, 90.0)) <= 100.0
+        ):
+            plddt = np.clip(candidate, 0.0, 100.0)
+
+    edge_weights = {}
+
+    def add_edge(i, j, weight):
+        if i == j or weight <= 0.0:
+            return
+        key = (min(int(i), int(j)), max(int(i), int(j)))
+        edge_weights[key] = max(float(weight), edge_weights.get(key, 0.0))
+
+    tree = cKDTree(coords)
+    for i, j in tree.query_pairs(float(contact_cutoff_nm)):
+        distance = float(np.linalg.norm(coords[j] - coords[i]))
+        weight = math.exp(-((distance / 0.75) ** 2))
+        # Inter-chain contacts remain available, but chain membership is a prior:
+        # only genuine, close interfaces can overcome the reduced edge weight.
+        if chains[i] != chains[j]:
+            weight *= 0.65
+        add_edge(i, j, weight)
+
+    # Polymer-neighbor edges preserve sequence continuity. A low-confidence
+    # AlphaFold linker weakens, but never completely removes, this connection.
+    for i in range(n - 1):
+        if chains[i] != chains[i + 1]:
+            continue
+        if residues is not None:
+            try:
+                if int(residues[i + 1]) - int(residues[i]) != 1:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        distance = float(np.linalg.norm(coords[i + 1] - coords[i]))
+        if distance > 0.75:
+            continue
+        sequence_weight = 1.8
+        if (
+            secondary is not None
+            and str(secondary[i]) in ("H", "E")
+            and str(secondary[i]) == str(secondary[i + 1])
+        ):
+            # HELIX/SHEET records are weak "do not cut here" evidence.
+            sequence_weight *= 1.35
+        if plddt is not None:
+            confidence = min(float(plddt[i]), float(plddt[i + 1]))
+            sequence_weight *= 0.25 + 0.75 * np.clip(
+                (confidence - 30.0) / 50.0, 0.0, 1.0
+            )
+        add_edge(i, i + 1, sequence_weight)
+
+    if not edge_weights:
+        return np.zeros((n, 0), dtype=float), {
+            "contact_edges": 0,
+            "contact_components": n,
+            "chain_count": len(unique_chains),
+            "plddt_used": plddt is not None,
+        }
+
+    rows = []
+    cols = []
+    values = []
+    for (i, j), weight in edge_weights.items():
+        rows.extend((i, j))
+        cols.extend((j, i))
+        values.extend((weight, weight))
+    adjacency = coo_matrix(
+        (values, (rows, cols)), shape=(n, n), dtype=float
+    ).tocsr()
+    component_count, _component_labels = connected_components(
+        adjacency, directed=False
+    )
+    degrees = np.asarray(adjacency.sum(axis=1)).ravel()
+    inv_sqrt = np.zeros_like(degrees)
+    positive = degrees > 1e-12
+    inv_sqrt[positive] = 1.0 / np.sqrt(degrees[positive])
+    normalized_adjacency = diags(inv_sqrt) @ adjacency @ diags(inv_sqrt)
+    laplacian = diags(np.ones(n, dtype=float)) - normalized_adjacency
+
+    requested = min(max(2, int(n_features) + int(component_count)), n - 1)
+    try:
+        if n <= 180:
+            eigenvalues, eigenvectors = np.linalg.eigh(laplacian.toarray())
+            eigenvalues = eigenvalues[:requested + 1]
+            eigenvectors = eigenvectors[:, :requested + 1]
+        else:
+            eigenvalues, eigenvectors = eigsh(
+                laplacian, k=requested, which="SM"
+            )
+            order = np.argsort(eigenvalues)
+            eigenvalues = eigenvalues[order]
+            eigenvectors = eigenvectors[:, order]
+    except Exception:
+        return np.zeros((n, 0), dtype=float), {
+            "contact_edges": len(edge_weights),
+            "contact_components": int(component_count),
+            "chain_count": len(unique_chains),
+            "plddt_used": plddt is not None,
+            "contact_spectral_fallback": True,
+        }
+
+    zero_tolerance = max(
+        1e-8,
+        float(np.max(np.abs(eigenvalues))) * 1e-8
+        if len(eigenvalues) else 1e-8,
+    )
+    nonzero = np.where(np.asarray(eigenvalues) > zero_tolerance)[0].tolist()
+    # For disconnected contact graphs, retain all but the global zero mode so
+    # component identity itself contributes to the embedding.
+    component_modes = list(
+        range(1, min(int(component_count), eigenvectors.shape[1]))
+    )
+    selected = []
+    for index in component_modes + nonzero:
+        if index not in selected:
+            selected.append(index)
+        if len(selected) >= max(1, int(n_features)):
+            break
+    selected = np.asarray(selected, dtype=int)
+    spectral = (
+        eigenvectors[:, selected]
+        if selected.size else np.zeros((n, 0), dtype=float)
+    )
+    spectral = _normalize_domain_features(spectral)
+
+    # A small one-hot chain block is a prior, not a hard boundary. Strong
+    # inter-chain contact and ENM agreement can still put chains in one domain.
+    chain_features = np.zeros((n, 0), dtype=float)
+    if 1 < len(unique_chains) <= 12:
+        chain_lookup = {chain: index for index, chain in enumerate(unique_chains)}
+        chain_features = np.zeros((n, len(unique_chains)), dtype=float)
+        for index, chain in enumerate(chains):
+            chain_features[index, chain_lookup[chain]] = 1.0
+        chain_features = _normalize_domain_features(chain_features)
+
+    blocks = []
+    if spectral.shape[1]:
+        blocks.append(0.70 * spectral)
+    if chain_features.shape[1]:
+        blocks.append(0.30 * chain_features)
+    features = (
+        np.concatenate(blocks, axis=1)
+        if blocks else np.zeros((n, 0), dtype=float)
+    )
+    info = {
+        "contact_edges": len(edge_weights),
+        "contact_components": int(component_count),
+        "chain_count": len(unique_chains),
+        "plddt_used": plddt is not None,
+        "contact_cutoff_nm": float(contact_cutoff_nm),
+        "secondary_structure_used": bool(
+            secondary is not None
+            and np.any(np.isin(secondary.astype(str), ("H", "E")))
+        ),
+    }
+    return features, info
+
+
+def _domain_sequence_fragmentation(labels, chain_ids):
+    """Return excess repeated runs of the same domain along polymer chains."""
+    labels = np.asarray(labels, dtype=int)
+    if labels.size < 2 or chain_ids is None or len(chain_ids) != labels.size:
+        return 0.0
+    chains = np.asarray([str(value).strip() or " " for value in chain_ids])
+    excess_runs = 0
+    for chain in dict.fromkeys(chains.tolist()):
+        chain_labels = labels[chains == chain]
+        if chain_labels.size < 2:
+            continue
+        runs = 1 + int(np.count_nonzero(chain_labels[1:] != chain_labels[:-1]))
+        excess_runs += max(0, runs - len(np.unique(chain_labels)))
+    return float(excess_runs) / float(max(1, labels.size))
+
+
+def _merge_tiny_domain_clusters(coords, labels, min_size):
+    """Merge tiny k-means fragments into the nearest substantial domain."""
+    coords = np.asarray(coords, dtype=float)
+    labels = np.asarray(labels, dtype=int).copy()
+    min_size = int(max(1, min_size))
+    unique, counts = np.unique(labels, return_counts=True)
+    large = [int(label) for label, count in zip(unique, counts) if int(count) >= min_size]
+    if not large:
+        large = [int(unique[int(np.argmax(counts))])]
+    centroids = {
+        label: np.mean(coords[labels == label], axis=0)
+        for label in large
+    }
+    for label, count in zip(unique, counts):
+        label = int(label)
+        if int(count) >= min_size or label in large:
+            continue
+        indices = np.where(labels == label)[0]
+        for index in indices:
+            nearest = min(
+                large,
+                key=lambda candidate: float(np.linalg.norm(coords[index] - centroids[candidate])),
+            )
+            labels[index] = nearest
+    relabel = {old: new for new, old in enumerate(sorted(int(v) for v in np.unique(labels)))}
+    return np.asarray([relabel[int(value)] for value in labels], dtype=int)
+
+
+def detect_domains_enm(
+    ca_coords,
+    cutoff_nm=1.3,
+    n_modes=8,
+    n_domains=None,
+    chain_ids=None,
+    residue_ids=None,
+    b_factors=None,
+    secondary_structure=None,
+):
+    """Detect domains using PDB metadata, contacts, geometry, and ENM modes.
+
+    Scientific note: hybrid domains remain a prediction rather than ground
+    truth. Judge validity by structural coherence and fit improvement.
     """
     coords = np.asarray(ca_coords, dtype=float)
     if coords.ndim != 2 or coords.shape[1] != 3:
@@ -447,20 +844,63 @@ def detect_domains_enm(ca_coords, cutoff_nm=1.3, n_modes=8, n_domains=None):
     else:
         prody_message = ""
 
-    features = _features_from_anm_modes(coords, eigvals, eigvecs, n_modes)
-    max_d = int(max(1, min(12, n)))
+    enm_features = _features_from_anm_modes(
+        coords, eigvals, eigvecs, n_modes
+    )
+    contact_features, hybrid_info = _contact_graph_domain_features(
+        coords,
+        chain_ids=chain_ids,
+        residue_ids=residue_ids,
+        b_factors=b_factors,
+        secondary_structure=secondary_structure,
+        contact_cutoff_nm=min(float(cutoff_nm), 1.2),
+        n_features=min(8, int(n_modes)),
+    )
+    if contact_features.shape[1]:
+        features = np.concatenate(
+            [0.65 * enm_features, contact_features], axis=1
+        )
+        method = f"hybrid-{method}"
+    else:
+        features = enm_features
+    max_manual = int(max(1, min(int(MAX_FLEXIBLE_FIT_DOMAINS), n)))
+    max_auto = int(max(1, min(int(AUTO_DOMAIN_SEARCH_MAX), n)))
+    min_cluster_size = max(2, int(math.ceil(0.03 * n)))
     if n_domains is not None:
-        suggested = int(max(1, min(max_d, n_domains)))
+        suggested = int(max(1, min(max_manual, int(n_domains))))
         labels = _kmeans_numpy(features, suggested)
+        labels = _merge_tiny_domain_clusters(coords, labels, min_cluster_size)
+        suggested = int(len(np.unique(labels)))
         sil = _mean_silhouette(features, labels) if suggested > 1 else 0.0
     else:
-        best = (1, np.zeros(n, dtype=int), -1.0)
-        for d in range(2, max(3, min(8, n) + 1)):
+        # Flexible fitting needs at least two domains. Penalize unnecessary
+        # complexity so Auto does not select many fragmented clusters merely
+        # for a marginal silhouette increase.
+        best = None
+        for d in range(2, max_auto + 1):
             labels_d = _kmeans_numpy(features, d)
+            labels_d = _merge_tiny_domain_clusters(coords, labels_d, min_cluster_size)
+            actual_d = int(len(np.unique(labels_d)))
+            if actual_d < 2:
+                continue
             sil_d = _mean_silhouette(features, labels_d)
-            if sil_d > best[2]:
-                best = (d, labels_d, sil_d)
-        suggested, labels, sil = best
+            fragmentation = _domain_sequence_fragmentation(
+                labels_d, chain_ids
+            )
+            adjusted = (
+                float(sil_d)
+                - 0.03 * max(0, actual_d - 2)
+                - 0.20 * fragmentation
+            )
+            if best is None or adjusted > best[3]:
+                best = (actual_d, labels_d, sil_d, adjusted)
+        if best is None:
+            labels = _kmeans_numpy(features, min(2, n))
+            labels = _merge_tiny_domain_clusters(coords, labels, min_cluster_size)
+            suggested = int(len(np.unique(labels)))
+            sil = _mean_silhouette(features, labels) if suggested > 1 else 0.0
+        else:
+            suggested, labels, sil, _adjusted = best
 
     info = {
         "method": method,
@@ -468,12 +908,219 @@ def detect_domains_enm(ca_coords, cutoff_nm=1.3, n_modes=8, n_domains=None):
         "cutoff_nm": float(cutoff_nm),
         "n_modes": int(n_modes),
         "suggested_D": int(suggested),
+        "max_domains_manual": int(max_manual),
+        "max_domains_auto": int(max_auto),
         "silhouette": float(sil),
         "eigvals": np.asarray(eigvals[: min(len(eigvals), int(n_modes) + 6)], dtype=float).tolist(),
     }
+    info.update(hybrid_info)
+    info["uses_chain_prior"] = bool(hybrid_info.get("chain_count", 1) > 1)
+    info["uses_contact_map"] = bool(hybrid_info.get("contact_edges", 0) > 0)
+    info["sequence_fragmentation"] = _domain_sequence_fragmentation(
+        labels, chain_ids
+    )
     if prody_message:
         info["prody_fallback"] = prody_message
     return np.asarray(labels, dtype=int), int(suggested), info
+
+
+def _partition_indices_into_blocks(n_items, n_blocks):
+    """Split ``0..n_items-1`` into ``n_blocks`` contiguous index blocks."""
+    n_items = int(max(0, n_items))
+    n_blocks = int(max(1, min(n_blocks, max(1, n_items))))
+    if n_items == 0:
+        return []
+    edges = [
+        int(round(i * n_items / float(n_blocks)))
+        for i in range(n_blocks + 1)
+    ]
+    blocks = []
+    for start, end in zip(edges[:-1], edges[1:]):
+        if end > start:
+            blocks.append(np.arange(start, end, dtype=int))
+    return blocks
+
+
+def detect_domains_oligomer_enm(
+    ca_coords,
+    chain_ids,
+    domains_per_monomer,
+    n_monomers=None,
+    use_pdb_chains=True,
+    cutoff_nm=1.3,
+    n_modes=8,
+    residue_ids=None,
+    b_factors=None,
+    secondary_structure=None,
+):
+    """Detect domains as (monomers/chains) × (domains per monomer).
+
+    Each monomer/chain is partitioned independently, then domain IDs are
+    renumbered globally. When ``use_pdb_chains`` is true, polymer Chain IDs
+    define the monomers. Otherwise a single-chain model can be split into
+    ``n_monomers`` contiguous sequence blocks first.
+    """
+    coords = np.asarray(ca_coords, dtype=float)
+    if coords.ndim != 2 or coords.shape[1] != 3:
+        raise ValueError("ca_coords must be an (N, 3) array")
+    n = coords.shape[0]
+    domains_per_monomer = int(max(1, domains_per_monomer))
+    if n == 0:
+        return np.array([], dtype=int), 0, {
+            "method": "oligomer-none",
+            "reason": "no_nodes",
+        }
+    if chain_ids is None or len(chain_ids) != n:
+        chain_ids = np.asarray(["A"] * n, dtype=object)
+    else:
+        chain_ids = np.asarray(
+            [str(value).strip() or " " for value in chain_ids],
+            dtype=object,
+        )
+
+    unique_chains = list(dict.fromkeys(chain_ids.tolist()))
+    group_indices = []
+    grouping = "pdb_chains"
+    notes = []
+
+    if use_pdb_chains or len(unique_chains) > 1:
+        grouping = "pdb_chains"
+        if (
+            n_monomers is not None
+            and int(n_monomers) != len(unique_chains)
+        ):
+            notes.append(
+                f"requested_monomers={int(n_monomers)} "
+                f"pdb_chains={len(unique_chains)}; using PDB chains"
+            )
+        for chain in unique_chains:
+            group_indices.append(np.where(chain_ids == chain)[0])
+    else:
+        grouping = "sequence_blocks"
+        n_blocks = int(
+            max(1, n_monomers if n_monomers is not None else 1)
+        )
+        order = np.arange(n, dtype=int)
+        if residue_ids is not None and len(residue_ids) == n:
+            try:
+                order = np.argsort(
+                    np.asarray(residue_ids, dtype=float), kind="mergesort"
+                )
+            except Exception:
+                order = np.arange(n, dtype=int)
+        for block in _partition_indices_into_blocks(n, n_blocks):
+            group_indices.append(np.asarray(order[block], dtype=int))
+
+    labels = np.full(n, -1, dtype=int)
+    next_domain = 0
+    per_group = []
+    silhouettes = []
+    methods = []
+    for group_idx, indices in enumerate(group_indices):
+        indices = np.asarray(indices, dtype=int)
+        if indices.size == 0:
+            continue
+        k = int(min(domains_per_monomer, indices.size))
+        sub_chain = np.asarray(
+            [f"G{group_idx}"] * int(indices.size), dtype=object
+        )
+        sub_res = None
+        if residue_ids is not None and len(residue_ids) == n:
+            sub_res = np.asarray(residue_ids, dtype=object)[indices]
+        sub_bfac = None
+        if b_factors is not None and len(b_factors) == n:
+            sub_bfac = np.asarray(b_factors, dtype=float)[indices]
+        sub_ss = None
+        if (
+            secondary_structure is not None
+            and len(secondary_structure) == n
+        ):
+            sub_ss = np.asarray(secondary_structure, dtype=object)[indices]
+        sub_labels, sub_suggested, sub_info = detect_domains_enm(
+            coords[indices],
+            cutoff_nm=cutoff_nm,
+            n_modes=min(int(n_modes), max(2, int(indices.size) - 1)),
+            n_domains=k,
+            chain_ids=sub_chain,
+            residue_ids=sub_res,
+            b_factors=sub_bfac,
+            secondary_structure=sub_ss,
+        )
+        remapped = np.asarray(sub_labels, dtype=int).copy()
+        local_ids = sorted(int(v) for v in np.unique(remapped))
+        local_map = {old: next_domain + i for i, old in enumerate(local_ids)}
+        remapped = np.asarray(
+            [local_map[int(v)] for v in remapped], dtype=int
+        )
+        labels[indices] = remapped
+        next_domain += len(local_ids)
+        per_group.append(
+            {
+                "group_index": int(group_idx),
+                "n_nodes": int(indices.size),
+                "requested_domains": int(k),
+                "assigned_domains": int(len(local_ids)),
+                "method": sub_info.get("method"),
+            }
+        )
+        if sub_info.get("silhouette") is not None:
+            silhouettes.append(float(sub_info["silhouette"]))
+        if sub_info.get("method"):
+            methods.append(str(sub_info["method"]))
+
+    if np.any(labels < 0):
+        # Safety: assign leftovers to nearest existing domain centroid.
+        assigned = np.where(labels >= 0)[0]
+        if assigned.size == 0:
+            labels[:] = 0
+        else:
+            centroids = {
+                int(dom): np.mean(coords[labels == dom], axis=0)
+                for dom in np.unique(labels[assigned])
+            }
+            for index in np.where(labels < 0)[0]:
+                nearest = min(
+                    centroids,
+                    key=lambda dom: float(
+                        np.linalg.norm(coords[index] - centroids[dom])
+                    ),
+                )
+                labels[index] = int(nearest)
+
+    relabel = {
+        old: new
+        for new, old in enumerate(sorted(int(v) for v in np.unique(labels)))
+    }
+    labels = np.asarray([relabel[int(v)] for v in labels], dtype=int)
+    suggested = int(len(relabel))
+    info = {
+        "method": "oligomer-" + (
+            methods[0] if len(set(methods)) == 1 and methods else "hybrid"
+        ),
+        "n_nodes": int(n),
+        "cutoff_nm": float(cutoff_nm),
+        "n_modes": int(n_modes),
+        "suggested_D": int(suggested),
+        "oligomer_grouping": grouping,
+        "requested_monomers": (
+            None if n_monomers is None else int(n_monomers)
+        ),
+        "domains_per_monomer": int(domains_per_monomer),
+        "use_pdb_chains": bool(use_pdb_chains),
+        "chain_count": int(len(unique_chains)),
+        "monomer_groups": int(len(group_indices)),
+        "per_monomer": per_group,
+        "silhouette": (
+            float(np.mean(silhouettes)) if silhouettes else 0.0
+        ),
+        "sequence_fragmentation": _domain_sequence_fragmentation(
+            labels, chain_ids
+        ),
+        "notes": notes,
+        "contact_edges": 0,
+        "plddt_used": False,
+    }
+    return labels, suggested, info
 
 
 class _EspGradientBar(QWidget):
@@ -796,6 +1443,11 @@ PLUGIN_NAME = "AFM Simulator"
 APP_ICON_FILENAME = "pyNuD_sim.png"
 APP_ICON_FALLBACK_FILENAMES = ("pyNuD_sim.png", "pyNuD_simulator.ico")
 THIRD_PARTY_NOTICES_FILENAME = "THIRD_PARTY_NOTICES.md"
+SIMULATOR_MANUAL_FILENAME = "pyNuD_Simulator_Manual.html"
+SIMULATOR_MANUAL_RELEASE_URL = (
+    "https://github.com/uchihast/pyNuDSim-Installers/releases/latest/"
+    f"download/{SIMULATOR_MANUAL_FILENAME}"
+)
 
 def iter_bundled_file_paths(filenames):
     """Yield possible bundled file paths for source and frozen app layouts."""
@@ -890,6 +1542,14 @@ HELP_HTML_EN = """
 <div class="step">You can also drag and drop a file onto the file name line below the Import File button.</div>
 <h2>Display style: Ribbon and secondary structure</h2>
 <p>The AFM Simulator supports PyMOL-style ribbon visualization (Catmull-Rom spline interpolation) based on secondary structure detection. Select <strong>Ribbon (PyMOL-style)</strong> in the display style to show the protein backbone as a ribbon. You can also change the display style from the context menu by right-clicking on the molecule view.</p>
+<h2>Real AFM fitting workflow</h2>
+<ol>
+    <li>Load Real AFM and select one molecule/repeat by left-dragging an ROI, or click <strong>Use Full Image</strong>.</li>
+    <li>Run <strong>Estimate Pose</strong>, then <strong>Auto-fit Tip Radius + Angle</strong>.</li>
+    <li>Use <strong>Auto-fit Checked Appearance</strong> in AFM Appearance to fit only enabled filters/artifacts.</li>
+    <li>For flexible structures, select Rigid Domains, Linear ANM, Iterative NMFF-AFM, external NOLB, or Official AFMfit under <strong>Method</strong>, then choose <strong>Run Flexible Fit</strong>.</li>
+</ol>
+<p>Domain detection is hybrid: Chain/residue and HELIX/SHEET metadata, residue contacts, geometry, ENM modes, and—only when confidently recognized—AlphaFold pLDDT are combined. Predicted boundaries must be inspected before Flexible Fit.</p>
 """
 
 HELP_HTML_JA = """
@@ -912,6 +1572,14 @@ HELP_HTML_JA = """
 <div class="step">Import File ボタン下のファイル名の行にドラッグ＆ドロップすることもできます。</div>
 <h2>表示スタイル: リボンと二次構造</h2>
 <p>AFMシミュレータでは二次構造の検出に基づき、PyMOL風のリボン可視化（Catmull-Romスプライン補間）が利用できます。表示スタイルで <strong>Ribbon (PyMOL-style)</strong> を選択すると、タンパク質の主鎖がリボンとして表示されます。分子表示上で右クリックするコンテキストメニューからも表示スタイルを変更できます。</p>
+<h2>Real AFMフィッティングの流れ</h2>
+<ol>
+    <li>Real AFMを読み込み、左ドラッグのROIで1分子・1繰り返しを選ぶか、<strong>Use Full Image</strong>で全領域を選択します。</li>
+    <li><strong>Estimate Pose</strong>、続いて<strong>Auto-fit Tip Radius + Angle</strong>を実行します。</li>
+    <li>AFM Appearanceの<strong>Auto-fit Checked Appearance</strong>で、有効にしたフィルタ・アーティファクトだけを調整します。</li>
+    <li>柔軟構造では、<strong>Method</strong>でRigid Domains、Linear ANM、Iterative NMFF-AFM、外部NOLB、またはOfficial AFMfitを選び、<strong>Run Flexible Fit</strong>を実行します。</li>
+</ol>
+<p>ドメイン検出は、Chain・残基・HELIX/SHEET情報、残基接触、空間配置、ENMモード、およびAlphaFold由来と強く判定できる場合のpLDDTを統合するハイブリッド方式です。Flexible Fit前に予測境界を確認してください。</p>
 """
 
 
@@ -931,25 +1599,25 @@ def apply_low_pass_filter(image, scan_x_nm, scan_y_nm, cutoff_wl_nm):
     """
     if cutoff_wl_nm <= 0:
         return image
-
+    
     # 周波数グリッド (cycles/nm)
     f_grid = create_frequency_grid(image.shape, scan_x_nm, scan_y_nm)
-
+    
     # カットオフ周波数 (1/nm)
     f_cutoff = 1.0 / cutoff_wl_nm
-
+    
     # バターワースフィルター (n=2)
     # H(f) = 1 / sqrt(1 + (f/f_cutoff)^(2n))
     h_f = 1.0 / np.sqrt(1.0 + (f_grid / f_cutoff)**4)
-
+    
     # FFT
     img_fft = fft2(image)
     filtered_fft = img_fft * h_f
-
+    
     # 逆FFT
     filtered_image = np.real(ifft2(filtered_fft))
     return filtered_image
-
+    
 def _create_vdw_surface_loop(nx, ny, pixel_x, pixel_y, x_start, y_start, min_z, atom_coords, atom_radii):
     surface_map = np.full((ny, nx), min_z - 5.0, dtype=np.float64)
     px_coords = x_start + (np.arange(nx) + 0.5) * pixel_x
@@ -993,7 +1661,7 @@ def _create_vdw_surface_loop(nx, ny, pixel_x, pixel_y, x_start, y_start, min_z, 
 DETAILED_MANUAL_MD_JA = """
 # pyNuD Simulator Manual (Detailed)
 
-このマニュアルは `pyNuD_simulator.py` の現行実装に基づき、主要機能・パラメータ・操作手順をできるだけ詳細にまとめたものです。
+このマニュアルは `pyNuD_simulator.py` の現行実装に基づき、主要機能・パラメータ・操作手順をできるだけ詳細にまとめたものです。  
 UI表示名は実際のラベル（英語）をそのまま記載しています。
 
 ## 1. アプリの目的 {#ja-sec1}
@@ -1005,7 +1673,7 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 - AFM探針モデルを使った高さマップ生成
 - XY / YZ / ZX 像の比較
 - 実AFMデータとのサイズ同期・姿勢推定（Estimate Pose）
-- 実AFMに見た目を寄せる外観最適化（Auto-fit AFM Appearance）
+- 配向後に探針半径と角度を制約付きで合わせる最適化（Auto-fit Tip Radius + Angle）
 
 ---
 
@@ -1018,12 +1686,13 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 - Color & Lighting Settings
 - AFM Tip Settings
 - Tip Position Control
+- Model Rotation（Simulation / Estimate Pose / Impose model の姿勢）
 - AFM Simulation
 - AFM Appearance（独立ウィンドウ）
 
 ### 2.2 右パネル（Structure + AFM） {#ja-sec2-2}
 - 上段: 構造表示ツールバー（Drop / Show Molecule / Show AFM Tip / Show Bonds / Sequence / Reset View）と構造表示（PyMOLビュー / VTKビュー）
-- 中段: Structure & View Control（回転、Find Initial Plane など）
+- 中段: Structure & View Control（Atom Statistics、Find Initial Plane、視点など）
 - 下段: Simulated AFM Images（XY/YZ/ZX）
 
 ### 2.3 独立ウィンドウ {#ja-sec2-3}
@@ -1040,9 +1709,11 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 - `AFM Appearance`: AFM外観パラメータ（ノイズ・低域フィルタ）を開く
 - `Real AFM image`: Real AFM / Sim Aligned 比較ウィンドウを開く
 - `Help` → `View Help...` (`F1`): ヘルプウィンドウを開く
+- `Help` → `Open HTML Manual...`: 同じ内容の専用HTMLマニュアルをWebブラウザで開く
 - `Help` → `Third-Party Notices...`: サードパーティの著作権・ライセンス・商標表示を開く
 
-`Manual` メニューは廃止され、ヘルプと通知表示は `Help` メニューへ統合されています。
+同梱HTMLが見つからない場合、`Open HTML Manual...` は公開中の最新版マニュアルを開きます。
+`Manual` メニューは廃止され、マニュアルと通知表示は `Help` メニューへ統合されています。
 
 ---
 
@@ -1093,9 +1764,16 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 - `Tip Info`: 現在の形状情報表示
 
 ### 5.5 Tip Position Control {#ja-sec5-5}
-- `X (nm)`: -50〜50（スライダ）
-- `Y (nm)`: -50〜50
-- `Z (nm)`: 10〜100（内部表示は5.0nm相当初期）
+- `X (nm)` / `Y (nm)` / `Z (nm)`: 数値入力（0.1 nmステップ、上下矢印対応）＋スライダ
+- XY範囲はスキャンサイズに応じて自動拡張（既定おおよそ ±100 nm 以上）
+- `Z (nm)`: 2.0〜20.0（内部スライダ 10〜100、初期 2.0 nm）。3D探針表示用で、Estimate Pose／AFMシミュレーションはZを動かさない。
+
+### 5.5b Model Rotation {#ja-sec5-5b}
+- 左パネルの Tip Position Control 直下
+- `Rotation X/Y/Z`:
+  - Spin: -180.0〜180.0°（0.5°ステップ）
+  - Slider: -1800〜1800（0.1°刻み）
+- AFMシミュレーション / Estimate Pose / Impose model の姿勢に使う
 
 ### 5.6 AFM Simulation {#ja-sec5-6}
 - `Scan Size X (nm)`: 1.0–500.0（デフォルト 20.0）
@@ -1106,6 +1784,9 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 - `Rctangle (force Y = X)`（デフォルト ON）:
   - ON時は `Scan Y = Scan X`, `Ny = Nx` を強制
   - OFFで長方形スキャンを許可
+- `Live sync from pyNuD`（スタンドアロン版のみ、デフォルト OFF）:
+  - ONにすると、起動中のpyNuDで現在表示しているAFMフレームをReal AFMとして継続受信
+  - pyNuD側でAFM画像を開き、AFM Simulatorプラグインが動作している場合に使用
 - `Sync Sim Params to Real AFM`: Real AFMのサイズ・解像度を反映
 - `Interactive Update`（デフォルト ON）:
   - 回転中は軽量更新（低解像度）
@@ -1135,17 +1816,19 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
   - `tap tau_track (lines)`
   - `tap tau_para (lines)`
   - `tap release (nm)`
+- `Auto-fit Checked Appearance`:
+  - チェックされているLow-pass、Height Noise、Line Noise、Drift、Feedback LagだけをReal AFMに合わせる
+  - 未チェック項目、Line Noise mode、Feedback mode、Scan Direction、Pose、Tip Radius/Angleは変更しない
+  - `Estimate Pose` と `Auto-fit Tip Radius + Angle` の完了後に使用
+  - 96px以下のプレビューで画像相関・高さRMSD・高周波成分・ライン統計を評価
 
 ---
 
 ## 6. 右パネル詳細（Structure & View Control） {#ja-sec6}
 
 ### 6.1 Rotation {#ja-sec6-1}
-- `Rotation X/Y/Z`:
-  - Spin: -180.0〜180.0°
-  - Slider: -1800〜1800（0.1°刻み）
-- `CTRL + Drag`（構造回転）
-- `Shift + Drag`（パン）
+- モデル回転は左パネルの `Model Rotation`（Tip Position 直下）へ移設
+- 右パネルでは `CTRL + Drag`（構造回転） / `Shift + Drag`（パン）も利用可能
 
 ### 6.2 ボタン {#ja-sec6-2}
 - `Reset All`: 回転・Tip位置・カメラを初期化
@@ -1206,7 +1889,71 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 
 各画像描画領域は同サイズになるように揃えられます。
 
-### 8.3 ASD読み込み {#ja-sec8-3}
+### 8.3 pyNuDとのLive sync {#ja-sec8-3}
+
+`Live sync from pyNuD`は、pyNuDで現在表示している処理済みAFMフレームを、
+スタンドアロン版pyNuD SimulatorのReal AFMへ継続的に受け渡す機能です。
+デフォルトはOFFです。必要なときだけユーザーが明示的にONにしてください。
+
+**pyNuD側の準備**
+
+1. pyNuDでASDなどのAFM画像を開く
+2. 位置合わせに使いたいフレームを表示する
+3. pyNuDのPluginメニューから`AFM Simulator`を起動する
+4. スタンドアロン版が検出された場合:
+   - `pyNuD Simulator を起動 / Launch standalone`を選ぶと、プラグインは非表示のデータ送信役となり、スタンドアロン版を起動
+   - `このプラグイン (VTK) / Use VTK plugin`を選ぶと、pyNuD内のVTK版を表示
+
+どちらを選んだ場合も、プラグインが動作している間はpyNuDの現在フレームを
+共有ブリッジへ送信します。スタンドアロン版は同じユーザーアカウントで
+起動してください。
+
+**スタンドアロン版での接続**
+
+1. 位置合わせするPDB/mmCIF構造を読み込む
+2. AFM Simulationパネルの`Live sync from pyNuD`をONにする
+3. pyNuDからフレームを受信すると、Real AFMウィンドウに画像名・フレーム・物理サイズが表示される
+4. `Sync Sim Params to Real AFM`を押して、Scan X/YとPixel X/Yを受信画像へ合わせる
+5. 必要ならReal AFM上でROIを選択する
+6. `Get Simulated image`を実行し、実像とシミュレーション像のサイズ・縦横比を確認
+7. 初回は`Estimate Pose`の`Global search`で全体方位を探索する
+8. `Auto-fit Tip Radius + Angle`、必要に応じAppearance fitting、Flexible Fitの順に進む
+
+**同期される内容**
+
+- pyNuDに現在表示されている処理済み高さ像（nm）
+- Scan X/Y、Pixel X/Y、nm/pixel、走査方向
+- ファイル表示名とフレーム番号
+- pyNuDでフレームを変更したときの新しい表示フレーム
+
+次の内容は同期されません。
+
+- PDB/mmCIF構造
+- Simulator側のRotation、Tip、Appearance、Flexible Fit設定
+- ROI、Estimate Pose結果、保存済みFit
+- Simulatorでの処理結果をpyNuDへ書き戻す操作
+
+pyNuDのフレームが変わると、Real AFM全体が新しいフレームへ置き換わり、
+以前のROIとSim Aligned表示は解除されます。新しいフレームでROIを選び直し、
+`Get Simulated image`と`Estimate Pose`を再実行してください。別分子や大きく
+異なる像へ切り替えた場合は`Global search`を使用します。
+
+**停止と切断**
+
+- `Live sync from pyNuD`をOFFにすると受信を停止する。最後に受信したReal AFM像はそのまま残る
+- pyNuD側のAFM Simulatorプラグインを閉じると、新しいフレームは送られない
+- pyNuDやSimulatorを終了しても、元のASDやpyNuD画像は変更されない
+
+**接続できない場合**
+
+- pyNuDでAFM画像が開かれているか確認
+- pyNuDの`AFM Simulator`プラグインが動作中か確認
+- スタンドアロン版の`Live sync from pyNuD`がONか確認
+- pyNuDとSimulatorを同じユーザーアカウントで起動しているか確認
+- 一度チェックをOFF/ONし、pyNuD側でフレームを変更して再送信
+- サイズが合わない場合は`Sync Sim Params to Real AFM`を再実行
+
+### 8.4 ASD読み込み {#ja-sec8-4}
 - Real AFM側パネルへ `.asd` をドラッグ&ドロップ
 - または内部ロード処理から選択
 - 読み込み時:
@@ -1214,15 +1961,17 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
   - メタ情報（Scan size / pixel）更新
   - 必要に応じシミュレーション条件同期
 
-### 8.4 ROI（Real AFM切り出し） {#ja-sec8-4}
+### 8.5 ROI（Real AFM切り出し） {#ja-sec8-5}
 - 左ドラッグ: ROI選択
 - 右クリック: ROI解除（全体に戻す）
+- `Use Full Image`: ROIを解除して全領域をEstimate Pose対象に戻す
+- 上部の `Pose ROI` 表示でFull image / Selectedと選択サイズを確認
 - ROI適用時:
   - Real AFMの有効領域が切り替わる
   - scan size / resolution メタ情報もROI基準に再計算
-  - 既存の整合像（Sim Aligned）はクリアされ、再推定が必要
+  - 既存のPoseと整合像（Sim Aligned）はクリアされ、Global searchでの再推定が必要
 
-### 8.5 ボタン {#ja-sec8-5}
+### 8.6 ボタン {#ja-sec8-6}
 - `Get Simulated image`
   - Real AFMの `Scan X/Y` と `Nx/Ny` に合わせて、PDBから再シミュレーション
   - 結果を `Sim Aligned` に表示
@@ -1233,15 +1982,18 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
   - `Pose axes` の `X` / `Y` / `Z` チェックで、探索中に回転を許可する軸を限定可能
   - 推定後、Rotation XYZへ反映
   - Sim Aligned とメイン `Simulated AFM Images` のXY像が一致する運用
-- `Auto-fit AFM Appearance`
-  - 1段階目で探針 `Radius (nm)` / `Angle (deg)` とLow-pass `Cutoff Wavelength (nm)` を探索
-  - Auto-fit成功時は `Apply Low-pass Filter` をONにする
-  - 2段階目でノイズ/アーティファクト条件を探索してReal AFMへ見た目を寄せる
+- `Auto-fit Tip Radius + Angle`
+  - 配向・XY位置がReal AFMと合っていることを前提に、探針 `Radius (nm)` と `Angle (deg)` を制約付き二段階探索
+  - 粗いRadius×Angle探索の後、最良候補の近傍だけを微調整
+  - ParaboloidではAngleが形状に影響しないためRadiusのみ探索
+  - 実高さRMSDと大きすぎるRadiusへの弱いペナルティを評価に加え、異常に大きなRadiusを抑制
+  - Low-pass、ノイズ、走査アーティファクト設定は探索・変更しない
   - 反映結果は Sim Aligned 側にも適用
 - `Impose model`（チェックボックス）
   - ONにすると、Simulation と同じ PDB（回転・Style/Color/Size）を **AFM スキャン窓と同じ nm 範囲** で高解像度 PNG 化し、Real AFM 像の上に重ねる
   - AFM 像のピクセル数に合わせて再サンプリングせず、nm スケールを揃えて表示領域にスケールして被せる
   - `Estimate Pose` 後の並進残差(Dx/Dy)を反映
+  - Tip Position / Rotation XYZ を変えると重ね表示も同期更新する
   - `Opacity` スライダーで不透明度を調整
 - `Difference (Real − Sim)` パネル（右端、自動更新）
   - 実像とSim Alignedの差分を表示。両者の平均(オフセット)を揃えてから nm 単位で引き算
@@ -1249,6 +2001,20 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
   - 発散カラーマップ(seismic): 0=白、正(実像が高い)=赤、負(シミュが高い)=青。スケールは差分絶対値の99パーセンタイルで対称
   - `RMSD`(nm) と `ZNCC`(相関係数) を表示
   - `Get Simulated image` 未実行時はプレースホルダ表示
+- `Detect Domains`: PDB/mmCIF情報・接触ネットワーク・ENMを統合してFlexible Fit用ドメインを予測
+- `Auto`: ドメイン数を自動選択。OFFでは`Total`または`N × D/chain`で指定
+- `N × D/chain`: 多量体数（または`PDB chains`）×モノマーあたりドメイン数。例: カドヘリン三量体は 3×5
+- `Domain colors`: 検出結果を構造表示で色分け
+- `Method`: `Rigid Domains (built-in)`、`Linear ANM (built-in)`、`Iterative NMFF-AFM (built-in)`、`Nonlinear NMA (NOLB)`、`Official AFMfit (external)`から選択
+- `Run Flexible Fit`: 選択した方法でReal AFMへフィット
+- `Iterative NMFF-AFM (built-in)`: 各反復でANMを再計算し、各モードの±Qと±Q/2をAFM相関で評価して最良方向へ逐次変形（ドメイン検出不要）
+- `Nonlinear NMA (NOLB)`: 外部NOLB実行ファイルで非線形NMA候補を生成し、pyNuDのAFM像で順位付け（ドメイン検出不要）
+- `Official AFMfit (external)`: 別途インストールした公式AFMfitを外部Pythonで実行し、局所姿勢refineとNOLB-RTB flexible fittingを行う（macOS/Linux、ドメイン検出不要）
+- `Save Fit`: 成功したFlexible FitのPDBとレポートを保存
+- `Compare Structures`: 最初に読み込んだ構造（灰色）とBest-fit構造（水色）を新しいインタラクティブVTKウィンドウで重ねて表示
+- `Active structure`: Flexible Fit採用後に`Original (loaded)`と`Best Fit`を切り替える。Originalは常に最初に読み込んだ構造。選択中の構造がEstimate Pose、AFMシミュレーション、Impose model、次のFlexible Fitの入力になる
+- `Reset Fit`: Rotation XYZ／Tip XYはそのまま、分子座標だけを最初に読み込んだ構造へ戻し、採用結果をクリアする
+- OriginalとBest Fitは最後に実行したEstimate Poseの回転・XY位置を別々に保持する
 
 ---
 
@@ -1266,6 +2032,14 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 - `High`
 
 精度が高いほど探索点が増え、時間は長くなります。
+
+既定の `Medium` / `High` は、現在のRotation XYZから局所微調整する
+`Refine current rotation`（または前回Estimate Pose成功時は
+`Refine current pose`）です。`Find Initial Plane`後は接触面（X/Y傾き）を
+保ったまま、主に面内回転Zを探索し、大きな倒れ込みで別方位へ飛び移らない
+よう傾き偏差を制限します。初期方位がまだ不明な場合は `Global search` を選びます。
+`Find Initial Plane`未実行のまま`Estimate Pose`を押した場合は、接地面積ランクを
+先に自動実行してから姿勢探索に入ります（接地面積は強い束縛として効きます）。
 
 ### 9.3 探索の流れ（実装） {#ja-sec9-3}
 1. 現在のRotationをベースラインとして評価
@@ -1286,30 +2060,221 @@ UI表示名は実際のラベル（英語）をそのまま記載しています
 
 ---
 
-## 10. Auto-fit AFM Appearance の仕様 {#ja-sec10}
+## 10. Auto-fit Tip Radius + Angle の仕様 {#ja-sec10}
 
-目的: 実AFM像に近い探針条件・Low-pass条件・外観ノイズ条件を自動探索。
+目的: 配向済みの構造について、実AFM像に近い探針半径と角度を制約付きで探索。
 
 主な特徴:
 - Real AFM と PDB/CIF/MRC/Coarse-grain などのシミュレーション対象構造が必要
 - ASDの `Scan X/Y` と `Nx/Ny` に合わせてXY像を再シミュレーションして評価
-- Stage 1: 探針 `Radius (nm)`、`Angle (deg)`、Low-pass `Cutoff Wavelength (nm)` を探索
-- Stage 2: Stage 1の最良像を基準に、ノイズ/走査アーティファクト条件を探索
-- `Apply Low-pass Filter` はAuto-fit成功時にONになり、`Cutoff Wavelength (nm)` をAuto-fitで変更可能
-- `Cutoff Wavelength (nm)` はLow-passの空間周波数カットオフに対応する波長パラメータ
-- `Scan Direction` は内部的に `L2R` 固定で評価
-- 探索候補:
-  - Tip radius / angle
-  - Low-pass cutoff wavelength
-  - Height noise
-  - Line noise
-  - Drift
-  - Feedback mode（none / linear_lag / tapping_parachute 系）
-- 最良候補を AFM Appearance UI に反映して再描画
+- `Estimate Pose` 済み、または手動で配向・XY位置を合わせた状態を前提とする
+- Cone/Sphereでは探針 `Radius (nm)` と `Angle (deg)` を同時探索
+- ParaboloidではRadiusのみ探索
+- Radius上限はスキャンサイズから設定し、上限到達時は非一意性を警告
+- Low-pass、ノイズ、Drift、Feedback設定は探索せず、UI設定も変更しない
+- 最良候補をTip設定へ反映して再描画
 
 ---
 
-## 11. Interactive Update の仕様 {#ja-sec11}
+## 11. Detect Domains / Flexible Fit {#ja-sec11}
+
+### 11.1 ハイブリッドドメイン検出
+
+`Detect Domains`は次の情報を統合します。
+- PDB/mmCIFのChain、残基順序、HELIX/SHEET
+- Cα（核酸ではP）残基接触ネットワーク
+- 3D空間配置
+- ENM低周波運動モード
+- AlphaFold形式と強く判定できる場合のみpLDDT
+
+Chainは強い事前情報ですが、絶対境界ではありません。密接なChain間接触とENM運動が一致する場合は同じドメインになり得ます。通常の結晶構造B-factorはpLDDTとして使用しません。CATH/SCOP/Pfamなど外部データベースへの照合は行いません。
+
+Autoではsilhouette、不要なドメイン数、配列上で飛び飛びになる割当を評価してドメイン数を選びます。結果は予測であり、`Domain colors`で境界と空間的まとまりを必ず確認してください。
+
+### 11.2 Flexible Fit
+
+- `Rigid Domains (built-in)`: `Estimate Pose`成功後、2ドメイン以上で実行。最大ドメインを固定アンカーとし、その他のドメインだけを相対回転・移動
+- `Linear ANM (built-in)`: Cα、Cα/P、または全タンパク質原子からANMモードを計算し、その線形結合の振幅をnm RMS単位で最適化。ドメイン検出は不要
+- `Iterative NMFF-AFM (built-in)`: 現在構造からANMを毎回再計算し、−Q、−Q/2、0、+Q/2、+Qで得たAFM像のZNCC勾配が最大のモードを逐次適用。公開アルゴリズムに基づく独立実装で、公式RTB版とは異なり内蔵ANMと固定済みEstimate Poseを使用
+- `Nonlinear NMA (NOLB)`: 別途入手したacademic版NOLBで非線形NMAアンサンブルを生成し、各候補をAFM像で評価。NOLBは同梱しない
+- `Official AFMfit (external)`: 別途インストールした公式AFMfitを外部Pythonプロセスで呼び出し、Estimate Pose周辺のprojection matchingとNOLB-RTB flexible fittingを実行。AFMfitは同梱しない
+- 設定画面でAtom Selection、Cutoff Distance、開始モード、モード数、振幅・全体変位上限、プレビュー解像度、評価回数、3種の変形ペナルティを指定可能
+- NMA Fitはモード固有値、連続主鎖の距離変化、全体RMS変位にペナルティを課し、過大変形を抑制
+- いずれも96px以下で探索し、最終候補を元解像度で検証
+- Pose scoreが改善せず、aligned RMSDも悪化する候補は採用しない
+- 採用後はDifference、Pose残差、PyMOL表示、保存PDBを更新
+- 任意の座標・残基編集後は古いドメイン割当を無効化
+
+大きな領域間運動にはDomain Fit、構造全体の滑らかな集団運動にはNMA Fitが適します。どちらの結果もAFM像が支持する候補モデルであり、一意な分子状態の証明ではありません。保存レポートのモード振幅とRMS変位を確認してください。
+
+### 11.3 実行前の共通準備
+
+1. PDBまたはmmCIF構造とReal AFM像を読み込む
+2. ROIで対象分子を選ぶか、`Use Full Image`を選択
+3. `Estimate Pose`を成功させ、全体の剛体姿勢を確定
+4. `Auto-fit Tip Radius + Angle`で探針条件を合わせる
+5. 必要に応じて`Auto-fit Checked Appearance`で像形成条件を調整
+6. `Method`を選択し、`Run Flexible Fit`を実行
+
+Flexible Fitは内部構造変化を探索する機能です。全体姿勢合わせの代わりには使用しません。ROI、Pose、Tip条件が不適切なまま実行すると、構造変形が画像位置ずれや探針差を誤って吸収する可能性があります。
+
+### 11.4 Rigid Domains (built-in)
+
+大きな領域間運動に使用します。`Detect Domains`で2個以上のドメインが必要です。最大ドメインを固定アンカーとし、それ以外のドメインの相対回転・移動を探索します。
+
+- `Fast`: 小さな探索範囲で短時間確認
+- `Medium`: 標準的な探索
+- `Thorough`: 広い探索範囲と多い評価回数
+- `Large motion`: 大きなヒンジ／腕の開き向け。回転最大±45°、並進もドメイン半径に応じて拡大。接続維持でも像の大きな形状差を狙える
+- Domain connectivity:
+  - `Keep domains connected (no separation)`（既定）: 開始構造のドメイン境界／リンカー距離を保ち、ドメインが完全に離れる候補を棄却
+  - `Allow domains to separate`: 境界距離は弱い罰則のみ。独立な断片が像の別ピークへ動くことを許容
+
+Autoドメイン境界は予測です。実行前に`Domain colors`で、配列上・空間上のまとまりを確認してください。境界が不自然な場合はAutoをOFFにしてドメイン数を変更します。像とモデルの開きが大きく違う場合は、まず`Large motion` + `Keep domains connected`を試してください。
+
+### 11.5 Linear ANM (built-in) の設定
+
+- `Use PDB-safe automatic settings (recommended)`: PDBのノード間隔と分子サイズからCutoff、モード数、振幅・総変位上限、評価回数、ペナルティを安全側に推定
+- `Show advanced/manual controls`: 自動値の確認、または自動設定をOFFにした手動調整
+- `Atom Selection`: C-alpha、C-alpha/P、または全タンパク質原子。全原子は計算量が増えます
+- `Cutoff Distance`: 弾性ネットワークを作る原子間距離
+- `First Fitted Mode`: 使用する最初の非剛体低周波モード。1が最低周波数
+- `Number of Fitted Modes`: 同時に最適化するモード数
+- `Max Amplitude / Mode`: 1モードあたりの最大振幅（nm RMS）
+- `Max Total RMS Displacement`: 構造全体の変位上限
+- `Preview Resolution (max)`: 探索中の最大画像解像度
+- `Maximum Evaluations`: 最適化で評価する候補数の上限
+- `Mode Energy Penalty`: 高エネルギーモードの大振幅を抑制
+- `Backbone Strain Penalty`: 連続主鎖の距離変化を抑制
+- `Steric Clash Penalty`: 原子・残基の不自然な近接に罰点を加算
+
+既定ではPDB-safe自動設定が有効です。まずPDB形状から保守的な値を表示し、実行時には選択された各ANMモードの正負方向を検査して振幅上限をさらに下げます。探索中に新しい深刻な重原子衝突を生じる候補は、AFM像との一致がよくても採用しません。
+
+PDBだけではAFM像に対する一意な「最適値」は決まりません。自動値は構造破綻を避ける探索上限であり、結果PDB、RMS変位、Difference像を確認してください。
+
+### 11.6 Iterative NMFF-AFM (built-in) の設定
+
+各反復で現在構造からANMを再計算し、各モードの`−Q, −Q/2, 0, +Q/2, +Q`を評価して、相関勾配が最も大きい方向へ逐次変形します。
+
+- `Atom Selection`: ANMノードの選択
+- `Elastic-network Cutoff`: ANM接続距離
+- `First Non-rigid Mode`: 最初に評価する非剛体モード
+- `Number of Modes`: 各反復で評価するモード数
+- `Step Amplitude Q`: 1反復の基準変位（nm RMS）
+- `Maximum Iterations`: 反復回数上限
+- `Max Total RMS Displacement`: 開始構造からの総変位上限
+- `Minimum CC Gain`: 採用に必要な最小相関改善
+- `Decay Threshold Fraction`: 初期改善量に対する収束判定割合
+- `Convergence Patience`: 小さい改善が続いたときに停止する反復数
+- `Preview Resolution (max)`: AFM評価時の最大解像度
+
+初期値はC-alpha、Cutoff 8 Å、15モード、Q=0.05 nm RMS、最大70反復、総変位1.5 nm、Preview 96 pxです。各候補はAFM scoring前に新しい深刻な重原子clashがないか検査し、衝突候補を除外して最後の安全な改善構造を保持します。公開NMFF-AFM法を参考にした独立実装であり、公式BioAFMviewerコードではありません。公式法のRTBモードではなく内蔵ANMを使用し、剛体姿勢は`Estimate Pose`で固定します。
+
+### 11.7 Nonlinear NMA (NOLB) の設定
+
+外部NOLBで非線形NMAアンサンブルを生成し、各候補をpyNuDのAFMシミュレーションで順位付けします。NOLBはpyNuD Simulatorに同梱されません。別途インストールが必要です。
+
+#### NOLB のインストール
+
+1. [NOLB公式配布ページ](https://team.inria.fr/nano-d/software/nolb-normal-modes/)から academic 版を入手する（無償）。
+2. 配布アーカイブを展開し、実行ファイル（通常名 `NOLB`）を取り出す。
+3. 例として `~/.local/bin/NOLB` へ配置し、実行権限を付与する。
+
+```bash
+mkdir -p ~/.local/bin
+cp /path/to/downloaded/NOLB ~/.local/bin/NOLB
+chmod +x ~/.local/bin/NOLB
+```
+
+4. Real AFMウィンドウで `Method` → `Nonlinear NMA (NOLB)` → `Run Flexible Fit` を選び、設定画面の `NOLB Executable` に実行ファイルのフルパスを指定する（既定候補は `~/.local/bin/NOLB`、または PATH 上の `NOLB`）。
+5. Apple Silicon（macOS arm64）では、配布バイナリが x86_64 の場合に Rosetta が必要になることがあります。初回実行時に macOS がインストールを促すか、`softwareupdate --install-rosetta` で導入してください。
+
+NOLBは academic 利用向けの別ソフトウェアです。ライセンス条件は公式配布元の案内に従ってください。
+
+#### 設定項目
+
+- `NOLB Executable`: 別途入手したNOLB実行ファイル
+- `Generated Structures`: 生成候補数
+- `Use PDB-safe RMSD limit (recommended)`: PDBの大きさから2–4 Åの安全側最大RMSDを設定
+- `Maximum Ensemble RMSD`: アンサンブルの最大RMSD（Å）。自動設定OFF時のみ編集
+- `Elastic-network Cutoff`: NOLBのネットワークCutoff（Å）
+- `Geometry Refinement`: `-m`による生成構造の最小化
+- `Preview Resolution (max)`: 候補評価時の最大解像度
+- `Maximum NOLB Runtime`: NOLBアンサンブル生成を停止する時間上限
+
+既定は50構造、PDB-safe RMSD（分子サイズから2–4 Å）、Cutoff 5 Å、Geometry Refinement有効、Preview 96 px、実行上限600秒です。生成中は経過時間、ログサイズ、出力PDBサイズ、最後のNOLB出力を表示します。出力が増えていなくてもプロセスが生存している場合はその旨を表示します。
+
+候補の全体回転・平行移動はKabsch alignmentで除去されます。最大RMS／局所最大変位を超える候補と、新しい深刻な重原子clashを生じる候補はAFM評価前に除外します。先に `Estimate Pose` で全体姿勢を合わせてから、NOLBは内部構造変化の探索に使ってください。
+
+### 11.8 Official AFMfit (external) の設定
+
+`AFMfit Python`に公式AFMfitをインストールしたPython実行ファイルを指定します。pyNuDは現在のReal AFMフレーム／ROIと、Estimate Poseを反映したPDBを一時ファイルとして渡します。AFMfit本体はGPL-3.0-or-laterの別ソフトウェアであり、pyNuDには同梱されません。公式NOLB backendを使用するためmacOS/Linux向けで、native Windowsでは実行できません。
+
+#### AFMfit のインストール
+
+pyNuD本体のPythonとは別に、専用の仮想環境へ公式AFMfitを入れることを推奨します。
+
+1. Python 3.10系などで仮想環境を作成する（例: `~/afmfit-env`）。
+
+```bash
+python3 -m venv ~/afmfit-env
+source ~/afmfit-env/bin/activate
+python -m pip install -U pip setuptools wheel
+```
+
+2. 公式リポジトリをクローンする。
+
+```bash
+git clone https://gricad-gitlab.univ-grenoble-alpes.fr/GruLab/AFMfit.git
+cd AFMfit
+```
+
+3. AFMfitをインストールする。CMake 4 環境では依存の `libasd` が旧policyで失敗することがあるため、次の互換指定を付けます。
+
+```bash
+CMAKE_POLICY_VERSION_MINIMUM=3.5 python -m pip install .
+```
+
+ソース直下で `./AFMfit` を指定する場合:
+
+```bash
+CMAKE_POLICY_VERSION_MINIMUM=3.5 python -m pip install ./AFMfit
+```
+
+4. インストール確認:
+
+```bash
+python -c "import afmfit; from afmfit.utils import get_nolb_path; print(afmfit.__version__, get_nolb_path())"
+```
+
+NOLB実行ファイルのパスが表示され、実行可能であること。
+
+5. Real AFMウィンドウで `Method` → `Official AFMfit (external)` → `Run Flexible Fit` を開き、`AFMfit Python` に仮想環境の Python（例: `~/afmfit-env/bin/python`）を指定する。
+6. 自動検出の候補は次の順です: 環境変数 `PYNUD_AFMFIT_PYTHON` → `~/afmfit-env/bin/python` → `~/Downloads/afmfit-env/bin/python`。
+
+注意:
+- AFMfit同梱のNOLB backendは macOS / Linux 向けです。native Windows では本機能を実行できません。
+- ChimeraX は公式AFMfitの可視化用推奨ツールですが、pyNuD経由のFlexible Fit実行自体には必須ではありません。
+- AFMfitとスタンドアロンNOLBは別物です。`Nonlinear NMA (NOLB)` 用に別途取得したNOLBと、AFMfit同梱NOLBを混同しないでください。
+
+#### 実行時の挙動
+
+AFMfit完了後、原子ID・順序を照合し、全体剛体運動を除去して、RMS／局所変位、新規重原子clash、pyNuDの元解像度AFMスコアを独立検査します。安全条件とスコア改善を満たす場合だけ構造へ適用します。進捗にはNMA、rigid、flexible、outputのstage、百分率、経過時間、ログサイズを表示し、Cancelと実行時間上限に対応します。
+
+### 11.9 採用条件・保存・比較
+
+探索は低解像度で行い、最良候補を元解像度で再評価します。Pose scoreが改善せず、aligned RMSDも悪化する候補は採用されず、元構造が維持されます。
+
+- `Save Fit`: 採用構造をPDB、評価内容を`_report.txt`として保存
+- `Compare Structures`: 元構造を灰色、採用構造を水色で重ねて表示
+- `Reset Fit`: 姿勢コントロールは変えず、構造だけを最初に読み込んだ座標へ戻す
+- 保存レポート: 方法、設定、前後のRMSD/ZNCC、変位、モード振幅、反復・評価回数を記録
+
+AFM像だけから柔軟構造を一意に決定できるとは限りません。画像スコアだけでなく、変位量、主鎖連続性、立体衝突、既知の構造生物学的情報を確認してください。元の入力PDBは自動上書きされません。
+
+---
+
+## 12. Interactive Update の仕様 {#ja-sec12}
 
 ON時:
 - 回転・条件変更中:
@@ -1323,7 +2288,7 @@ OFF時:
 
 ---
 
-## 12. 保存機能 {#ja-sec12}
+## 13. 保存機能 {#ja-sec13}
 
 - `Save as ASD...`:
   - AFMシミュレーション結果をASDとして保存
@@ -1337,7 +2302,7 @@ OFF時:
 
 ---
 
-## 13. 操作一覧（マウス/キー） {#ja-sec13}
+## 14. 操作一覧（マウス/キー） {#ja-sec14}
 
 - 構造ビュー:
   - `CTRL + 左ドラッグ`: 回転
@@ -1351,21 +2316,41 @@ OFF時:
 
 ---
 
-## 14. 推奨ワークフロー（実AFM整合） {#ja-sec14}
+## 15. 推奨ワークフロー（実AFM整合） {#ja-sec15}
 
-1. PDB/CIFを読み込む
-2. `Real AFM image` ウィンドウを開く
-3. ASDを読み込む（必要ならフレーム選択）
-4. 必要に応じROIで対象分子を中心化
-5. `Get Simulated image` でスキャン条件一致シミュレーション
-6. `Estimate Pose` で方位推定（精度選択）
-7. `Auto-fit AFM Appearance` で探針・Low-pass・ノイズ外観を調整
-8. メイン下段 `Simulated AFM Images` と `Sim Aligned` が一致することを確認
-9. ASD/画像を保存
+### 15.1 ASDを直接読み込む場合 {#ja-sec15-1}
+
+1. PDB/CIFを読み込む  
+2. `Real AFM image` ウィンドウを開く  
+3. ASDを読み込む（必要ならフレーム選択）  
+4. 必要に応じROIで対象分子を中心化  
+5. `Get Simulated image` でスキャン条件一致シミュレーション  
+6. `Estimate Pose` で方位推定（精度選択）  
+7. `Auto-fit Tip Radius + Angle` で探針半径と角度を調整
+8. 必要ならAFM Appearanceで対象項目をチェックし、`Auto-fit Checked Appearance`を実行
+9. 柔軟構造では`Method`を選択して`Run Flexible Fit`。領域運動はRigid Domains、微小集団運動はLinear ANM、反復的集団運動はIterative NMFF-AFM、大振幅候補探索はNOLBまたはOfficial AFMfit
+10. メイン下段 `Simulated AFM Images` と `Sim Aligned` が一致することを確認
+11. ASD/画像またはFit PDBを保存
+
+### 15.2 pyNuD Live syncを使う場合 {#ja-sec15-2}
+
+1. pyNuDでAFM画像を開き、位置合わせ対象のフレームを表示
+2. pyNuDのPluginメニューから`AFM Simulator`を起動
+3. 必要なら`Launch standalone`を選び、スタンドアロン版を起動
+4. スタンドアロン版でPDB/CIFを読み込む
+5. `Live sync from pyNuD`をONにし、Real AFMにpyNuDのフレームが表示されたことを確認
+6. `Sync Sim Params to Real AFM`でスキャンサイズとピクセル数を同期
+7. 対象分子だけを使う場合はROIを選択
+8. `Get Simulated image`でサイズ・縦横比・初期位置を確認
+9. `Estimate Pose`（未実行なら`Find Initial Plane`を自動実行してから姿勢探索）
+10. 初回は`Estimate Pose`の`Global search`で方位を推定
+11. `Auto-fit Tip Radius + Angle`、Appearance fitting、Flexible Fitの順に実行
+12. Difference、RMSD、ZNCC、構造変位を確認して保存
+13. pyNuDでフレームを変更した場合は、ROI選択から位置合わせをやり直す
 
 ---
 
-## 15. トラブルシューティング {#ja-sec15}
+## 16. トラブルシューティング {#ja-sec16}
 
 - `PDB is not loaded`:
   - 先に構造ファイルを読み込み
@@ -1380,22 +2365,41 @@ OFF時:
   - `Get Simulated image` を先に実行して条件一致を確認
 - 画像が縦横で合わない:
   - `Rctangle` の状態と Real AFM の実サイズ比を確認
+- Detect Domainsの境界が不自然:
+  - `Domain colors`で確認し、AutoをOFFにしてドメイン数を変更
+  - Chain、欠損残基、HELIX/SHEET情報が構造ファイルに含まれるか確認
+- Flexible Fitで改善しない:
+  - Estimate PoseとTip fittingを先に完了
+  - ROIが対象分子だけを含むか、ドメイン境界が妥当か確認
+  - Domain Fitで改善しない場合はNMA Fit（またはその逆）を試し、保存レポートの変位量を確認
+- `NOLB executable was not found` / NOLBが起動しない:
+  - [公式配布ページ](https://team.inria.fr/nano-d/software/nolb-normal-modes/)から academic 版を入手し、`NOLB Executable` にフルパスを指定
+  - `chmod +x` で実行権限があるか確認
+  - Apple Silicon では Rosetta が必要な場合あり
+- AFMfit の import / 環境チェックに失敗する:
+  - 専用venvへ公式AFMfitを入れ、`AFMfit Python` にその `bin/python` を指定（symlink解決ではなくvenv launcherを使う）
+  - CMake 4 で `libasd` が失敗する場合は `CMAKE_POLICY_VERSION_MINIMUM=3.5 python -m pip install ./AFMfit`
+  - 初回は Numba cache 生成で時間がかかることがある（最大約90秒）
+  - native Windows では Official AFMfit は非対応（macOS/Linux）
 
 ---
 
-## 16. 依存モジュールに関する注意 {#ja-sec16}
+## 17. 依存モジュールに関する注意 {#ja-sec17}
 
 - ASD読み込み/表示に `cv2` は必須ではありません。
 - 実装は `asd_io.py` のローダーを利用しており、ASD読み込みはこれで完結します。
 
 ---
 
-## 17. 変更履歴メモ（現行実装で重要な挙動） {#ja-sec17}
+## 18. 変更履歴メモ（現行実装で重要な挙動） {#ja-sec18}
 
 - `Help` メニューには `View Help...` と `Third-Party Notices...` を配置
 - Real AFM と Sim Aligned は専用ウィンドウで管理
 - Estimate Pose は画像回転比較だけでなく、Rotation XYZを変えて再シミュレーションする方式
-- Auto-fit AFM Appearance は Sim Aligned 側にも反映
+- Auto-fit Tip Radius + Angle は Sim Aligned 側にも反映
+- Auto-fit Checked Appearanceはチェックされた項目だけを変更
+- Detect DomainsはPDB/mmCIF情報・接触ネットワーク・ENMを統合するハイブリッド方式
+- Flexible Fitは剛体領域のDomain Fitと連続変形のNMA Fitを選択可能
 - Interactive Update はデフォルト ON
 - `Rctangle` はデフォルト ON（必要に応じ自動解除）
 """
@@ -1404,7 +2408,7 @@ DETAILED_MANUAL_MD_EN = """
 # pyNuD Simulator Detailed Manual
 
 This manual describes the current implementation in `pyNuD_simulator.py` in detail, including
-features, parameter meanings, and operational workflow.
+features, parameter meanings, and operational workflow.  
 UI labels are written as displayed in the application.
 
 ## 1. Purpose {#en-sec1}
@@ -1430,12 +2434,13 @@ Main use cases:
 - Color & Lighting Settings
 - AFM Tip Settings
 - Tip Position Control
+- Model Rotation (simulation / Estimate Pose / Impose model pose)
 - AFM Simulation
 - AFM Appearance (separate window)
 
 ### 2.2 Right Panel (Structure + AFM) {#en-sec2-2}
 - Top: structure toolbar (Drop / Show Molecule / Show AFM Tip / Show Bonds / Sequence / Reset View) and structure view (PyMOL / VTK)
-- Middle: Structure & View Control (rotation, Find Initial Plane, etc.)
+- Middle: Structure & View Control (Atom Statistics, Find Initial Plane, standard views, etc.)
 - Bottom: Simulated AFM Images (XY/YZ/ZX)
 
 ### 2.3 Separate Windows {#en-sec2-3}
@@ -1452,9 +2457,12 @@ When the main window closes, these child windows close automatically.
 - `AFM Appearance`: open appearance controls (filter/noise/artifacts)
 - `Real AFM image`: open Real AFM / Sim Aligned window
 - `Help` → `View Help...` (`F1`): open built-in detailed manual
+- `Help` → `Open HTML Manual...`: open the standalone HTML version of the same manual in a web browser
 - `Help` → `Third-Party Notices...`: open third-party copyright, license, and trademark notices
 
-The old `Manual` menu has been removed; help and notices are available from `Help`.
+If the bundled HTML is unavailable, `Open HTML Manual...` opens the latest published
+manual. The old `Manual` menu has been removed; manuals and notices are available
+from `Help`.
 
 ---
 
@@ -1505,9 +2513,16 @@ The old `Manual` menu has been removed; help and notices are available from `Hel
 - `Tip Info`: current tip geometry summary
 
 ### 5.5 Tip Position Control {#en-sec5-5}
-- `X (nm)`: -50 to 50
-- `Y (nm)`: -50 to 50
-- `Z (nm)`: 10 to 100
+- `X (nm)` / `Y (nm)` / `Z (nm)`: numeric spin (0.1 nm steps with up/down arrows) plus slider
+- XY range expands automatically with scan size (default roughly ±100 nm or wider)
+- `Z (nm)`: 2.0-20.0 (slider units 10-100; default 2.0 nm). Display-only tip height; Estimate Pose / AFM simulation do not move Z.
+
+### 5.5b Model Rotation {#en-sec5-5b}
+- Placed on the left panel directly under Tip Position Control
+- `Rotation X/Y/Z`:
+  - spin: -180.0 to 180.0 deg (0.5 deg steps)
+  - slider: -1800 to 1800 (0.1 deg units)
+- Used for AFM simulation / Estimate Pose / Impose model
 
 ### 5.6 AFM Simulation {#en-sec5-6}
 - `Scan Size X (nm)`: 1.0-500.0 (default 20.0)
@@ -1518,6 +2533,9 @@ The old `Manual` menu has been removed; help and notices are available from `Hel
 - `Rctangle (force Y = X)` (default ON):
   - Forces `Scan Y = Scan X` and `Ny = Nx`
   - Disable for rectangular scan settings
+- `Live sync from pyNuD` (standalone app only, default OFF):
+  - When enabled, continuously receives the AFM frame currently displayed in a running pyNuD as Real AFM
+  - Use it while an AFM image is open in pyNuD and the AFM Simulator plugin is active
 - `Sync Sim Params to Real AFM`: copy size/resolution from current Real AFM metadata
 - `Interactive Update` (default ON):
   - low-resolution fast updates while interacting
@@ -1547,17 +2565,19 @@ The old `Manual` menu has been removed; help and notices are available from `Hel
   - `tap tau_track (lines)`
   - `tap tau_para (lines)`
   - `tap release (nm)`
+- `Auto-fit Checked Appearance`:
+  - fits only enabled Low-pass, Height Noise, Line Noise, Drift, and Feedback Lag items
+  - does not change unchecked items, modes, scan direction, pose, or Tip Radius/Angle
+  - should be run after `Estimate Pose` and `Auto-fit Tip Radius + Angle`
+  - evaluates correlation, height RMSD, high-frequency content, and line statistics at up to 96 px
 
 ---
 
 ## 6. Structure & View Control {#en-sec6}
 
 ### 6.1 Rotation {#en-sec6-1}
-- `Rotation X/Y/Z`:
-  - spin: -180.0 to 180.0 deg
-  - slider: 0.1 deg step mapped to -1800 to 1800
-- `CTRL + Drag`: rotate structure
-- `Shift + Drag`: pan
+- Model Rotation XYZ lives on the left panel under Tip Position Control
+- The right panel still supports `CTRL + Drag` (structure rotate) and `Shift + Drag` (pan)
 
 ### 6.2 Buttons {#en-sec6-2}
 - `Reset All`
@@ -1611,22 +2631,84 @@ Note:
 
 Image drawing areas are kept aligned in size.
 
-### 8.3 ASD Loading {#en-sec8-3}
+### 8.3 Live sync from pyNuD {#en-sec8-3}
+
+`Live sync from pyNuD` continuously transfers the processed AFM frame currently
+displayed in pyNuD to the Real AFM input of the standalone pyNuD Simulator.
+The default is OFF; enable it explicitly only when live transfer is needed.
+
+**Prepare pyNuD**
+
+1. Open an AFM image such as an ASD file in pyNuD
+2. Display the frame to be used for alignment
+3. Start `AFM Simulator` from the pyNuD Plugin menu
+4. If the standalone installation is detected:
+   - `Launch standalone` keeps the plugin hidden as a data feeder and starts the standalone app
+   - `Use VTK plugin` displays the lightweight VTK version inside pyNuD
+
+While the plugin is active, either choice publishes the current pyNuD frame to
+the shared bridge. Run pyNuD and the standalone app under the same user account.
+
+**Connect the standalone app**
+
+1. Load the PDB/mmCIF structure to align
+2. Enable `Live sync from pyNuD` in the AFM Simulation panel
+3. Confirm that the image label, frame, and physical size appear in the Real AFM window
+4. Click `Sync Sim Params to Real AFM` to copy Scan X/Y and Pixel X/Y
+5. Select a Real AFM ROI if needed
+6. Run `Get Simulated image` and inspect size and aspect ratio
+7. For the first alignment, run `Estimate Pose` with `Global search`
+8. Continue with `Auto-fit Tip Radius + Angle`, optional appearance fitting, and Flexible Fit
+
+**Transferred data**
+
+- The processed height image currently displayed in pyNuD, in nm
+- Scan X/Y, Pixel X/Y, nm/pixel, and scan direction
+- Display label and frame index
+- A replacement frame when the displayed pyNuD frame changes
+
+The PDB/mmCIF model, Simulator rotation, tip, appearance and Flexible Fit
+settings, ROI, pose result, and saved fits are not transferred. Simulator
+processing does not write changes back into the source pyNuD image.
+
+When the pyNuD frame changes, the previous Real AFM frame is replaced and its
+ROI and Sim Aligned preview are cleared. Select the ROI again, rerun
+`Get Simulated image`, and rerun `Estimate Pose`. Use `Global search` after
+switching to a different molecule or substantially different image.
+
+**Stop or disconnect**
+
+- Disable `Live sync from pyNuD` to stop receiving; the last received Real AFM remains loaded
+- Closing the AFM Simulator plugin in pyNuD stops new frame publication
+- Closing either program does not modify the source ASD or pyNuD image
+
+**If connection fails**
+
+- Confirm that an AFM image is open in pyNuD
+- Confirm that the pyNuD `AFM Simulator` plugin is active
+- Confirm that `Live sync from pyNuD` is enabled in the standalone app
+- Run both applications under the same user account
+- Toggle the checkbox OFF/ON and change the pyNuD frame to republish it
+- If size is incorrect, rerun `Sync Sim Params to Real AFM`
+
+### 8.4 ASD Loading {#en-sec8-4}
 - Drag-and-drop `.asd` onto Real AFM panel, or load via dialog
 - On load:
   - frame controls update
   - scan/pixel metadata updates
   - optional simulation parameter sync
 
-### 8.4 ROI on Real AFM {#en-sec8-4}
+### 8.5 ROI on Real AFM {#en-sec8-5}
 - Left drag: select ROI
 - Right click: clear ROI
+- `Use Full Image`: clear ROI and restore the complete image as the Estimate Pose target
+- The `Pose ROI` indicator shows Full image / Selected and the selected size
 - When ROI is applied:
   - active Real AFM area changes
   - scan size and resolution metadata are recomputed from ROI
-  - previous alignment preview is cleared
+  - the previous pose and alignment preview are cleared; rerun a Global search
 
-### 8.5 Buttons {#en-sec8-5}
+### 8.6 Buttons {#en-sec8-6}
 - `Get Simulated image`
   - simulates XY from current structure using Real AFM scan size/resolution
   - displays result on `Sim Aligned`
@@ -1637,23 +2719,39 @@ Image drawing areas are kept aligned in size.
   - `Pose axes` `X` / `Y` / `Z` checkboxes restrict which structure rotation axes may change during search
   - applies estimated rotation to controls
   - keeps Sim Aligned and main XY simulation consistent
-- `Auto-fit AFM Appearance`
-  - first searches probe `Radius (nm)` / `Angle (deg)` and low-pass `Cutoff Wavelength (nm)`
-  - turns `Apply Low-pass Filter` on when Auto-fit succeeds
-  - then searches noise/artifact parameters to visually match Real AFM
+- `Auto-fit Tip Radius + Angle`
+  - assumes orientation and XY position already match the Real AFM image
+  - uses a bounded two-stage search over probe `Radius (nm)` and `Angle (deg)`
+  - fits only radius for Paraboloid tips, where angle does not affect shape
+  - includes physical-height error and a weak oversized-radius penalty
+  - does not search or change low-pass, noise, or scan-artifact settings
   - applies result to aligned preview as well
 - `Impose model` (checkbox)
   - when on, overlays the **molecular model rendered like the main 3D view** (same Style / Color / Size / Opacity) on top of the Real AFM image
   - uses an orthographic XY off-screen render framed to the AFM scan window (tip center, Scan X/Y, resolution), scaled to the Real AFM display
   - if a pose residual (Dx/Dy) exists after `Estimate Pose`, it is applied as a whole-image shift (same as the Difference panel)
   - the Real AFM window `Opacity` slider controls overall overlay opacity
-  - auto-updates on rotation change, `Estimate Pose`, and display-setting changes (falls back to max-Z atom projection if 3D capture is unavailable)
+  - auto-updates on Tip Position, Rotation XYZ, `Estimate Pose`, and display-setting changes (falls back to max-Z atom projection if 3D capture is unavailable)
 - `Difference (Real − Sim)` panel (rightmost, auto-updating)
   - shows Real minus Sim Aligned after removing each image's mean offset, subtracted in nm
   - if a pose residual (Dx/Dy) from `Estimate Pose` exists, the simulated image is shifted onto the Real features before differencing
   - diverging colormap (seismic): 0 = white, positive (real higher) = red, negative (sim higher) = blue; range is symmetric at the 99th percentile of |diff|
   - displays `RMSD` (nm) and `ZNCC` (correlation)
   - shows a placeholder until `Get Simulated image` has been run
+- `Detect Domains`: predicts Flexible Fit domains by combining PDB/mmCIF metadata, contacts, and ENM
+- `Auto`: selects domain count automatically; disable it to choose `Total` or `N × D/chain`
+- `N × D/chain`: monomers (or PDB chains) × domains per monomer (e.g. cadherin trimer 3×5)
+- `Domain colors`: displays detected assignments on the structure
+- `Method`: selects `Rigid Domains (built-in)`, `Linear ANM (built-in)`, `Iterative NMFF-AFM (built-in)`, `Nonlinear NMA (NOLB)`, or `Official AFMfit (external)`
+- `Run Flexible Fit`: runs the selected method against Real AFM
+- `Iterative NMFF-AFM (built-in)`: recalculates ANM modes after each accepted step and selects a mode/direction from the Pearson-correlation slope at -Q, -Q/2, 0, +Q/2, and +Q
+- `Nonlinear NMA (NOLB)`: generates nonlinear-NMA candidates with an external NOLB executable and ranks them with pyNuD AFM simulation; domain detection is not required
+- `Official AFMfit (external)`: runs a separately installed official AFMfit Python environment for local pose refinement and NOLB-RTB flexible fitting; available on macOS/Linux
+- `Save Fit`: saves the accepted fitted PDB and report
+- `Compare Structures`: overlays the originally loaded structure (gray) and best-fit (cyan) structures in a separate interactive VTK window
+- `Reset Fit`: restores the originally loaded coordinates while keeping Rotation XYZ / tip XY; clears the accepted fit result
+- `Active structure`: after an accepted fit, switches between `Original (loaded)` and `Best Fit`; Original is always the first-loaded structure; the selected model is used by Estimate Pose, AFM simulation, Impose model, and subsequent Flexible Fit runs
+- Original and Best Fit retain independent last-used Estimate Pose rotation and XY placement
 
 ---
 
@@ -1670,6 +2768,14 @@ Image drawing areas are kept aligned in size.
 - `High`
 
 Higher precision increases search evaluations and runtime.
+
+The default `Medium` / `High` choices refine from the current Rotation XYZ
+(`Refine current rotation`, or `Refine current pose` after a prior successful
+estimate). After `Find Initial Plane`, X/Y tilt is preserved while the in-plane
+Z angle is searched more freely, with a hard limit on tilt drift. Choose
+`Global search` when the starting orientation is still unknown.
+If `Find Initial Plane` has not been run yet, `Estimate Pose` runs contact-area
+ranking automatically first; retained substrate contact is a strong constraint.
 
 ### 9.3 Search Flow {#en-sec9-3}
 1. evaluate the current Rotation as a baseline
@@ -1690,30 +2796,220 @@ Axes disabled in `Pose axes` are fixed at their current Rotation values during E
 
 ---
 
-## 10. Auto-fit AFM Appearance Behavior {#en-sec10}
+## 10. Auto-fit Tip Radius + Angle Behavior {#en-sec10}
 
-Purpose: fit probe, low-pass, and noise appearance to the Real AFM look.
+Purpose: fit probe radius and angle after structure alignment with a bounded two-stage search.
 
 Key points:
 - requires Real AFM and a simulation target structure such as PDB/CIF/MRC/coarse-grain
 - re-simulates XY using ASD `Scan X/Y` and `Nx/Ny`
-- Stage 1 fits probe `Radius (nm)`, `Angle (deg)`, and low-pass `Cutoff Wavelength (nm)`
-- Stage 2 fits noise/scan artifact parameters from the best Stage 1 image
-- `Apply Low-pass Filter` is turned on when Auto-fit succeeds, and Auto-fit changes `Cutoff Wavelength (nm)`
-- `Cutoff Wavelength (nm)` is the wavelength-form parameter corresponding to the low-pass spatial-frequency cutoff
-- uses fixed `Scan Direction = L2R` during search
-- explores candidates over:
-  - tip radius / angle
-  - low-pass cutoff wavelength
-  - height noise
-  - line noise
-  - drift
-  - feedback mode parameters (`none`, `linear_lag`, `tapping_parachute`)
-- writes best candidate back to AFM Appearance controls
+- requires a previously estimated pose or a correct manual orientation/XY alignment
+- jointly explores radius and angle for Cone/Sphere tips
+- explores radius only for Paraboloid tips
+- warns when the optimum reaches a search boundary
+- does not search or change low-pass, noise, drift, or feedback settings
+- writes the best candidate back to the Tip controls
 
 ---
 
-## 11. Interactive Update Behavior {#en-sec11}
+## 11. Detect Domains / Flexible Fit {#en-sec11}
+
+### 11.1 Hybrid domain detection
+
+`Detect Domains` combines:
+- PDB/mmCIF Chain, residue order, and HELIX/SHEET records
+- C-alpha (or P for nucleic acids) residue-contact networks
+- 3D geometry
+- low-frequency ENM modes
+- pLDDT only when the B-factor distribution strongly resembles AlphaFold output
+
+Chain identity is a strong prior, not a hard boundary. Closely interacting chains with consistent ENM motion may remain in one domain. Ordinary crystallographic B factors are not used as pLDDT. No external CATH/SCOP/Pfam lookup is performed.
+
+Auto selection evaluates silhouette, unnecessary complexity, and sequence-fragmented assignments. The result remains a prediction: inspect boundaries and spatial coherence with `Domain colors` before fitting.
+
+### 11.2 Flexible Fit
+
+- `Rigid Domains (built-in)` requires a successful `Estimate Pose` and at least two domains; it fixes the largest domain as an anchor and moves only the others
+- `Linear ANM (built-in)` calculates ANM modes from C-alpha, C-alpha/P, or all protein atoms and optimizes their linear-combination amplitudes in nm RMS units; domain detection is not required
+- `Iterative NMFF-AFM (built-in)` recalculates ANM modes from every accepted structure and applies the mode/direction with the strongest AFM-correlation slope across `-Q, -Q/2, 0, +Q/2, +Q`; domain detection is not required
+- `Nonlinear NMA (NOLB)` asks the separately downloaded academic NOLB executable to generate a nonlinear-NMA ensemble and ranks each candidate against Real AFM; NOLB is not bundled
+- `Official AFMfit (external)` invokes a separately installed official AFMfit package, locally refines the Estimate Pose projection, and performs NOLB-RTB flexible fitting; AFMfit is not bundled
+- its settings dialog controls atom selection, cutoff distance, first/count of fitted modes, amplitude and total-displacement limits, preview resolution, evaluations, and three deformation-penalty weights
+- NMA Fit constrains excessive deformation with eigenvalue-weighted mode energy, sequential-backbone strain, and total-RMS-displacement penalties
+- both methods search at up to 96 px and validate the final candidate at original resolution
+- candidates are rejected unless pose score improves without worsening aligned RMSD
+- accepted fits update Difference, pose residuals, structure display, and saved PDB
+
+Use Domain Fit for large inter-region motion and NMA Fit for smooth collective motion. Either output is an AFM-supported candidate model, not proof of a unique molecular state. Inspect the saved mode amplitudes, RMS displacement, and structural plausibility.
+
+### 11.3 Common preparation
+
+1. Load a PDB/mmCIF structure and a Real AFM image
+2. Select the target with an ROI or choose `Use Full Image`
+3. Complete `Estimate Pose` to establish the global rigid pose
+4. Run `Auto-fit Tip Radius + Angle`
+5. Optionally fit selected image-formation effects with `Auto-fit Checked Appearance`
+6. Choose `Method` and run `Run Flexible Fit`
+
+Flexible Fit changes internal coordinates; it must not replace global pose alignment. An incorrect ROI, pose, or tip model can make deformation absorb image-position or tip-shape errors.
+
+### 11.4 Rigid Domains (built-in)
+
+Use this method for large inter-region motion. At least two domains from `Detect Domains` are required. The largest domain remains fixed as an anchor while the other domains undergo relative rotation and translation.
+
+- `Fast`: short check with a narrow search
+- `Medium`: standard search
+- `Thorough`: wider search with more evaluations
+- `Large motion`: for large hinge / arm opening; up to ±45° rotation with translation scaled to domain size. Still compatible with connected-domain mode
+- Domain connectivity:
+  - `Keep domains connected (no separation)` (default): preserves starting interface/linker distances and rejects candidates where domains fly apart
+  - `Allow domains to separate`: soft boundary penalty only; independent pieces may move toward different image peaks
+
+Inspect sequence and spatial coherence with `Domain colors` before fitting. If Auto boundaries are implausible, disable Auto and change the domain count. When the AFM shape is much more open than the model, try `Large motion` with `Keep domains connected` first.
+
+### 11.5 Linear ANM (built-in) settings
+
+- `Use PDB-safe automatic settings (recommended)`: estimates conservative cutoff, mode count, displacement limits, evaluation count, and penalties from PDB node spacing and molecular size
+- `Show advanced/manual controls`: shows the automatic values or allows manual editing after automatic mode is disabled
+- `Atom Selection`: C-alpha, C-alpha/P, or all protein atoms
+- `Cutoff Distance`: distance used to construct the elastic network
+- `First Fitted Mode`: first non-rigid low-frequency mode; 1 is the lowest
+- `Number of Fitted Modes`: number of amplitudes optimized together
+- `Max Amplitude / Mode`: per-mode limit in nm RMS
+- `Max Total RMS Displacement`: total structural-displacement limit
+- `Preview Resolution (max)`: maximum image resolution used during search
+- `Maximum Evaluations`: optimizer evaluation limit
+- `Mode Energy Penalty`: discourages large high-energy-mode amplitudes
+- `Backbone Strain Penalty`: discourages sequential-backbone distortion
+- `Steric Clash Penalty`: adds a soft cost for implausible close contacts
+
+PDB-safe automatic mode is enabled by default. It first derives conservative values from PDB geometry, then scans both signs of every selected ANM mode and tightens the amplitude limit again. Any candidate that creates a new severe heavy-atom clash is rejected during the search even when its AFM score is favorable.
+
+A PDB alone cannot determine a unique optimum against an AFM image. The automatic values are structure-preserving search limits; inspect the fitted PDB, RMS displacement, and Difference image.
+
+### 11.6 Iterative NMFF-AFM (built-in) settings
+
+At each iteration, pyNuD recalculates ANM from the accepted structure and evaluates `-Q, -Q/2, 0, +Q/2, +Q` for every selected mode.
+
+- `Atom Selection`: ANM nodes
+- `Elastic-network Cutoff`: ANM connection distance
+- `First Non-rigid Mode`: first mode evaluated
+- `Number of Modes`: modes evaluated per iteration
+- `Step Amplitude Q`: reference displacement per iteration in nm RMS
+- `Maximum Iterations`: iteration limit
+- `Max Total RMS Displacement`: displacement limit from the starting model
+- `Minimum CC Gain`: minimum correlation gain required for acceptance
+- `Decay Threshold Fraction`: convergence threshold relative to the initial gain
+- `Convergence Patience`: number of small-gain iterations tolerated
+- `Preview Resolution (max)`: maximum AFM-scoring resolution
+
+Defaults are C-alpha, 8 Å cutoff, 15 modes, Q=0.05 nm RMS, 70 iterations, 1.5 nm total RMS displacement, and 96 px preview. Every candidate is checked for a new severe heavy-atom clash before AFM scoring; clashing candidates are skipped and the last safe improvement is retained. This is an independent implementation inspired by the published NMFF-AFM workflow, not the official BioAFMviewer code. It uses built-in ANM instead of RTB modes and keeps the `Estimate Pose` rigid pose fixed.
+
+### 11.7 Nonlinear NMA (NOLB) settings
+
+NOLB generates a nonlinear-NMA ensemble; pyNuD ranks every conformation with its AFM simulation. NOLB is not bundled with pyNuD Simulator and must be installed separately.
+
+#### Installing NOLB
+
+1. Download the academic NOLB build from the [official NOLB page](https://team.inria.fr/nano-d/software/nolb-normal-modes/).
+2. Extract the archive and locate the executable (usually named `NOLB`).
+3. Place it somewhere convenient such as `~/.local/bin/NOLB` and make it executable:
+
+```bash
+mkdir -p ~/.local/bin
+cp /path/to/downloaded/NOLB ~/.local/bin/NOLB
+chmod +x ~/.local/bin/NOLB
+```
+
+4. In the Real AFM window choose `Method` → `Nonlinear NMA (NOLB)` → `Run Flexible Fit`, then set `NOLB Executable` to the full path (default candidates are `~/.local/bin/NOLB` or `NOLB` on PATH).
+5. On Apple Silicon macOS, an x86_64 NOLB binary may require Rosetta. Install it when prompted, or run `softwareupdate --install-rosetta`.
+
+Follow the academic license terms published by the NOLB distributors.
+
+#### Settings
+
+- `NOLB Executable`: separately downloaded NOLB executable
+- `Generated Structures`: ensemble size
+- `Use PDB-safe RMSD limit (recommended)`: derives a conservative 2–4 Å maximum RMSD from PDB size
+- `Maximum Ensemble RMSD`: maximum ensemble RMSD in Å; editable when the automatic limit is disabled
+- `Elastic-network Cutoff`: NOLB network cutoff in Å
+- `Geometry Refinement`: apply NOLB `-m` minimization
+- `Preview Resolution (max)`: maximum candidate-scoring resolution
+- `Maximum NOLB Runtime`: stops NOLB ensemble generation at this time limit
+
+Defaults are 50 structures, a PDB-safe 2–4 Å maximum RMSD, 5 Å cutoff, Geometry Refinement enabled, 96 px preview, and a 600-second runtime limit. During generation the dialog shows elapsed time, log size, output-PDB size, and the latest NOLB output. It explicitly reports when the process is alive but has not emitted text.
+
+Global rotation and translation are removed from each candidate by Kabsch alignment. Candidates with excessive RMS/peak displacement or a new severe heavy-atom clash are rejected before AFM scoring. Complete `Estimate Pose` first so NOLB focuses on internal conformational change.
+
+### 11.8 Official AFMfit (external) settings
+
+Set `AFMfit Python` to the Python executable where the official AFMfit package is installed. pyNuD passes the current Real AFM frame/ROI and a temporary PDB with the Estimate Pose orientation. AFMfit is separate GPL-3.0-or-later software and is not bundled. Its official NOLB backend supports macOS/Linux rather than native Windows.
+
+#### Installing AFMfit
+
+Install official AFMfit in a dedicated virtual environment, separate from the pyNuD runtime.
+
+1. Create a venv (example: `~/afmfit-env`):
+
+```bash
+python3 -m venv ~/afmfit-env
+source ~/afmfit-env/bin/activate
+python -m pip install -U pip setuptools wheel
+```
+
+2. Clone the official repository:
+
+```bash
+git clone https://gricad-gitlab.univ-grenoble-alpes.fr/GruLab/AFMfit.git
+cd AFMfit
+```
+
+3. Install AFMfit. With CMake 4, building the `libasd` dependency may fail unless the compatibility flag is set:
+
+```bash
+CMAKE_POLICY_VERSION_MINIMUM=3.5 python -m pip install .
+```
+
+If installing from a parent directory that contains `./AFMfit`:
+
+```bash
+CMAKE_POLICY_VERSION_MINIMUM=3.5 python -m pip install ./AFMfit
+```
+
+4. Verify the install:
+
+```bash
+python -c "import afmfit; from afmfit.utils import get_nolb_path; print(afmfit.__version__, get_nolb_path())"
+```
+
+Confirm that the reported NOLB path exists and is executable.
+
+5. In the Real AFM window open `Method` → `Official AFMfit (external)` → `Run Flexible Fit` and set `AFMfit Python` to the venv interpreter (example: `~/afmfit-env/bin/python`).
+6. Auto-detection order: `PYNUD_AFMFIT_PYTHON` → `~/afmfit-env/bin/python` → `~/Downloads/afmfit-env/bin/python`.
+
+Notes:
+- The AFMfit-bundled NOLB backend targets macOS/Linux. Native Windows is not supported for this method.
+- ChimeraX is recommended by AFMfit for visualization, but it is not required for Flexible Fit launched from pyNuD.
+- Standalone academic NOLB (for `Nonlinear NMA (NOLB)`) and the NOLB shipped inside AFMfit are separate; do not mix their paths casually.
+
+#### Runtime behavior
+
+After AFMfit finishes, pyNuD verifies atom identity/order, removes global rigid motion, and independently checks RMS/peak displacement, new severe heavy-atom clashes, and the original-resolution AFM score. The structure is applied only when the safety checks pass and the pyNuD score improves. Progress reports NMA, rigid, flexible, and output stages with percent, elapsed time, and log size; Cancel and a runtime limit are supported.
+
+### 11.9 Acceptance, saving, and comparison
+
+Search uses a reduced resolution and the best candidate is re-evaluated at original resolution. A candidate is rejected when pose score does not improve and aligned RMSD worsens, leaving the starting structure unchanged.
+
+- `Save Fit`: writes the accepted PDB and a `_report.txt`
+- `Compare Structures`: overlays the original structure in gray and the accepted structure in cyan
+- `Reset Fit`: restores the originally loaded coordinates without changing pose controls
+- Saved report: records method, settings, before/after RMSD and ZNCC, displacement, mode amplitudes, and iteration/evaluation counts
+
+A flexible fit is an AFM-supported candidate, not necessarily a unique structure. Inspect displacement, backbone continuity, steric clashes, and independent structural knowledge. The input PDB is never overwritten automatically.
+
+---
+
+## 12. Interactive Update Behavior {#en-sec12}
 
 When ON:
 - during interaction: low-resolution fast updates (mainly XY)
@@ -1725,7 +3021,7 @@ When OFF:
 
 ---
 
-## 12. Save/Export {#en-sec12}
+## 13. Save/Export {#en-sec13}
 
 - `Save as ASD...`: simulated data export
 - `Save Image...`: image export with view selection/incremental rotation options
@@ -1734,7 +3030,7 @@ When OFF:
 
 ---
 
-## 13. Mouse/Key Operations {#en-sec13}
+## 14. Mouse/Key Operations {#en-sec14}
 
 - Structure view:
   - `CTRL + Left Drag`: rotate
@@ -1748,21 +3044,41 @@ When OFF:
 
 ---
 
-## 14. Recommended Real-AFM Alignment Workflow {#en-sec14}
+## 15. Recommended Real-AFM Alignment Workflow {#en-sec15}
 
-1. Load PDB/CIF
-2. Open `Real AFM image` window
-3. Load ASD and select frame
-4. Optionally define ROI around target molecule
-5. Run `Get Simulated image`
-6. Run `Estimate Pose` with selected precision
-7. Run `Auto-fit AFM Appearance`
-8. Confirm consistency between main XY and Sim Aligned
-9. Save ASD/image outputs
+### 15.1 Loading ASD directly {#en-sec15-1}
+
+1. Load PDB/CIF  
+2. Open `Real AFM image` window  
+3. Load ASD and select frame  
+4. Optionally define ROI around target molecule  
+5. Run `Get Simulated image`  
+6. Run `Estimate Pose` with selected precision  
+7. Run `Auto-fit Tip Radius + Angle`
+8. If needed, check AFM Appearance items and run `Auto-fit Checked Appearance`
+9. For flexible structures, choose `Method` and run `Run Flexible Fit`: Rigid Domains for region motion, Linear ANM for small collective motion, or NOLB/Official AFMfit for large-amplitude motion
+10. Confirm consistency between main XY and Sim Aligned
+11. Save ASD/images or the fitted PDB
+
+### 15.2 Using pyNuD Live sync {#en-sec15-2}
+
+1. Open an AFM image in pyNuD and display the target frame
+2. Start `AFM Simulator` from the pyNuD Plugin menu
+3. Select `Launch standalone` if the standalone app should be used
+4. Load the PDB/CIF in the standalone app
+5. Enable `Live sync from pyNuD` and confirm the frame appears as Real AFM
+6. Run `Sync Sim Params to Real AFM`
+7. Select an ROI when only one molecule should be fitted
+8. Run `Get Simulated image` and inspect size, aspect ratio, and initial position
+9. Run `Estimate Pose` (auto-runs `Find Initial Plane` first when needed)
+10. Use `Estimate Pose` with `Global search` for the first alignment
+11. Run tip fitting, appearance fitting, and Flexible Fit as needed
+12. Inspect Difference, RMSD, ZNCC, and structural displacement before saving
+13. After changing the frame in pyNuD, repeat from ROI selection
 
 ---
 
-## 15. Troubleshooting {#en-sec15}
+## 16. Troubleshooting {#en-sec16}
 
 - `PDB is not loaded`:
   - load structure first
@@ -1777,22 +3093,41 @@ When OFF:
   - run `Get Simulated image` first to ensure matching scan settings
 - aspect mismatch:
   - verify rectangle lock and Real AFM X/Y ratio
+- implausible Detect Domains boundaries:
+  - inspect `Domain colors`, disable Auto, and change domain count
+  - check whether Chain, missing-residue, and HELIX/SHEET information is present
+- no Flexible Fit improvement:
+  - complete Estimate Pose and tip fitting first
+  - verify that ROI contains the target molecule and domain boundaries are plausible
+  - try NMA Fit when Domain Fit fails (or vice versa), then inspect displacement in the saved report
+- `NOLB executable was not found` / NOLB will not start:
+  - download the academic build from the [official NOLB page](https://team.inria.fr/nano-d/software/nolb-normal-modes/) and set the full path in `NOLB Executable`
+  - confirm execute permission (`chmod +x`)
+  - Apple Silicon may require Rosetta
+- AFMfit import / environment check fails:
+  - install official AFMfit in a dedicated venv and point `AFMfit Python` at that `bin/python` (keep the venv launcher, do not resolve the symlink)
+  - if CMake 4 breaks `libasd`, rerun with `CMAKE_POLICY_VERSION_MINIMUM=3.5 python -m pip install ./AFMfit`
+  - the first check can take up to about 90 seconds while Numba builds caches
+  - Official AFMfit is unsupported on native Windows (macOS/Linux only)
 
 ---
 
-## 16. Dependency Note {#en-sec16}
+## 17. Dependency Note {#en-sec17}
 
 - `cv2` is not required for ASD loading/display.
 - ASD loading is handled through `asd_io.py`.
 
 ---
 
-## 17. Current Important Behavior Summary {#en-sec17}
+## 18. Current Important Behavior Summary {#en-sec18}
 
 - `Help` menu contains `View Help...` and `Third-Party Notices...`
 - Real AFM and aligned preview are managed in a separate window
 - Estimate Pose optimizes Rotation XYZ with re-simulation
-- Auto-fit AFM Appearance is applied to aligned preview as well
+- Auto-fit Tip Radius + Angle is applied to aligned preview as well
+- Auto-fit Checked Appearance changes only enabled appearance items
+- Detect Domains combines PDB/mmCIF metadata, contact networks, and ENM
+- Flexible Fit provides rigid-region Domain Fit and continuous-deformation NMA Fit
 - Interactive Update default is ON
 - Rectangle lock default is ON and can auto-disable when needed
 """
@@ -1815,7 +3150,7 @@ class HelpContentManager:
         if page_id != "detailed_manual":
             page_id = "detailed_manual"
         return self._wrap_content(self._embedded_detailed_manual_page())
-
+            
     def get_ui_text(self, key):
         return self.content[self.current_language]['ui_text'].get(key, '')
 
@@ -2152,10 +3487,10 @@ class HelpContentManager:
         }
     </style>
     """
-
+    
     def _initialize_content(self):
         self.current_language = 'en'
-
+        
         # --- 英語コンテンツ ---
         toc_structure_en = [("Manual", self._build_detailed_manual_toc_items('en'))]
         pages_en = {
@@ -2394,7 +3729,7 @@ class HelpWindow(QWidget):
         splitter.addWidget(self.help_viewer)
         splitter.setSizes([220, 580])
         layout.addWidget(splitter)
-
+    
     def switch_language(self, lang_code):
         self.content_manager.set_language(lang_code)
         self.setWindowTitle(self.content_manager.get_ui_text('window_title'))
@@ -2440,17 +3775,17 @@ class HelpWindow(QWidget):
             self.toc_tree.addTopLevelItem(category_item)
             add_items(category_item, items, 1)
         self.toc_tree.expandAll()
-
+    
     def onTocItemClicked(self, item, column):
         item_id = item.data(0, Qt.UserRole)
         if item_id: self.showHelpPage(item_id)
-
+    
     def showHelpPage(self, page_id):
         base_id, anchor = (page_id.split('#', 1) + [None])[:2] if '#' in page_id else (page_id, None)
         self.help_viewer.setHtml(self.content_manager.get_content(base_id))
         if anchor:
             QTimer.singleShot(0, lambda: self.help_viewer.scrollToAnchor(anchor))
-
+    
     def showHomePage(self):
         self.showHelpPage('detailed_manual')
 class AFMSimulationWorker(QThread):
@@ -2472,7 +3807,7 @@ class AFMSimulationWorker(QThread):
 
     def cancel(self):
         self._is_cancelled = True
-
+    
     def __del__(self):
         """
         デストラクタではwait/terminateしない。
@@ -2503,27 +3838,27 @@ class AFMSimulationWorker(QThread):
                 if not self.silent_mode:
                     self.progress.emit(start_progress)
                 if self._is_cancelled: break
-
+                
                 self.rotated_atom_coords = scan_coords
                 if self._is_cancelled: break
-
+                
                 if self.sim_params.get('use_vdw', False) and self.element_symbols is not None:
                     sample_surface = self.create_vdw_surface()
                 else:
                     sample_surface = self.create_atom_center_surface()
-
+                
                 if not self.silent_mode:
                     self.progress.emit(start_progress + int((end_progress - start_progress) * 0.1))
                 if self._is_cancelled: break
-
+                
                 nx = self.sim_params.get('nx', self.sim_params.get('resolution', 64))
                 ny = self.sim_params.get('ny', self.sim_params.get('resolution', 64))
                 scan_x = self.sim_params.get('scan_x_nm', self.sim_params.get('scan_size', 20.0))
                 scan_y = self.sim_params.get('scan_y_nm', self.sim_params.get('scan_size', 20.0))
-
+                
                 dx = scan_x / nx
                 dy = scan_y / ny
-
+                
                 z_coords = scan_coords[:, 2]
                 mol_depth = np.max(z_coords) - np.min(z_coords) if z_coords.size > 0 else 0
                 tip_footprint = self.create_igor_style_tip(dx, dy, mol_depth)
@@ -2555,7 +3890,7 @@ class AFMSimulationWorker(QThread):
                 # ★★★ 削除：ステータス表示を無効化 ★★★
                 # self.status_update.emit("All tasks completed!")
                 pass
-
+            
             if not self.silent_mode:
                 self.progress.emit(100)
             self.done.emit(None)
@@ -2563,35 +3898,35 @@ class AFMSimulationWorker(QThread):
         except Exception as e:
             print(f"An error occurred during the AFM simulation: {e}")
             self.done.emit(None)
-
+    
     def create_vdw_surface(self):
         """ファンデルワールス半径を考慮した表面マップを作成する。"""
         nx = self.sim_params.get('nx', self.sim_params.get('resolution', 64))
         ny = self.sim_params.get('ny', self.sim_params.get('resolution', 64))
         scan_x = self.sim_params.get('scan_x_nm', self.sim_params.get('scan_size', 20.0))
         scan_y = self.sim_params.get('scan_y_nm', self.sim_params.get('scan_size', 20.0))
-
+        
         center_x = self.sim_params['center_x']
         center_y = self.sim_params['center_y']
-
+        
         pixel_x = scan_x / nx
         pixel_y = scan_y / ny
-
+        
         x_start = center_x - scan_x / 2.0
         y_start = center_y - scan_y / 2.0
-
+        
         min_z = np.min(self.rotated_atom_coords[:, 2]) if self.rotated_atom_coords.size > 0 else 0
-
+        
         if self.rotated_atom_coords.size == 0:
             return np.zeros((ny, nx), dtype=np.float64)
 
         atom_radii = np.array([self.vdw_radii.get(e, self.vdw_radii['other']) for e in self.element_symbols], dtype=np.float64)
-
+        
         surface_map = _create_vdw_surface_loop(
             nx, ny, pixel_x, pixel_y, x_start, y_start, min_z,
             self.rotated_atom_coords, atom_radii
         )
-
+        
         return surface_map
 
 
@@ -2601,16 +3936,16 @@ class AFMSimulationWorker(QThread):
         ny = self.sim_params.get('ny', self.sim_params.get('resolution', 64))
         scan_x = self.sim_params.get('scan_x_nm', self.sim_params.get('scan_size', 20.0))
         scan_y = self.sim_params.get('scan_y_nm', self.sim_params.get('scan_size', 20.0))
-
+        
         center_x = self.sim_params['center_x']
         center_y = self.sim_params['center_y']
-
+        
         pixel_x = scan_x / nx
         pixel_y = scan_y / ny
-
+        
         x_start = center_x - scan_x / 2.0
         y_start = center_y - scan_y / 2.0
-
+        
         min_z = np.min(self.rotated_atom_coords[:, 2]) if self.rotated_atom_coords.size > 0 else 0
         surface_map = np.full((ny, nx), min_z - 5.0, dtype=np.float64)
 
@@ -2625,7 +3960,7 @@ class AFMSimulationWorker(QThread):
         mask = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
         if np.any(mask):
             np.maximum.at(surface_map, (iy[mask], ix[mask]), atom_z[mask])
-
+        
         surface_map[surface_map < min_z - 4.0] = 0.0 # 原子がないピクセルは高さ0とする
 
         return surface_map
@@ -2651,10 +3986,10 @@ class AFMSimulationWorker(QThread):
 
         tip_px = int(np.ceil(max_tip_radius_nm / dx))
         tip_py = int(np.ceil(max_tip_radius_nm / dy))
-
+        
         tip_wave = np.zeros((2 * tip_py + 1, 2 * tip_px + 1), dtype=np.float64)
         y_idx, x_idx = np.indices(tip_wave.shape)
-
+        
         r_i = np.sqrt(((x_idx - tip_px) * dx)**2 + ((y_idx - tip_py) * dy)**2)
         if tip_shape == 'cone':
             r_crit = R * np.cos(alpha_rad)
@@ -2678,143 +4013,7 @@ class AFMSimulationWorker(QThread):
         if np.any(tip_wave):
             tip_wave -= np.min(tip_wave)
         return tip_wave
-
-    def simulate_views_blocking(self, desired_keys):
-        """
-        Run simulation only for desired view keys (['XY_Frame','YZ_Frame','ZX_Frame'])
-        blocking this method until finished.
-        """
-        # Map internal keys to checkboxes
-        key_to_check = {
-            "XY_Frame": self.afm_x_check,
-            "YZ_Frame": self.afm_y_check,
-            "ZX_Frame": self.afm_z_check
-        }
-        # Save original states
-        original = {k: key_to_check[k].isChecked() for k in key_to_check}
-        try:
-            # Apply new checkbox states
-            for k, cb in key_to_check.items():
-                cb.blockSignals(True)
-                cb.setChecked(k in desired_keys)
-                cb.blockSignals(False)
-            # Kick simulation
-            self.run_simulation()
-            loop = QEventLoop()
-            def _quit_once(_):
-                if loop.isRunning():
-                    loop.quit()
-            self.simulation_done.connect(_quit_once)
-            loop.exec_()
-        finally:
-            # Restore original states
-            for k, cb in key_to_check.items():
-                cb.blockSignals(True)
-                cb.setChecked(original[k])
-                cb.blockSignals(False)
-            # Restore display layout
-            self.update_afm_display()
-
-    def handle_save_image(self):
-        """Export one or more simulated AFM images (PNG) with optional incremental rotation."""
-        if not self.simulation_results:
-            QMessageBox.warning(self, "No Data", "No simulation data available to save.")
-            return
-
-        # Build available (only those already simulated)
-        available_keys = list(self.simulation_results.keys())
-        display_names = {"XY_Frame": "XY View", "YZ_Frame": "YZ View", "ZX_Frame": "ZX View"}
-
-        dlg = SaveAFMImageDialog(available_keys, display_names, self.get_active_dataset_id(), self)
-        if dlg.exec_() != QDialog.Accepted:
-            return
-        result = dlg.get_result()
-        selected_view_keys = result['selected_views']
-        rot_inc = result['drot']
-        base_name = result['base_name']
-
-        if not selected_view_keys:
-            QMessageBox.warning(self, "No Selection", "No views selected.")
-            return
-
-        # Map for filename friendly
-        def key_to_short(k):
-            return {
-                "XY_Frame": "XY",
-                "YZ_Frame": "YZ",
-                "ZX_Frame": "ZX"
-            }.get(k, k.replace("_Frame", ""))
-
-        # Prepare directory & ensure last_import_dir is valid
-        directory = ""
-        if self.last_import_dir and os.path.isdir(self.last_import_dir):
-            directory = self.last_import_dir
-        if not directory:
-            directory = os.getcwd()
-
-        # Save original rotation
-        orig_rx = self.rotation_widgets['X']['spin'].value()
-        orig_ry = self.rotation_widgets['Y']['spin'].value()
-        orig_rz = self.rotation_widgets['Z']['spin'].value()
-
-        apply_rotation = any(abs(v) > 1e-6 for v in rot_inc.values())
-
-        try:
-            if apply_rotation:
-                # Apply incremental rotation (add to current)
-                self.rotation_widgets['X']['spin'].setValue(self.normalize_angle(orig_rx + rot_inc['x']))
-                self.rotation_widgets['Y']['spin'].setValue(self.normalize_angle(orig_ry + rot_inc['y']))
-                self.rotation_widgets['Z']['spin'].setValue(self.normalize_angle(orig_rz + rot_inc['z']))
-                # Force apply transform & run simulation for required views
-                self.apply_structure_rotation()
-                self.simulate_views_blocking(selected_view_keys)
-
-            # Export each selected view
-            export_count = 0
-            for key in selected_view_keys:
-                if key not in self.simulation_results:
-                    continue
-                data = self.simulation_results[key]
-                # Normalize to 8-bit grayscale
-                mn, mx = float(np.min(data)), float(np.max(data))
-                if mx <= mn:
-                    norm = np.zeros_like(data, dtype=np.uint8)
-                else:
-                    norm = ((data - mn) / (mx - mn) * 255).astype(np.uint8)
-
-                # Resize to 512x512
-                try:
-                    from PIL import Image
-                except ImportError:
-                    QMessageBox.critical(self, "Missing Pillow", "Install Pillow to export images (pip install Pillow).")
-                    return
-                img = Image.fromarray(norm, mode='L')
-                resample_filter = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS
-                img = img.resize((512, 512), resample=resample_filter)
-
-                fname = f"{base_name}_{key_to_short(key)}_dx{rot_inc['x']:+.0f}_dy{rot_inc['y']:+.0f}_dz{rot_inc['z']:+.0f}.png"
-                save_path = os.path.join(directory, fname)
-                try:
-                    img.save(save_path)
-                    export_count += 1
-                except Exception as e:
-                    print(f"[ERROR] Failed to save {save_path}: {e}")
-
-            if export_count:
-                QMessageBox.information(self, "Export Complete", f"Exported {export_count} image(s) to:\n{directory}")
-            else:
-                QMessageBox.warning(self, "No Export", "No images were exported.")
-
-        finally:
-            # Restore original rotation if we changed it
-            if apply_rotation:
-                self.rotation_widgets['X']['spin'].setValue(orig_rx)
-                self.rotation_widgets['Y']['spin'].setValue(orig_ry)
-                self.rotation_widgets['Z']['spin'].setValue(orig_rz)
-                self.apply_structure_rotation()
-                # (Optionally regenerate original visible views if needed)
-                # self.simulate_views_blocking(available_keys)
-
+    
 class CustomInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
     def __init__(self, window_instance):
         super().__init__()
@@ -2826,10 +4025,10 @@ class CustomInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
 
     def OnLeftButtonDown(self):
         rwi = self.GetInteractor()
-
+        
         # macOSのCommandキーにも対応するため、GetCommandKey()のチェックを追加
         is_ctrl_or_cmd_pressed = rwi.GetControlKey() or rwi.GetCommandKey()
-
+        
         # Ctrl(またはCmd)キーが押されているか最初にチェック
         if is_ctrl_or_cmd_pressed and not rwi.GetShiftKey():
             self.actor_rotating = True
@@ -2851,12 +4050,12 @@ class CustomInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
         if self.actor_rotating:
             self.actor_rotating = False
             self.EndRotate()
-
+            
             # ドラッグ終了時の高解像度シミュレーション
             if hasattr(self.window, 'interactive_update_check') and self.window.interactive_update_check.isChecked():
                 if hasattr(self.window, 'schedule_high_res_simulation'):
                     self.window.schedule_high_res_simulation()
-
+                    
         elif self.panning:
             self.panning = False
             self.EndPan()
@@ -2897,7 +4096,7 @@ class CustomInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
                 self.window.update_rotation_from_drag_view_dependent(dx, dy)
         except Exception:
             pass
-
+    
     def normalize_angle(self, angle):
         """角度を-180〜180の範囲に正規化"""
         while angle > 180:
@@ -2910,10 +4109,10 @@ class CustomInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
         renderer.SetDisplayPoint(float(x), float(y), float(z))
         renderer.DisplayToWorld()
         world_point = renderer.GetWorldPoint()
-        return [world_point[0] / world_point[3],
-                world_point[1] / world_point[3],
+        return [world_point[0] / world_point[3], 
+                world_point[1] / world_point[3], 
                 world_point[2] / world_point[3]]
-
+    
 class pyNuD_simulator(QMainWindow):
 
     simulation_done = pyqtSignal(object)
@@ -2934,34 +4133,34 @@ class pyNuD_simulator(QMainWindow):
         icon, _icon_path = load_app_icon()
         if not icon.isNull():
             self.setWindowIcon(icon)
-
+        
         # Windows固有の設定
         #if sys.platform.startswith('win'):
             # Windowsでの安定性向上のための設定
         #    self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         #    self.setAttribute(Qt.WA_NoSystemBackground, True)
-
+        
         # スタンドアロンアプリケーションなのでwindow_managerは使用しない
-
+        
         # ウィンドウの位置とサイズを復元
         self.settings = QSettings("pyNuD", "pyNuD_Simulator")
         self.restore_geometry()
-
+        
         # 設定が保存されていない場合はデフォルトサイズを使用
         if not self.settings.contains("geometry"):
             # ウィンドウサイズ設定
             from PyQt5.QtWidgets import QDesktopWidget
             desktop = QDesktopWidget()
             screen_geometry = desktop.screenGeometry()
-
+            
             width = int(screen_geometry.width() * 0.6)
             height = int(screen_geometry.height() * 0.6)
-
+            
             # ★★★ 変更点: 最小サイズを小さく設定 ★★★
             self.setMinimumSize(600, 450)
             self.resize(width, height)
         self.center_on_screen()
-
+        
         # データ格納
         self.atoms_data = None
         self.pdb_name = ""
@@ -2978,7 +4177,7 @@ class pyNuD_simulator(QMainWindow):
         self.tip_actor = None
         self.sample_actor = None
         self.bonds_actor = None
-        self.simulation_results = {}
+        self.simulation_results = {} 
         self.raw_simulation_results = {}
 
         self.help_window = None
@@ -3011,6 +4210,7 @@ class pyNuD_simulator(QMainWindow):
         self.impose_model_enabled = False
         self.impose_model_opacity = 0.6
         self._pose_estimation_running = False
+        self._restoring_active_structure_pose = False
         self._model_overlay_update_timer = None
         self._impose_overlay_refresh_timer = None
         self._overlay_last_qpainter_atoms = 0
@@ -3039,6 +4239,7 @@ class pyNuD_simulator(QMainWindow):
         self.pymol_loaded_path = None
         self.current_structure_path = None
         self.current_structure_type = None
+        self._structure_load_in_progress = False
         self.pymol_esp_object = None
         self.pymol_residue_selection_name = "pynud_selected_residues"
         self.pymol_block_transform_selection_name = "pynud_block_transform"
@@ -3061,6 +4262,14 @@ class pyNuD_simulator(QMainWindow):
         self.domain_info = {}
         self.flexible_fit_result = None
         self.flexible_fit_report_text = ""
+        self.flexible_fit_baseline_coords = None
+        self._flex_fit_live_preview = None
+        self.active_fit_structure = "original"
+        self.active_fit_structure_combo = None
+        self.nmff_fit_settings = {}
+        self.nolb_fit_settings = {}
+        self.afmfit_fit_settings = {}
+        self.structure_comparison_windows = []
         self.block_transform_active = False
         self.block_transform_keys = set()
         self.block_transform_dragging = False
@@ -3109,23 +4318,23 @@ class pyNuD_simulator(QMainWindow):
         self._pymol_mouse_mode = None
         self.current_standard_view = None
         self.view_plane_buttons = {}
-
+        
         # 変換を二段に分離
         self.base_transform = vtk.vtkTransform()
         self.base_transform.Identity()
-
+        
         self.local_transform = vtk.vtkTransform()
         self.local_transform.Identity()
         self.local_transform.PostMultiply()  # ローカル回転を右に積む（オブジェクト座標で回す）
-
+        
         self.combined_transform = vtk.vtkTransform()
         self.combined_transform.Identity()
         self.combined_transform.PostMultiply()
-
+        
         # 後方互換性のため残す
         self.molecule_transform = vtk.vtkTransform()
         self.last_import_dir = ""
-
+        
         # スライダ差分適用用の前回値
         self.prev_rot = {'x': 0.0, 'y': 0.0, 'z': 0.0}
 
@@ -3138,6 +4347,7 @@ class pyNuD_simulator(QMainWindow):
 
         # UI操作フラグ（PyMOL/VTKどちらでも必要）
         self.tip_slider_pressed = False
+        self.tip_position_debounce_timer = None
         self.scan_size_keyboard_input = False
         self.tip_radius_keyboard_input = False
         self.minitip_radius_keyboard_input = False
@@ -3146,37 +4356,37 @@ class pyNuD_simulator(QMainWindow):
         self.tip_radius_debounce_timer = None
         self.minitip_radius_debounce_timer = None
         self.tip_angle_debounce_timer = None
-
+        
         # カラー・ライティング設定
         self.current_bg_color = (0.05, 0.05, 0.05)
         self.current_single_color = (0.5, 0.7, 0.9)
         self.brightness_factor = 1.0
-
+        
         # AFM像表示用の参照
         self.afm_x_widget = None
         self.afm_y_widget = None
         self.afm_z_widget = None
-
+        
         # 簡単で確実なカラーマップ
         self.element_colors = {
             'C': (0.565, 0.565, 0.565), 'O': (1.0, 0.3, 0.3), 'N': (0.3, 0.3, 1.0),
             'H': (0.9, 0.9, 0.9), 'S': (1.0, 1.0, 0.3), 'P': (1.0, 0.5, 0.0),
             'other': (0.7, 0.7, 0.7)
         }
-
+        
         # チェーンカラー
         self.chain_colors = [
             (0.2, 0.8, 0.2), (0.8, 0.2, 0.2), (0.2, 0.2, 0.8), (0.8, 0.8, 0.2),
             (0.8, 0.2, 0.8), (0.2, 0.8, 0.8), (1.0, 0.5, 0.0), (0.5, 0.0, 0.8),
         ]
-
+        
          # ★★★ ここから追加 ★★★
         # 一般的なファンデルワールス半径 (nm)
         self.vdw_radii = {
             'H': 0.120, 'C': 0.170, 'N': 0.155, 'O': 0.152,
             'P': 0.180, 'S': 0.180, 'other': 0.170
         }
-
+        
         # バックグラウンド処理からのシグナル
         #self.simulation_done = pyqtSignal(object)
         #self.simulation_progress = pyqtSignal(int)
@@ -3185,10 +4395,10 @@ class pyNuD_simulator(QMainWindow):
         # AFMパラメータ
         self.afm_params = {
             'tip_radius': 2.0, 'tip_shape': 'cone', 'tip_angle': 15.0,
-            'tip_x': 0.0, 'tip_y': 0.0, 'tip_z': 5.0,
+            'tip_x': 0.0, 'tip_y': 0.0, 'tip_z': 2.0,
         }
-
-
+        
+        
         # メニューバーを作成（Helpはここへ移動）
         self.create_menu_bar()
 
@@ -3488,23 +4698,39 @@ class pyNuD_simulator(QMainWindow):
                     super().leaveEvent(event)
 
                 def dragEnterEvent(self, event):
-                    if self._pynud_owner._structure_path_from_mime(event.mimeData()):
-                        event.acceptProposedAction()
-                        return
-                    super().dragEnterEvent(event)
+                    try:
+                        if self._pynud_owner._structure_path_from_mime(event.mimeData()):
+                            event.acceptProposedAction()
+                        else:
+                            event.ignore()
+                    except Exception:
+                        # Never let an exception escape a Qt virtual event
+                        # handler: SIP treats it as fatal and aborts Python.
+                        traceback.print_exc()
+                        event.ignore()
 
                 def dragMoveEvent(self, event):
-                    if self._pynud_owner._structure_path_from_mime(event.mimeData()):
-                        event.acceptProposedAction()
-                        return
-                    super().dragMoveEvent(event)
+                    try:
+                        if self._pynud_owner._structure_path_from_mime(event.mimeData()):
+                            event.acceptProposedAction()
+                        else:
+                            event.ignore()
+                    except Exception:
+                        traceback.print_exc()
+                        event.ignore()
 
                 def dropEvent(self, event):
-                    path = self._pynud_owner._structure_path_from_mime(event.mimeData())
-                    if path and self._pynud_owner._load_structure_file(path):
-                        event.acceptProposedAction()
-                        return
-                    super().dropEvent(event)
+                    try:
+                        path = self._pynud_owner._structure_path_from_mime(event.mimeData())
+                        if path and self._pynud_owner._load_structure_file(path):
+                            event.acceptProposedAction()
+                        else:
+                            event.ignore()
+                    except Exception:
+                        # Calling PyMOLGLWidget.dropEvent for an unsupported or
+                        # stale drop can call qFatal on macOS.  Ignore it safely.
+                        traceback.print_exc()
+                        event.ignore()
 
             pymol_widget = PyNuDPyMOLGLWidget(self, self)
             pymol_widget.setToolTip(
@@ -3861,6 +5087,13 @@ class pyNuD_simulator(QMainWindow):
 
     def _rebuild_sequence_panel(self):
         """Populate the common sequence panel from the current atoms_data."""
+        # A pending mouse event may still refer to a residue button from the
+        # previous structure.  Release it before scheduling those widgets for
+        # deletion, otherwise Qt can deliver an event to an already-deleted
+        # QPushButton while a large structure is being loaded.
+        if self.sequence_drag_selecting:
+            self._finish_sequence_drag_selection()
+        self.sequence_drag_grab_widget = None
         self.sequence_residues = self._build_sequence_model()
         self.sequence_button_by_key = {}
         if hasattr(self, "sequence_content_layout"):
@@ -3868,6 +5101,11 @@ class pyNuD_simulator(QMainWindow):
         if not self.sequence_residues:
             if hasattr(self, "sequence_summary_label"):
                 self.sequence_summary_label.setText("No sequence loaded")
+            return
+
+        # Keep the residue model ready, but do not create thousands of hidden
+        # QPushButtons.  They are built on demand when Sequence is opened.
+        if not self.sequence_panel_visible:
             return
 
         chains = []
@@ -3992,7 +5230,12 @@ class pyNuD_simulator(QMainWindow):
     def _sequence_key_from_widget(self, obj):
         if obj is None or not hasattr(obj, "property"):
             return None
-        key = obj.property("sequence_key")
+        try:
+            key = obj.property("sequence_key")
+        except RuntimeError:
+            # PyQt raises this while processing DeferredDelete events for a
+            # residue button removed during a structure reload.
+            return None
         if isinstance(key, tuple) and len(key) == 3:
             return key
         return None
@@ -4005,9 +5248,12 @@ class pyNuD_simulator(QMainWindow):
         }
         widget = obj
         while widget is not None:
-            if widget in targets or self._sequence_key_from_widget(widget) is not None:
-                return True
-            widget = widget.parentWidget() if hasattr(widget, "parentWidget") else None
+            try:
+                if widget in targets or self._sequence_key_from_widget(widget) is not None:
+                    return True
+                widget = widget.parentWidget() if hasattr(widget, "parentWidget") else None
+            except RuntimeError:
+                return False
         return False
 
     def _sequence_key_from_global_pos(self, global_pos):
@@ -4149,9 +5395,11 @@ class pyNuD_simulator(QMainWindow):
         self._update_sequence_selection_ui()
         self._clear_residue_selection_highlight()
 
-    def _mark_in_memory_structure_edited(self, force_pymol_reload=True):
+    def _mark_in_memory_structure_edited(self, force_pymol_reload=True, preserve_domains=False):
         self.in_memory_structure_edited = True
         self.pymol_structure_temp_dirty = True
+        if not preserve_domains:
+            self._invalidate_domain_assignments()
         if force_pymol_reload and self._is_pymol_active():
             self.pymol_loaded_path = None
 
@@ -4167,7 +5415,74 @@ class pyNuD_simulator(QMainWindow):
         return snapshot
 
     def _store_original_atoms_data(self):
+        """Snapshot the loaded structure as the Flexible Fit Original baseline."""
         self.original_atoms_data = self._snapshot_atoms_data()
+        self._set_flexible_fit_baseline_from_atoms(self.original_atoms_data)
+
+    def _atom_coords_from_snapshot(self, atoms_data):
+        if not isinstance(atoms_data, dict):
+            return None
+        try:
+            x = np.asarray(atoms_data["x"], dtype=float)
+            y = np.asarray(atoms_data["y"], dtype=float)
+            z = np.asarray(atoms_data["z"], dtype=float)
+        except Exception:
+            return None
+        if x.shape != y.shape or x.shape != z.shape or x.size == 0:
+            return None
+        return np.column_stack([x, y, z]).copy()
+
+    def _set_flexible_fit_baseline_from_atoms(self, atoms_data=None):
+        """Remember the loaded-session coordinates used as Flexible Fit Original."""
+        source = (
+            atoms_data
+            if atoms_data is not None
+            else getattr(self, "atoms_data", None)
+        )
+        self.flexible_fit_baseline_coords = self._atom_coords_from_snapshot(
+            source
+        )
+
+    def _session_original_structure_coords(self, expected_atom_count=None):
+        """Return the originally loaded structure coords for this session.
+
+        Active Structure Original, Compare Structures, and Reset Fit all use
+        this baseline — never the start of the most recent Flexible Fit.
+        """
+        if expected_atom_count is None and getattr(self, "atoms_data", None) is not None:
+            expected_atom_count = len(self.atoms_data["x"])
+        baseline = getattr(self, "flexible_fit_baseline_coords", None)
+        if baseline is not None:
+            arr = np.asarray(baseline, dtype=float)
+            if arr.ndim == 2 and arr.shape[1] == 3 and np.all(np.isfinite(arr)):
+                if (
+                    expected_atom_count is None
+                    or arr.shape[0] == int(expected_atom_count)
+                ):
+                    return np.array(arr, dtype=float, copy=True)
+        original = getattr(self, "original_atoms_data", None)
+        coords = self._atom_coords_from_snapshot(original)
+        if coords is None:
+            return None
+        if (
+            expected_atom_count is not None
+            and coords.shape[0] != int(expected_atom_count)
+        ):
+            return None
+        return coords
+
+    def _flexible_fit_result_original_coords(self, fallback_coords):
+        """Coords stored as fit-result Original: the loaded session structure."""
+        fallback = np.asarray(fallback_coords, dtype=float)
+        session = self._session_original_structure_coords(
+            expected_atom_count=int(fallback.shape[0]) if fallback.ndim == 2 else None
+        )
+        if session is not None:
+            return session
+        arr = np.array(fallback, dtype=float, copy=True)
+        if getattr(self, "flexible_fit_baseline_coords", None) is None:
+            self.flexible_fit_baseline_coords = np.array(arr, dtype=float, copy=True)
+        return arr
 
     def _has_residue_edits(self):
         if bool(getattr(self, "in_memory_structure_edited", False)):
@@ -4209,6 +5524,11 @@ class pyNuD_simulator(QMainWindow):
         self._last_sequence_key = None
         self._deactivate_block_transform()
         self.in_memory_structure_edited = False
+        self.flexible_fit_result = None
+        self.flexible_fit_report_text = ""
+        self._set_flexible_fit_baseline_from_atoms(self.atoms_data)
+        self.active_fit_structure = "original"
+        self._update_flexible_fit_action_buttons()
         self._clear_pymol_structure_temp_file()
         self.pymol_loaded_path = None
         self._clear_residue_selection_highlight()
@@ -4588,9 +5908,9 @@ class pyNuD_simulator(QMainWindow):
             np.asarray(self.atoms_data["x"], dtype=float),
             np.asarray(self.atoms_data["y"], dtype=float),
             np.asarray(self.atoms_data["z"], dtype=float),
-        ])
+        ]).copy()
 
-    def _set_atom_coords_array(self, coords, mark_edited=True):
+    def _set_atom_coords_array(self, coords, mark_edited=True, preserve_domains=False):
         if getattr(self, "atoms_data", None) is None:
             return False
         arr = np.asarray(coords, dtype=float)
@@ -4600,7 +5920,10 @@ class pyNuD_simulator(QMainWindow):
         self.atoms_data["y"] = np.array(arr[:, 1], dtype=float, copy=True)
         self.atoms_data["z"] = np.array(arr[:, 2], dtype=float, copy=True)
         if mark_edited:
-            self._mark_in_memory_structure_edited(force_pymol_reload=False)
+            self._mark_in_memory_structure_edited(
+                force_pymol_reload=False,
+                preserve_domains=preserve_domains,
+            )
         return True
 
     def _extract_ca_domain_nodes(self):
@@ -4610,19 +5933,54 @@ class pyNuD_simulator(QMainWindow):
         atom_names = np.asarray(self.atoms_data.get("atom_name", []))
         if atom_names.size == 0:
             return None
-        node_mask = atom_names == "CA"
-        if not np.any(node_mask):
-            node_mask = atom_names == "P"
-        if not np.any(node_mask):
+        ca_indices = np.where(atom_names == "CA")[0]
+        ca_residue_keys = {
+            self._sequence_key_from_atom_arrays(int(index))
+            for index in ca_indices
+        }
+        p_indices = [
+            int(index)
+            for index in np.where(atom_names == "P")[0]
+            if self._sequence_key_from_atom_arrays(int(index))
+            not in ca_residue_keys
+        ]
+        node_indices = np.asarray(
+            sorted([int(index) for index in ca_indices] + p_indices),
+            dtype=int,
+        )
+        if node_indices.size == 0:
             return None
 
-        node_indices = np.where(node_mask)[0]
+        node_mask = np.zeros(atom_names.size, dtype=bool)
+        node_mask[node_indices] = True
         residue_keys = [self._sequence_key_from_atom_arrays(int(i)) for i in node_indices]
         coords = np.column_stack([
             np.asarray(self.atoms_data["x"], dtype=float)[node_indices],
             np.asarray(self.atoms_data["y"], dtype=float)[node_indices],
             np.asarray(self.atoms_data["z"], dtype=float)[node_indices],
         ])
+        chain_ids = np.asarray(
+            self.atoms_data.get("chain_id", [" "] * len(node_mask))
+        )[node_indices]
+        residue_ids = np.asarray(
+            self.atoms_data.get("residue_id", np.arange(len(node_mask)))
+        )[node_indices]
+        b_factors = None
+        if "b_factor" in self.atoms_data:
+            values = np.asarray(self.atoms_data["b_factor"])
+            if values.size == len(node_mask):
+                b_factors = values[node_indices]
+        secondary_structure = []
+        for chain, residue_id in zip(chain_ids, residue_ids):
+            try:
+                residue_number = int(residue_id)
+            except (TypeError, ValueError):
+                secondary_structure.append("C")
+                continue
+            key = (str(chain).strip(), residue_number)
+            secondary_structure.append(
+                self.secondary_structure.get(key, "C")
+            )
 
         key_to_node = {key: idx for idx, key in enumerate(residue_keys)}
         atom_to_node = np.full(len(self.atoms_data["x"]), -1, dtype=int)
@@ -4636,10 +5994,16 @@ class pyNuD_simulator(QMainWindow):
             "node_indices": node_indices,
             "residue_keys": residue_keys,
             "atom_to_node": atom_to_node,
+            "chain_ids": chain_ids,
+            "residue_ids": residue_ids,
+            "b_factors": b_factors,
+            "secondary_structure": np.asarray(
+                secondary_structure, dtype=object
+            ),
         }
 
     def _set_domain_count_widgets(self, value):
-        value = int(max(1, min(12, value)))
+        value = int(max(1, min(int(MAX_FLEXIBLE_FIT_DOMAINS), value)))
         widgets = [
             getattr(self, "domain_count_slider", None),
             getattr(self, "domain_count_spin", None),
@@ -4668,17 +6032,173 @@ class pyNuD_simulator(QMainWindow):
         except Exception:
             return False
 
+    def _domain_split_mode(self):
+        combo = getattr(self, "domain_split_mode_combo", None)
+        if combo is None:
+            return "total"
+        try:
+            mode = combo.currentData()
+        except Exception:
+            mode = None
+        mode = str(mode or "total").strip().lower()
+        if mode not in {"total", "oligomer"}:
+            return "total"
+        return mode
+
+    def _structure_polymer_chain_count(self):
+        nodes = None
+        try:
+            nodes = self._extract_ca_domain_nodes()
+        except Exception:
+            nodes = None
+        if not nodes:
+            return 1
+        chains = nodes.get("chain_ids")
+        if chains is None:
+            return 1
+        values = [
+            str(value).strip() or " "
+            for value in np.asarray(chains).tolist()
+        ]
+        return max(1, len(dict.fromkeys(values)))
+
+    def _sync_oligomer_domain_product(self, *, update_total_spin=True):
+        oligomer = getattr(self, "domain_oligomer_spin", None)
+        per = getattr(self, "domain_per_monomer_spin", None)
+        total_label = getattr(self, "domain_oligomer_total_label", None)
+        if oligomer is None or per is None:
+            return None
+        try:
+            n_monomers = int(oligomer.value())
+            d_per = int(per.value())
+        except Exception:
+            return None
+        total = int(n_monomers) * int(d_per)
+        if total > int(MAX_FLEXIBLE_FIT_DOMAINS):
+            d_per = max(1, int(MAX_FLEXIBLE_FIT_DOMAINS) // max(1, n_monomers))
+            total = n_monomers * d_per
+            try:
+                per.blockSignals(True)
+                per.setValue(int(d_per))
+            finally:
+                try:
+                    per.blockSignals(False)
+                except Exception:
+                    pass
+        if total_label is not None:
+            try:
+                total_label.setText(f"= {total}")
+            except Exception:
+                pass
+        if update_total_spin:
+            self._domain_count_update_blocked = True
+            try:
+                self._set_domain_count_widgets(int(total))
+            finally:
+                self._domain_count_update_blocked = False
+        return int(total)
+
+    def _refresh_oligomer_spin_from_pdb_chains(self):
+        check = getattr(self, "domain_use_pdb_chains_check", None)
+        oligomer = getattr(self, "domain_oligomer_spin", None)
+        if check is None or oligomer is None:
+            return
+        try:
+            use_pdb = bool(check.isChecked())
+        except Exception:
+            use_pdb = True
+        if not use_pdb:
+            return
+        n_chains = self._structure_polymer_chain_count()
+        try:
+            oligomer.blockSignals(True)
+            oligomer.setValue(int(n_chains))
+        finally:
+            try:
+                oligomer.blockSignals(False)
+            except Exception:
+                pass
+        self._sync_oligomer_domain_product(update_total_spin=True)
+
     def _update_domain_controls_enabled(self):
         manual = not self._domain_auto_enabled()
+        mode = self._domain_split_mode()
+        oligomer_mode = manual and mode == "oligomer"
+        total_mode = manual and mode == "total"
         for widget in (
             getattr(self, "domain_count_slider", None),
             getattr(self, "domain_count_spin", None),
         ):
             if widget is not None:
                 try:
-                    widget.setEnabled(manual)
+                    widget.setEnabled(total_mode)
                 except Exception:
                     pass
+        mode_combo = getattr(self, "domain_split_mode_combo", None)
+        if mode_combo is not None:
+            try:
+                mode_combo.setEnabled(manual)
+            except Exception:
+                pass
+        use_pdb = getattr(self, "domain_use_pdb_chains_check", None)
+        use_pdb_checked = True
+        if use_pdb is not None:
+            try:
+                use_pdb.setEnabled(oligomer_mode)
+                use_pdb_checked = bool(use_pdb.isChecked())
+            except Exception:
+                use_pdb_checked = True
+        oligomer = getattr(self, "domain_oligomer_spin", None)
+        if oligomer is not None:
+            try:
+                oligomer.setEnabled(oligomer_mode and not use_pdb_checked)
+            except Exception:
+                pass
+        for widget in (
+            getattr(self, "domain_per_monomer_spin", None),
+            getattr(self, "domain_times_label", None),
+            getattr(self, "domain_oligomer_total_label", None),
+        ):
+            if widget is not None:
+                try:
+                    widget.setEnabled(oligomer_mode)
+                except Exception:
+                    pass
+
+    def _on_domain_split_mode_changed(self, _index=None):
+        if self._domain_split_mode() == "oligomer":
+            self._refresh_oligomer_spin_from_pdb_chains()
+            self._sync_oligomer_domain_product(update_total_spin=True)
+        self._update_domain_controls_enabled()
+        if (
+            not self._domain_auto_enabled()
+            and getattr(self, "domain_ids", None) is not None
+        ):
+            try:
+                self.detect_domains_from_ui(show_messages=False)
+            except Exception as e:
+                print(f"[WARNING] Domain split mode update failed: {e}")
+
+    def _on_oligomer_domain_params_changed(self, _value=None):
+        if getattr(self, "_domain_count_update_blocked", False):
+            return
+        if self._domain_auto_enabled():
+            self._set_domain_auto_checked(False)
+        if self._domain_split_mode() != "oligomer":
+            return
+        self._sync_oligomer_domain_product(update_total_spin=True)
+        if getattr(self, "domain_ids", None) is None:
+            return
+        try:
+            self.detect_domains_from_ui(show_messages=False)
+        except Exception as e:
+            print(f"[WARNING] Oligomer domain update failed: {e}")
+
+    def _on_domain_use_pdb_chains_toggled(self, checked):
+        if checked:
+            self._refresh_oligomer_spin_from_pdb_chains()
+        self._update_domain_controls_enabled()
+        self._on_oligomer_domain_params_changed()
 
     def _set_domain_auto_checked(self, checked):
         check = getattr(self, "domain_auto_check", None)
@@ -4705,6 +6225,8 @@ class pyNuD_simulator(QMainWindow):
             return
         if self._domain_auto_enabled():
             self._set_domain_auto_checked(False)
+        if self._domain_split_mode() == "oligomer":
+            return
         if getattr(self, "domain_ids", None) is None:
             return
         try:
@@ -4745,6 +6267,11 @@ class pyNuD_simulator(QMainWindow):
         method = info.get("method", "ENM")
         sil = info.get("silhouette", None)
         extra = f", silhouette {sil:.2f}" if isinstance(sil, (float, int)) else ""
+        if info.get("oligomer_grouping"):
+            extra += (
+                f"; {info.get('monomer_groups', '?')}x"
+                f"{info.get('domains_per_monomer', '?')}"
+            )
         mode = "Auto" if info.get("auto_domains", False) else "Manual"
         label.setText(f"{mode}: {n_domains} domains / {n_atoms} atoms ({method}{extra})")
 
@@ -4761,7 +6288,14 @@ class pyNuD_simulator(QMainWindow):
                 QMessageBox.warning(self, "Detect Domains", "No C-alpha or P atoms are available for ENM detection.")
             return False
 
-        if n_domains is None:
+        split_mode = self._domain_split_mode()
+        use_oligomer = (
+            not self._domain_auto_enabled()
+            and split_mode == "oligomer"
+            and n_domains is None
+        )
+
+        if n_domains is None and not use_oligomer:
             if self._domain_auto_enabled():
                 n_domains = None
             else:
@@ -4769,16 +6303,44 @@ class pyNuD_simulator(QMainWindow):
                     n_domains = int(self.domain_count_spin.value())
                 except Exception:
                     n_domains = None
-        auto_domains = n_domains is None
+        auto_domains = (not use_oligomer) and n_domains is None
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            residue_domain_ids, suggested_D, info = detect_domains_enm(
-                nodes["coords"],
-                cutoff_nm=1.3,
-                n_modes=8,
-                n_domains=n_domains,
-            )
+            if use_oligomer:
+                self._refresh_oligomer_spin_from_pdb_chains()
+                n_monomers = int(self.domain_oligomer_spin.value())
+                d_per = int(self.domain_per_monomer_spin.value())
+                use_pdb = True
+                check = getattr(self, "domain_use_pdb_chains_check", None)
+                if check is not None:
+                    try:
+                        use_pdb = bool(check.isChecked())
+                    except Exception:
+                        use_pdb = True
+                residue_domain_ids, suggested_D, info = detect_domains_oligomer_enm(
+                    nodes["coords"],
+                    nodes.get("chain_ids"),
+                    domains_per_monomer=d_per,
+                    n_monomers=n_monomers,
+                    use_pdb_chains=use_pdb,
+                    cutoff_nm=1.3,
+                    n_modes=8,
+                    residue_ids=nodes.get("residue_ids"),
+                    b_factors=nodes.get("b_factors"),
+                    secondary_structure=nodes.get("secondary_structure"),
+                )
+            else:
+                residue_domain_ids, suggested_D, info = detect_domains_enm(
+                    nodes["coords"],
+                    cutoff_nm=1.3,
+                    n_modes=8,
+                    n_domains=n_domains,
+                    chain_ids=nodes.get("chain_ids"),
+                    residue_ids=nodes.get("residue_ids"),
+                    b_factors=nodes.get("b_factors"),
+                    secondary_structure=nodes.get("secondary_structure"),
+                )
         except Exception as e:
             if show_messages:
                 QMessageBox.critical(self, "Detect Domains", f"Domain detection failed:\n{e}")
@@ -4796,34 +6358,81 @@ class pyNuD_simulator(QMainWindow):
         self.domain_ca_atom_indices = np.asarray(nodes["node_indices"], dtype=int)
         self.domain_info = dict(info or {})
         self.domain_info["auto_domains"] = bool(auto_domains)
+        self.domain_info["split_mode"] = (
+            "oligomer" if use_oligomer else ("auto" if auto_domains else "total")
+        )
         self.domain_info["scientific_note"] = (
-            "ENM domains predict potentially flexible regions; judge validity by fit improvement."
+            "Hybrid PDB/contact/ENM domains are predictions; judge validity "
+            "by structural coherence and fit improvement."
         )
         self.flexible_fit_result = None
         self.flexible_fit_report_text = ""
-        if hasattr(self, "save_flex_fit_btn"):
-            self.save_flex_fit_btn.setEnabled(False)
+        self.active_fit_structure = "original"
+        self._update_flexible_fit_action_buttons()
 
         self._domain_count_update_blocked = True
         try:
             self._set_domain_count_widgets(int(suggested_D))
+            if use_oligomer:
+                self._sync_oligomer_domain_product(update_total_spin=False)
         finally:
             self._domain_count_update_blocked = False
         self._update_domain_controls_enabled()
 
         self._update_domain_status_label()
-        if getattr(self, "domain_preview_check", None) is not None and self.domain_preview_check.isChecked():
+        if getattr(self, "domain_preview_check", None) is not None:
+            self.domain_preview_check.blockSignals(True)
+            self.domain_preview_check.setChecked(True)
+            self.domain_preview_check.blockSignals(False)
             self.color_combo.setCurrentText("By Domain")
         self.update_display()
 
         if show_messages:
+            oligomer_line = ""
+            if use_oligomer:
+                oligomer_line = (
+                    f"Oligomer split: {info.get('monomer_groups', '?')} × "
+                    f"{info.get('domains_per_monomer', '?')} "
+                    f"({info.get('oligomer_grouping', 'pdb_chains')})\n"
+                )
+                notes = info.get("notes") or []
+                if notes:
+                    oligomer_line += "Note: " + "; ".join(str(n) for n in notes) + "\n"
             QMessageBox.information(
                 self,
                 "Detect Domains",
-                f"Detected {suggested_D} ENM domains from {len(nodes['coords'])} nodes.\n"
-                "ENM domains indicate likely flexible regions; validate them by fit improvement."
+                f"Detected {suggested_D} hybrid domains from {len(nodes['coords'])} nodes.\n"
+                f"{oligomer_line}"
+                f"Method: {info.get('method', 'hybrid')}; "
+                f"chains: {info.get('chain_count', 1)}; "
+                f"contact edges: {info.get('contact_edges', 0)}"
+                + ("; AlphaFold pLDDT used" if info.get("plddt_used") else "")
+                + "\n"
+                "Domain colors have been enabled for inspection.\n"
+                "Validate predicted boundaries by structure and fit improvement."
             )
         return True
+
+    def _invalidate_domain_assignments(self):
+        """Drop stale domain labels after arbitrary coordinate/topology edits."""
+        had_domains = getattr(self, "domain_ids", None) is not None
+        self.flexible_fit_result = None
+        self.flexible_fit_report_text = ""
+        self.active_fit_structure = "original"
+        self._update_flexible_fit_action_buttons()
+        if not had_domains:
+            return
+        self.domain_ids = None
+        self.domain_residue_keys = []
+        self.domain_ca_atom_indices = []
+        self.domain_info = {}
+        if getattr(self, "domain_preview_check", None) is not None:
+            self.domain_preview_check.blockSignals(True)
+            self.domain_preview_check.setChecked(False)
+            self.domain_preview_check.blockSignals(False)
+        if hasattr(self, "color_combo") and self.color_combo.currentText() == "By Domain":
+            self.color_combo.setCurrentText("By Chain")
+        self._update_domain_status_label()
 
     def _clear_domain_state(self):
         self.domain_ids = None
@@ -4832,9 +6441,11 @@ class pyNuD_simulator(QMainWindow):
         self.domain_info = {}
         self.flexible_fit_result = None
         self.flexible_fit_report_text = ""
+        self.flexible_fit_baseline_coords = None
+        self.active_fit_structure = "original"
+        self._update_flexible_fit_action_buttons()
+        self._discard_deleted_real_afm_window_refs()
         self._set_domain_auto_checked(True)
-        if hasattr(self, "save_flex_fit_btn"):
-            self.save_flex_fit_btn.setEnabled(False)
         if hasattr(self, "domain_preview_check") and self.domain_preview_check is not None:
             try:
                 self.domain_preview_check.blockSignals(True)
@@ -4850,6 +6461,60 @@ class pyNuD_simulator(QMainWindow):
                 pass
         self._update_domain_status_label()
         self._update_domain_controls_enabled()
+
+    def _discard_deleted_real_afm_window_refs(self):
+        """Clear Python references after Qt deletes the auxiliary AFM window."""
+        window = getattr(self, "real_afm_window", None)
+        if window is None:
+            self._clear_real_afm_window_refs()
+            return
+        try:
+            window.isVisible()
+            return
+        except RuntimeError:
+            pass
+        self._clear_real_afm_window_refs()
+
+    def _clear_real_afm_window_refs(self):
+        """Forget every widget owned by the disposable Real AFM window."""
+        for name in (
+            "real_afm_window",
+            "real_afm_window_scroll_area",
+            "real_afm_window_content",
+            "real_afm_window_real_frame",
+            "real_afm_window_aligned_frame",
+            "real_afm_window_diff_frame",
+            "real_afm_window_view",
+            "real_afm_frame_slider",
+            "real_afm_frame_label",
+            "real_afm_sim_info_label",
+            "real_afm_diff_info_label",
+            "pose_roi_status_label",
+            "use_full_image_btn",
+            "impose_model_check",
+            "impose_opacity_slider",
+            "detect_domains_btn",
+            "domain_auto_check",
+            "domain_count_slider",
+            "domain_count_spin",
+            "domain_split_mode_combo",
+            "domain_use_pdb_chains_check",
+            "domain_oligomer_spin",
+            "domain_times_label",
+            "domain_per_monomer_spin",
+            "domain_oligomer_total_label",
+            "domain_preview_check",
+            "flex_fit_backend_combo",
+            "flex_fit_btn",
+            "nma_flex_fit_btn",
+            "save_flex_fit_btn",
+            "compare_flex_fit_btn",
+            "reset_flex_fit_btn",
+            "active_fit_structure_combo",
+            "domain_status_label",
+        ):
+            setattr(self, name, None)
+        self.pose_axis_checks = {}
 
     def _rotate_block_degrees(self, axis, angle_deg, request_render=True):
         if abs(float(angle_deg)) < 1e-9:
@@ -5365,54 +7030,54 @@ class pyNuD_simulator(QMainWindow):
         if not hasattr(self, 'vtk_widget') or self.vtk_widget is None:
             print("Error: VTK widget not found")
             return
-
+            
         try:
             # レンダラー作成
             self.renderer = vtk.vtkRenderer()
             self.renderer.SetBackground(*self.current_bg_color)
-
+            
             # スライダー操作フラグの初期化
             self.tip_slider_pressed = False
-
+            
             # スピンボックスの入力方法フラグ（True=キー入力中, False=マウス/ボタン操作）
             self.scan_size_keyboard_input = False
             self.tip_radius_keyboard_input = False
             self.minitip_radius_keyboard_input = False
             self.tip_angle_keyboard_input = False
-
+            
             # デバウンス用のタイマー
             self.scan_size_debounce_timer = None
             self.tip_radius_debounce_timer = None
             self.minitip_radius_debounce_timer = None
             self.tip_angle_debounce_timer = None
-
+            
             # アンチエイリアシング
             render_window = self.vtk_widget.GetRenderWindow()
             render_window.AddRenderer(self.renderer)
             render_window.SetMultiSamples(4)
-
+            
             # インタラクター設定
             self.interactor = self.vtk_widget.GetRenderWindow().GetInteractor()
 
             # CustomInteractorStyleにメインウィンドウ(self)への参照を渡す
             style = CustomInteractorStyle(self)
             self.interactor.SetInteractorStyle(style)
-
+            
             # Ctrl/Shift ドラッグは eventFilter で処理し、通常操作は VTK ネイティブに任せる
             # （mousePressEvent の差し替えは macOS でプログラム更新後の再描画を阻害する）
-
+            
             # ライティング改善
             self.setup_lighting()
-
+            
             # 座標軸追加
             self.add_axes()
-
+            
             # 初期カメラ設定
             self.reset_camera()
 
             # カメラ変更の同期
             self._attach_vtk_camera_observer()
-
+            
             # レンダリング開始（プラグイン版は show 後に Initialize — macOS GL コンテキスト対策）
             if self._is_vtk_only_plugin():
                 self._vtk_deferred_init = True
@@ -5420,7 +7085,7 @@ class pyNuD_simulator(QMainWindow):
                 self.interactor.Initialize()
                 self._vtk_deferred_init = False
             self.vtk_initialized = True
-
+            
         except Exception as e:
             print(f"VTK setup error: {e}")
 
@@ -5969,7 +7634,7 @@ class pyNuD_simulator(QMainWindow):
                 self._request_pymol_widget_update()
         except Exception:
             pass
-
+        
     def center_on_screen(self):
         """ウィンドウを画面中央に配置"""
         from PyQt5.QtWidgets import QDesktopWidget
@@ -5978,7 +7643,7 @@ class pyNuD_simulator(QMainWindow):
         center_point = desktop.availableGeometry().center()
         frame_geometry.moveCenter(center_point)
         self.move(frame_geometry.topLeft())
-
+    
     def restore_geometry(self):
         """ウィンドウの位置とサイズを復元"""
         try:
@@ -5987,7 +7652,7 @@ class pyNuD_simulator(QMainWindow):
                 self.restoreGeometry(geometry)
         except Exception:
             pass  # 復元に失敗した場合は無視
-
+    
     def save_geometry(self):
         """ウィンドウの位置とサイズを保存"""
         try:
@@ -5995,7 +7660,7 @@ class pyNuD_simulator(QMainWindow):
             self.settings.setValue("geometry", geometry)
         except Exception:
             pass  # 保存に失敗した場合は無視
-
+        
     def setup_ui(self):
         """UIセットアップ"""
         central_widget = QWidget()
@@ -6022,11 +7687,11 @@ class pyNuD_simulator(QMainWindow):
         # ★★★ 修正ここまで ★★★
 
         main_layout = QHBoxLayout(central_widget)
-
+        
         # --- メインのスプリッター ---
         self.main_splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(self.main_splitter)
-
+        
         # --- 左右パネルの作成とスプリッターへの追加 ---
         left_scroll_area = QScrollArea()
         left_panel = self.create_control_panel()
@@ -6035,12 +7700,12 @@ class pyNuD_simulator(QMainWindow):
         self._force_persistent_scrollbars(left_scroll_area, vertical=True, horizontal=False)
         left_scroll_area.setMinimumWidth(280)
         self.main_splitter.addWidget(left_scroll_area)
-
+        
         # VTK/OpenGL は QScrollArea 内だと macOS で再描画が届かないことがあるため、
         # 右パネルは three_d_viewer と同様にスプリッターへ直接配置する。
         right_panel = self.create_vtk_panel()
         self.main_splitter.addWidget(right_panel)
-
+        
         self.main_splitter.setSizes([280, 1020])
         self.main_splitter.setCollapsible(0, False)
         self.main_splitter.setCollapsible(1, False)
@@ -6049,7 +7714,7 @@ class pyNuD_simulator(QMainWindow):
         """アプリケーションのメニューバーを作成する"""
         # ヘルプウィンドウの参照を初期化
         self.help_window = None
-
+        
         # QMainWindow標準のメニューバーを取得
         menu_bar = self.menuBar()
         # ウィンドウ内に表示（macOSでも常に表示）
@@ -6072,12 +7737,19 @@ class pyNuD_simulator(QMainWindow):
 
         # 「Help」メニューを作成
         help_menu = menu_bar.addMenu("&Help")
-
+        
         # 「View Help」アクションを作成し、クリックされたらshow_help_windowを呼び出す
         show_help_action = QAction("View Help...", self)
         show_help_action.setShortcut("F1")
         show_help_action.triggered.connect(self.show_help_window)
         help_menu.addAction(show_help_action)
+
+        html_manual_action = QAction("Open HTML Manual...", self)
+        html_manual_action.setToolTip(
+            "Open the bundled standalone pyNuD Simulator manual in a web browser"
+        )
+        html_manual_action.triggered.connect(self.open_html_manual)
+        help_menu.addAction(html_manual_action)
 
         help_menu.addSeparator()
         notices_action = QAction("Third-Party Notices...", self)
@@ -6095,6 +7767,21 @@ class pyNuD_simulator(QMainWindow):
         else:
             self.help_window.activateWindow()
             self.help_window.raise_()
+
+    def open_html_manual(self):
+        """Open the bundled standalone HTML manual, or its public fallback."""
+        manual_path = get_bundled_file_path(SIMULATOR_MANUAL_FILENAME)
+        if manual_path is not None:
+            target = QUrl.fromLocalFile(str(manual_path))
+        else:
+            target = QUrl(SIMULATOR_MANUAL_RELEASE_URL)
+        if not QDesktopServices.openUrl(target):
+            QMessageBox.warning(
+                self,
+                "HTML Manual",
+                "Could not open the pyNuD Simulator HTML manual.\n\n"
+                f"Manual URL:\n{SIMULATOR_MANUAL_RELEASE_URL}",
+            )
 
     def show_third_party_notices(self):
         """Display bundled third-party license and trademark notices."""
@@ -6282,11 +7969,11 @@ class pyNuD_simulator(QMainWindow):
                 font-size: 11px;
             }
         """)
-
+        
         # File Import (統合: PDB/CIF/MRC)
         file_import_group = QGroupBox("File Import")
         file_import_layout = QVBoxLayout(file_import_group)
-
+        
         self.import_btn = QPushButton("Import File...")
         self.import_btn.setMinimumHeight(35)
         self.import_btn.setToolTip("Load structure file (PDB/CIF/MRC) for AFM simulation\nAFMシミュレーション用の構造ファイル（PDB/CIF/MRC）を読み込み")
@@ -6309,14 +7996,14 @@ class pyNuD_simulator(QMainWindow):
         self.file_label = QLabel("File Name: (none)")
         self.file_label.setStyleSheet("color: #666; font-size: 12px;")
         file_import_layout.addWidget(self.file_label)
-
+        
         # プログレスバー
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         file_import_layout.addWidget(self.progress_bar)
 
         layout.addWidget(file_import_group)
-
+        
         # ★★★ Density Thresholdセクションを追加 ★★★
         self.mrc_group = QGroupBox("Density Threshold")
         mrc_layout = QGridLayout(self.mrc_group)
@@ -6347,7 +8034,7 @@ class pyNuD_simulator(QMainWindow):
         # 表示設定
         display_group = QGroupBox("Display Settings")
         display_layout = QGridLayout(display_group)
-
+        
         # 表示スタイル
         display_layout.addWidget(QLabel("Style:"), 0, 0)
         self.style_combo = QComboBox()
@@ -6356,7 +8043,7 @@ class pyNuD_simulator(QMainWindow):
         ])
         self.style_combo.currentTextChanged.connect(self.update_display)
         display_layout.addWidget(self.style_combo, 0, 1)
-
+        
         # カラーリング
         display_layout.addWidget(QLabel("Color:"), 1, 0)
         self.color_combo = QComboBox()
@@ -6365,14 +8052,14 @@ class pyNuD_simulator(QMainWindow):
         ])
         self.color_combo.currentTextChanged.connect(self.on_color_scheme_changed)
         display_layout.addWidget(self.color_combo, 1, 1)
-
+        
         # 原子選択
         display_layout.addWidget(QLabel("Show:"), 2, 0)
         self.atom_combo = QComboBox()
         self.atom_combo.addItems(["All Atoms", "Heavy Atoms", "Backbone", "C", "N", "O"])
         self.atom_combo.currentTextChanged.connect(self.update_display)
         display_layout.addWidget(self.atom_combo, 2, 1)
-
+        
         # サイズ
         display_layout.addWidget(QLabel("Size:"), 3, 0)
         self.size_slider = QSlider(Qt.Horizontal)
@@ -6380,7 +8067,7 @@ class pyNuD_simulator(QMainWindow):
         self.size_slider.setValue(100)
         self.size_slider.valueChanged.connect(self.update_display)
         display_layout.addWidget(self.size_slider, 3, 1)
-
+        
         # 透明度
         display_layout.addWidget(QLabel("Opacity:"), 4, 0)
         self.opacity_slider = QSlider(Qt.Horizontal)
@@ -6388,7 +8075,7 @@ class pyNuD_simulator(QMainWindow):
         self.opacity_slider.setValue(100)
         self.opacity_slider.valueChanged.connect(self.update_display)
         display_layout.addWidget(self.opacity_slider, 4, 1)
-
+        
         # 品質設定
         display_layout.addWidget(QLabel("Quality:"), 5, 0)
         self.quality_combo = QComboBox()
@@ -6413,14 +8100,14 @@ class pyNuD_simulator(QMainWindow):
         else:
             self.renderer_combo = None
             self.esp_check = None
-
+        
         layout.addWidget(display_group)
         self._wire_display_settings_to_impose_overlay()
 
         # カラー・ライティング設定
         color_group = QGroupBox("Color & Lighting Settings")
         color_layout = QGridLayout(color_group)
-
+        
         # 背景色設定
         color_layout.addWidget(QLabel("Background:"), 0, 0)
         self.bg_color_btn = QPushButton("Choose Color")
@@ -6438,7 +8125,7 @@ class pyNuD_simulator(QMainWindow):
         """)
         self.bg_color_btn.clicked.connect(self.choose_background_color)
         color_layout.addWidget(self.bg_color_btn, 0, 1)
-
+        
         # 明るさ調整
         color_layout.addWidget(QLabel("Brightness:"), 1, 0)
         self.brightness_slider = QSlider(Qt.Horizontal)
@@ -6448,11 +8135,11 @@ class pyNuD_simulator(QMainWindow):
         self.brightness_factor = initial_brightness / 100.0
         self.brightness_slider.valueChanged.connect(self.update_brightness)
         color_layout.addWidget(self.brightness_slider, 1, 1)
-
+        
         self.brightness_label = QLabel(f"{initial_brightness}%")
         self.brightness_label.setMinimumWidth(40)
         color_layout.addWidget(self.brightness_label, 1, 2)
-
+        
         # 単色モード用カラー選択
         color_layout.addWidget(QLabel("Single Color:"), 2, 0)
         self.single_color_btn = QPushButton("Choose Color")
@@ -6475,7 +8162,7 @@ class pyNuD_simulator(QMainWindow):
         """)
         self.single_color_btn.clicked.connect(self.choose_single_color)
         color_layout.addWidget(self.single_color_btn, 2, 1)
-
+        
         # 環境光設定
         color_layout.addWidget(QLabel("Ambient:"), 3, 0)
         self.ambient_slider = QSlider(Qt.Horizontal)
@@ -6484,11 +8171,11 @@ class pyNuD_simulator(QMainWindow):
         self.ambient_slider.setValue(initial_ambient)
         self.ambient_slider.valueChanged.connect(self.update_lighting)
         color_layout.addWidget(self.ambient_slider, 3, 1)
-
+        
         self.ambient_label = QLabel(f"{initial_ambient}%")
         self.ambient_label.setMinimumWidth(40)
         color_layout.addWidget(self.ambient_label, 3, 2)
-
+        
         # スペキュラ設定
         color_layout.addWidget(QLabel("Specular:"), 4, 0)
         self.specular_slider = QSlider(Qt.Horizontal)
@@ -6496,11 +8183,11 @@ class pyNuD_simulator(QMainWindow):
         self.specular_slider.setValue(60)
         self.specular_slider.valueChanged.connect(self.update_material)
         color_layout.addWidget(self.specular_slider, 4, 1)
-
+        
         self.specular_label = QLabel("60%")
         self.specular_label.setMinimumWidth(40)
         color_layout.addWidget(self.specular_label, 4, 2)
-
+        
         dark_btn = QPushButton("Dark Theme")
         dark_btn.setStyleSheet("""
             QPushButton {
@@ -6516,7 +8203,7 @@ class pyNuD_simulator(QMainWindow):
         """)
         dark_btn.clicked.connect(self.apply_dark_theme)
         color_layout.addWidget(dark_btn, 5, 0, 1, 3)
-
+        
         layout.addWidget(color_group)
         self._update_single_color_control_state()
 
@@ -6536,7 +8223,7 @@ class pyNuD_simulator(QMainWindow):
         # Row 1: Radius (of cone part)
         tip_layout.addWidget(QLabel("Radius (nm):"), 1, 0)
         self.tip_radius_spin = QDoubleSpinBox()
-        self.tip_radius_spin.setRange(0.1, 30.0)
+        self.tip_radius_spin.setRange(0.1, 100.0)
         self.tip_radius_spin.setValue(0.5)
         self.tip_radius_spin.setSingleStep(0.1)
         self.tip_radius_spin.setDecimals(1)
@@ -6571,7 +8258,7 @@ class pyNuD_simulator(QMainWindow):
         self.tip_angle_spin.editingFinished.connect(self.tip_angle_editing_finished)
         self.tip_angle_spin.keyPressEvent = self.tip_angle_key_press_event
         tip_layout.addWidget(self.tip_angle_spin, 3, 1)
-
+        
         # Row 4: Tip Info
         self.tip_info_label = QLabel("Tip Info: -")
         self.tip_info_label.setStyleSheet("""
@@ -6584,59 +8271,109 @@ class pyNuD_simulator(QMainWindow):
         tip_layout.addWidget(self.tip_info_label, 4, 0, 1, 2)
 
         layout.addWidget(tip_group)
-
+        
         # 探針位置制御
         pos_group = QGroupBox("Tip Position Control")
         pos_layout = QGridLayout(pos_group)
+        # Slider units are 0.2 nm (value / 5). Spins show nm with 0.1 nm steps
+        # so arrow keys / typed values can fine-tune after Estimate Pose.
+
+        def _make_tip_spin(minimum_nm, maximum_nm, value_nm, tooltip):
+            spin = QDoubleSpinBox()
+            spin.setRange(float(minimum_nm), float(maximum_nm))
+            spin.setDecimals(1)
+            spin.setSingleStep(0.1)
+            spin.setValue(float(value_nm))
+            spin.setMinimumWidth(78)
+            spin.setKeyboardTracking(False)
+            spin.setToolTip(tooltip)
+            return spin
 
         # X位置
         pos_layout.addWidget(QLabel("X (nm):"), 0, 0)
+        self.tip_x_spin = _make_tip_spin(
+            -25.0,
+            25.0,
+            0.0,
+            "AFM tip X position in nanometers\nAFM探針のX位置（ナノメートル）",
+        )
+        pos_layout.addWidget(self.tip_x_spin, 0, 1)
         self.tip_x_slider = QSlider(Qt.Horizontal)
-        self.tip_x_slider.setRange(-50, 50)
+        # Default matches a ~50 nm scan (± half scan). Real AFM load / pose
+        # estimation retunes the range via _ensure_tip_xy_range_for_scan.
+        self.tip_x_slider.setRange(-125, 125)
         self.tip_x_slider.setValue(0)
-        self.tip_x_slider.setToolTip("AFM tip X position in nanometers\nAFM探針のX位置（ナノメートル）")
-        self.tip_x_slider.valueChanged.connect(self.update_tip_position)
-        self.tip_x_slider.sliderPressed.connect(self.on_tip_slider_pressed)
-        self.tip_x_slider.sliderReleased.connect(self.on_tip_slider_released)
-        pos_layout.addWidget(self.tip_x_slider, 0, 1)
-        self.tip_x_label = QLabel("0.0")
-        self.tip_x_label.setMinimumWidth(30)
-        pos_layout.addWidget(self.tip_x_label, 0, 2)
+        self.tip_x_slider.setToolTip(
+            "AFM tip X position in nanometers\nAFM探針のX位置（ナノメートル）"
+        )
+        pos_layout.addWidget(self.tip_x_slider, 0, 2)
+        pos_layout.setColumnStretch(2, 1)
 
         # Y位置
         pos_layout.addWidget(QLabel("Y (nm):"), 1, 0)
+        self.tip_y_spin = _make_tip_spin(
+            -25.0,
+            25.0,
+            0.0,
+            "AFM tip Y position in nanometers\nAFM探針のY位置（ナノメートル）",
+        )
+        pos_layout.addWidget(self.tip_y_spin, 1, 1)
         self.tip_y_slider = QSlider(Qt.Horizontal)
-        self.tip_y_slider.setRange(-50, 50)
+        self.tip_y_slider.setRange(-125, 125)
         self.tip_y_slider.setValue(0)
-        self.tip_y_slider.setToolTip("AFM tip Y position in nanometers\nAFM探針のY位置（ナノメートル）")
-        self.tip_y_slider.valueChanged.connect(self.update_tip_position)
-        self.tip_y_slider.sliderPressed.connect(self.on_tip_slider_pressed)
-        self.tip_y_slider.sliderReleased.connect(self.on_tip_slider_released)
-        pos_layout.addWidget(self.tip_y_slider, 1, 1)
-        self.tip_y_label = QLabel("0.0")
-        self.tip_y_label.setMinimumWidth(30)
-        pos_layout.addWidget(self.tip_y_label, 1, 2)
+        self.tip_y_slider.setToolTip(
+            "AFM tip Y position in nanometers\nAFM探針のY位置（ナノメートル）"
+        )
+        pos_layout.addWidget(self.tip_y_slider, 1, 2)
 
         # Z位置
         pos_layout.addWidget(QLabel("Z (nm):"), 2, 0)
+        self.tip_z_spin = _make_tip_spin(
+            2.0,
+            20.0,
+            2.0,
+            "AFM tip Z position (height) in nanometers\n"
+            "AFM探針のZ位置（高さ）（ナノメートル）\n"
+            "3D tip display only; Estimate Pose / AFM simulation do not move Z.",
+        )
+        pos_layout.addWidget(self.tip_z_spin, 2, 1)
         self.tip_z_slider = QSlider(Qt.Horizontal)
         self.tip_z_slider.setRange(10, 100)
-        self.tip_z_slider.setValue(25)
-        self.tip_z_slider.setToolTip("AFM tip Z position (height) in nanometers\nAFM探針のZ位置（高さ）（ナノメートル）")
-        self.tip_z_slider.valueChanged.connect(self.update_tip_position)
-        self.tip_z_slider.sliderPressed.connect(self.on_tip_slider_pressed)
-        self.tip_z_slider.sliderReleased.connect(self.on_tip_slider_released)
-        pos_layout.addWidget(self.tip_z_slider, 2, 1)
-        self.tip_z_label = QLabel("5.0")
-        self.tip_z_label.setMinimumWidth(30)
-        pos_layout.addWidget(self.tip_z_label, 2, 2)
+        self.tip_z_slider.setValue(10)
+        self.tip_z_slider.setToolTip(
+            "AFM tip Z position (height) in nanometers\n"
+            "AFM探針のZ位置（高さ）（ナノメートル）\n"
+            "3D tip display only; Estimate Pose / AFM simulation do not move Z."
+        )
+        pos_layout.addWidget(self.tip_z_slider, 2, 2)
+
+        self.tip_position_widgets = {
+            "X": {"spin": self.tip_x_spin, "slider": self.tip_x_slider},
+            "Y": {"spin": self.tip_y_spin, "slider": self.tip_y_slider},
+            "Z": {"spin": self.tip_z_spin, "slider": self.tip_z_slider},
+        }
+        for widgets in self.tip_position_widgets.values():
+            widgets["slider"].valueChanged.connect(self.sync_tip_position_widgets)
+            widgets["spin"].valueChanged.connect(self.sync_tip_position_widgets)
+            widgets["spin"].valueChanged.connect(
+                self.tip_position_spin_value_changed
+            )
+            widgets["spin"].editingFinished.connect(
+                self.tip_position_spin_editing_finished
+            )
+            widgets["slider"].sliderPressed.connect(self.on_tip_slider_pressed)
+            widgets["slider"].sliderReleased.connect(self.on_tip_slider_released)
 
         layout.addWidget(pos_group)
 
+        # Model pose rotation sits next to Tip Position so XY/Z pose tweaks
+        # do not require switching between the left and center panels.
+        layout.addWidget(self._create_model_rotation_group())
+        
         # シミュレーション設定
         sim_group = QGroupBox("AFM Simulation")
         sim_layout = QGridLayout(sim_group)
-
+        
         # スキャンサイズ (X/Y)
         sim_layout.addWidget(QLabel("Scan Size X (nm):"), 0, 0)
         self.spinScanXNm = QDoubleSpinBox()
@@ -6707,11 +8444,31 @@ class pyNuD_simulator(QMainWindow):
         # Apply default lock state now that widgets exist
         self._apply_rectangle_lock(enforce_values=True)
 
+        next_row = 6
+        if not self._is_vtk_only_plugin():
+            # This is a persistent state, so expose it as a visible checkbox
+            # beside the other Real AFM controls instead of as a top-level
+            # menu-bar action whose checked state is not apparent on macOS.
+            self.pynud_sync_check = QCheckBox("Live sync from pyNuD")
+            self.pynud_sync_check.setToolTip(
+                "Continuously receive the frame displayed in a running pyNuD.\n"
+                "起動中のpyNuDで表示しているフレームをReal AFMとして継続受信します。"
+            )
+            self.pynud_sync_check.setChecked(False)
+            self.pynud_sync_check.toggled.connect(self.toggle_pynud_sync)
+            sim_layout.addWidget(self.pynud_sync_check, next_row, 0, 1, 2)
+            next_row += 1
+            self.toggle_pynud_sync(False)
+
         # Sync to Real button
         self.btnSyncToReal = QPushButton("Sync Sim Params to Real AFM")
         self.btnSyncToReal.setToolTip("Synchronize simulator scan parameters to the loaded Real AFM metadata")
-        self.btnSyncToReal.clicked.connect(self.sync_sim_params_to_real)
-        sim_layout.addWidget(self.btnSyncToReal, 6, 0, 1, 2)
+        if self._is_vtk_only_plugin():
+            self.btnSyncToReal.clicked.connect(self.sync_sim_params_to_real)
+        else:
+            self.btnSyncToReal.clicked.connect(self._on_sync_sim_params_clicked)
+        sim_layout.addWidget(self.btnSyncToReal, next_row, 0, 1, 2)
+        next_row += 1
 
         self.interactive_update_check = QCheckBox("Interactive Update")
         self.interactive_update_check.setToolTip("Automatically update simulation when parameters change\nパラメータ変更時に自動でシミュレーションを実行")
@@ -6722,13 +8479,14 @@ class pyNuD_simulator(QMainWindow):
             self.interactive_update_check.setChecked(True)
         finally:
             self.interactive_update_check.blockSignals(False)
-        sim_layout.addWidget(self.interactive_update_check, 7, 0, 1, 2)
-
+        sim_layout.addWidget(self.interactive_update_check, next_row, 0, 1, 2)
+        next_row += 1
+        
         # Consider VDW check
         self.use_vdw_check = QCheckBox("Consider atom size (vdW)")
         self.use_vdw_check.setToolTip("Treat atoms as spheres with van der Waals radii instead of points\n原子を点ではなくファンデルワールス半径を持つ球として扱う")
         self.use_vdw_check.toggled.connect(self.trigger_interactive_simulation)
-        sim_layout.addWidget(self.use_vdw_check, 8, 0, 1, 2)
+        sim_layout.addWidget(self.use_vdw_check, next_row, 0, 1, 2)
 
 
         # シミュレーション実行
@@ -6753,7 +8511,7 @@ class pyNuD_simulator(QMainWindow):
         self.simulate_btn.clicked.connect(self.run_simulation)
         self.simulate_btn.setEnabled(False)
         sim_layout.addWidget(self.simulate_btn, 9, 0, 1, 2)
-
+        
         layout.addWidget(sim_group)
 
         # AFM Appearance (filters + noise/artifacts)
@@ -6942,6 +8700,19 @@ class pyNuD_simulator(QMainWindow):
         row += 1
 
         appearance_layout.addLayout(noise_layout)
+
+        self.btnAutoFitCheckedAppearance = QPushButton("Auto-fit Checked Appearance")
+        self.btnAutoFitCheckedAppearance.setToolTip(
+            "Fit only the enabled AFM Appearance items against Real AFM.\n"
+            "Run Estimate Pose and Auto-fit Tip Radius + Angle first.\n"
+            "チェックしたLow-pass / Noise / Drift / Feedback項目だけを自動調整します。"
+        )
+        self.btnAutoFitCheckedAppearance.setMinimumHeight(34)
+        self.btnAutoFitCheckedAppearance.clicked.connect(
+            self._run_auto_fit_checked_appearance_safely
+        )
+        appearance_layout.addWidget(self.btnAutoFitCheckedAppearance)
+
         # AFM Appearance is hosted in a dedicated window opened from the menu.
         self.afm_appearance_group = appearance_group
 
@@ -6972,28 +8743,28 @@ class pyNuD_simulator(QMainWindow):
                 pass
 
         self._update_noise_ui_states()
-
+        
         #self.update_tip_ui(self.tip_shape_combo.currentText())
-
+        
         return panel
-
-
+        
+    
     def update_tip_ui(self, shape):
         """探針設定UIの表示を、選択された形状に応じて更新する"""
         shape = shape.lower()
-
+        
         is_sphere = (shape == "sphere")
         is_cone = (shape == "cone")
-
+        
         # Minitip Radius widgets visibility
         self.minitip_label.setVisible(is_sphere)
         self.minitip_radius_spin.setVisible(is_sphere)
-
+        
         # Angle widgets visibility/enabled state
         angle_is_relevant = is_cone or is_sphere
         self.tip_angle_label.setEnabled(angle_is_relevant)
         self.tip_angle_spin.setEnabled(angle_is_relevant)
-
+        
         # Trigger a tip redraw
         self.update_tip()
 
@@ -7102,7 +8873,7 @@ class pyNuD_simulator(QMainWindow):
             vx = float(self.spinDriftVxNmPerLine.value()) if hasattr(self, 'spinDriftVxNmPerLine') else 0.0
             vy = float(self.spinDriftVyNmPerLine.value()) if hasattr(self, 'spinDriftVyNmPerLine') else 0.0
             jitter = float(self.spinDriftJitterNmPerLine.value()) if hasattr(self, 'spinDriftJitterNmPerLine') else 0.0
-
+            
             shifted = np.zeros_like(height)
             for y in range(ny):
                 dx_nm = vx * y + rng.normal(0.0, jitter)
@@ -7218,6 +8989,18 @@ class pyNuD_simulator(QMainWindow):
             self.real_afm_nm = full_arr
             self.real_meta = dict(meta_full)
             return True
+        # A near-full drag is usually an accidental one-pixel crop. Treating it
+        # as a physical ROI changes the scan center/extent without removing any
+        # meaningful background, which can introduce an apparent half-pixel pose
+        # offset. Snap it back to the exact full-image grid.
+        if (
+            (x1 - x0) / float(full_w) >= 0.90
+            and (y1 - y0) / float(full_h) >= 0.90
+        ):
+            self.real_afm_roi_px = None
+            self.real_afm_nm = full_arr
+            self.real_meta = dict(meta_full)
+            return True
 
         crop = full_arr[y0:y1, x0:x1]
         if crop.size == 0:
@@ -7253,6 +9036,148 @@ class pyNuD_simulator(QMainWindow):
         self.real_meta = meta
         return True
 
+    def _real_afm_full_scan_geometry(self):
+        """Return full-image (scan_x, scan_y, nx, ny) or None."""
+        full = getattr(self, "real_afm_nm_full", None)
+        meta_full = getattr(self, "real_meta_full", None)
+        if full is None or not meta_full:
+            return None
+        full_arr = np.asarray(full)
+        if full_arr.ndim != 2 or full_arr.size == 0:
+            return None
+        full_h, full_w = full_arr.shape
+        nx = int(meta_full.get("nx", full_w) or full_w)
+        ny = int(meta_full.get("ny", full_h) or full_h)
+        sx = float(meta_full.get("scan_x_nm", 0.0) or 0.0)
+        sy = float(meta_full.get("scan_y_nm", 0.0) or 0.0)
+        if nx <= 0 or ny <= 0 or sx <= 0.0 or sy <= 0.0:
+            return None
+        return float(sx), float(sy), int(nx), int(ny)
+
+    @staticmethod
+    def _scan_center_for_roi_window(
+        tip_x_nm,
+        tip_y_nm,
+        roi_px,
+        scan_x_nm,
+        scan_y_nm,
+        nx,
+        ny,
+    ):
+        """World-nm scan center of an ROI when tip is the full-image center."""
+        rx0, ry0, rx1, ry1 = [float(v) for v in roi_px]
+        cx_px = 0.5 * (rx0 + rx1)
+        cy_px = 0.5 * (ry0 + ry1)
+        tip_x = float(tip_x_nm) - 0.5 * float(scan_x_nm) + (
+            cx_px / float(nx)
+        ) * float(scan_x_nm)
+        tip_y = float(tip_y_nm) - 0.5 * float(scan_y_nm) + (
+            cy_px / float(ny)
+        ) * float(scan_y_nm)
+        return float(tip_x), float(tip_y)
+
+    @staticmethod
+    def _full_scan_center_from_roi_center(
+        tip_x_nm,
+        tip_y_nm,
+        roi_px,
+        scan_x_nm,
+        scan_y_nm,
+        nx,
+        ny,
+    ):
+        """Recover full-image tip from an ROI-centered tip."""
+        rx0, ry0, rx1, ry1 = [float(v) for v in roi_px]
+        cx_px = 0.5 * (rx0 + rx1)
+        cy_px = 0.5 * (ry0 + ry1)
+        tip_x = float(tip_x_nm) - (cx_px / float(nx)) * float(scan_x_nm) + (
+            0.5 * float(scan_x_nm)
+        )
+        tip_y = float(tip_y_nm) - (cy_px / float(ny)) * float(scan_y_nm) + (
+            0.5 * float(scan_y_nm)
+        )
+        return float(tip_x), float(tip_y)
+
+    def _update_pose_scan_center_nm(self, center_x_nm, center_y_nm):
+        """Keep pose / Active Structure snapshots aligned with tip XY."""
+        pose = dict(getattr(self, "pose", None) or {})
+        pose["center_x_nm"] = float(center_x_nm)
+        pose["center_y_nm"] = float(center_y_nm)
+        self.pose = pose
+        try:
+            self._record_manual_pose_geometry()
+        except Exception:
+            pass
+
+    def _invalidate_pose_after_roi_change(self):
+        """Invalidate alignment scores because a different AFM area was selected."""
+        pose = self._clear_estimated_pose_markers()
+        pose.update({
+            'theta_deg': 0.0,
+            'dx_px': 0.0,
+            'dy_px': 0.0,
+            'mirror_mode': 'none',
+        })
+        self.pose = pose
+        self.sim_aligned_nm = None
+        if hasattr(self, 'status_label'):
+            self.status_label.setText(
+                "Pose target changed. Run Estimate Pose (Global search)."
+            )
+
+    def _refresh_after_roi_scan_remap(self, *, soft=False):
+        """Refresh Real AFM panels after ROI/tip remapping.
+
+        soft=True keeps the current rotation and scan-center correspondence and
+        only clears Sim Aligned until the next simulation refresh.
+        """
+        if soft:
+            self.sim_aligned_nm = None
+            if hasattr(self, "status_label"):
+                try:
+                    self.status_label.setText(
+                        "ROI scan window remapped. Refreshing simulation..."
+                    )
+                except Exception:
+                    pass
+        else:
+            self._invalidate_pose_after_roi_change()
+        self._update_real_afm_roi_controls()
+        self.show_real_afm()
+        self._update_real_afm_frame_controls()
+        self.sync_sim_params_to_real()
+
+    def _update_real_afm_roi_controls(self):
+        """Show whether Estimate Pose uses the full image or a selected ROI."""
+        label = getattr(self, 'pose_roi_status_label', None)
+        button = getattr(self, 'use_full_image_btn', None)
+        roi = getattr(self, 'real_afm_roi_px', None)
+        try:
+            if roi is None:
+                if label is not None:
+                    label.setText("Pose ROI: Full image")
+                    label.setStyleSheet("color: #2e6b2e;")
+                if button is not None:
+                    button.setEnabled(False)
+                return
+
+            x0, y0, x1, y1 = [int(value) for value in roi]
+            width_px = max(0, x1 - x0)
+            height_px = max(0, y1 - y0)
+            meta = getattr(self, 'real_meta', None) or {}
+            width_nm = float(meta.get('scan_x_nm', 0.0) or 0.0)
+            height_nm = float(meta.get('scan_y_nm', 0.0) or 0.0)
+            size_text = f"{width_px}×{height_px} px"
+            if width_nm > 0.0 and height_nm > 0.0:
+                size_text += f" ({width_nm:.1f}×{height_nm:.1f} nm)"
+            if label is not None:
+                label.setText(f"Pose ROI: Selected {size_text}")
+                label.setStyleSheet("font-weight: bold; color: #9a5a00;")
+            if button is not None:
+                button.setEnabled(True)
+        except RuntimeError:
+            pass
+
     def on_real_afm_roi_selected(self, x0, y0, x1, y1):
         """Apply ROI selected on displayed Real AFM image (left-drag)."""
         full = getattr(self, 'real_afm_nm_full', None)
@@ -7266,25 +9191,93 @@ class pyNuD_simulator(QMainWindow):
             return
 
         # Displayed image is vertically flipped, so convert back to raw coordinates.
-        x0 = max(0, min(int(x0), w))
-        x1 = max(0, min(int(x1), w))
-        y0 = max(0, min(int(y0), h))
-        y1 = max(0, min(int(y1), h))
+        # Selection is always mapped into full-image pixel space.
+        active = np.asarray(getattr(self, "real_afm_nm", full_arr))
+        if active.ndim != 2:
+            return
+        active_h, active_w = active.shape
+        x0 = max(0, min(int(x0), active_w))
+        x1 = max(0, min(int(x1), active_w))
+        y0 = max(0, min(int(y0), active_h))
+        y1 = max(0, min(int(y1), active_h))
         rx0, rx1 = min(x0, x1), max(x0, x1)
-        ry0 = max(0, min(h, h - max(y0, y1)))
-        ry1 = max(0, min(h, h - min(y0, y1)))
+        ry0 = max(0, min(active_h, active_h - max(y0, y1)))
+        ry1 = max(0, min(active_h, active_h - min(y0, y1)))
         if rx1 <= rx0 or ry1 <= ry0:
             return
 
-        self.real_afm_roi_px = (int(rx0), int(ry0), int(rx1), int(ry1))
+        # If a ROI is already active, coordinates are relative to the crop.
+        # Convert them back into full-image coordinates before remapping tip.
+        existing_roi = getattr(self, "real_afm_roi_px", None)
+        if existing_roi is not None and active_w == int(existing_roi[2] - existing_roi[0]) and active_h == int(existing_roi[3] - existing_roi[1]):
+            ox0, oy0, _, _ = [int(v) for v in existing_roi]
+            rx0, rx1 = ox0 + rx0, ox0 + rx1
+            ry0, ry1 = oy0 + ry0, oy0 + ry1
+        else:
+            # Display was the full image; keep full-image bounds.
+            rx0 = max(0, min(rx0, w))
+            rx1 = max(0, min(rx1, w))
+            ry0 = max(0, min(ry0, h))
+            ry1 = max(0, min(ry1, h))
+
+        geometry = self._real_afm_full_scan_geometry()
+        tip_x, tip_y = self._get_tip_center_xy_nm()
+        # Tip is always interpreted in the current active scan. If a previous ROI
+        # is active, first lift that tip back to full-image coordinates.
+        if existing_roi is not None and geometry is not None:
+            tip_x, tip_y = self._full_scan_center_from_roi_center(
+                tip_x,
+                tip_y,
+                existing_roi,
+                geometry[0],
+                geometry[1],
+                geometry[2],
+                geometry[3],
+            )
+
+        roi = (int(rx0), int(ry0), int(rx1), int(ry1))
+        roi_tip = None
+        if geometry is not None:
+            roi_tip = self._scan_center_for_roi_window(
+                tip_x,
+                tip_y,
+                roi,
+                geometry[0],
+                geometry[1],
+                geometry[2],
+                geometry[3],
+            )
+
+        self.real_afm_roi_px = roi
         if not self._rebuild_real_afm_active_from_full():
             return
+        # Near-full snaps clear the ROI; nothing left to remap.
+        if getattr(self, "real_afm_roi_px", None) is None:
+            if roi_tip is None:
+                self._refresh_after_roi_scan_remap(soft=False)
+            else:
+                # Treat as full-image restore with remapped tip continuity.
+                self._ensure_tip_xy_range_for_scan(geometry[0], geometry[1])
+                actual = self._set_tip_center_xy_nm(
+                    tip_x, tip_y, update=False
+                )
+                self._update_pose_scan_center_nm(actual[0], actual[1])
+                self._refresh_after_roi_scan_remap(soft=True)
+            return
 
-        # ROI change invalidates current alignment until re-simulated.
-        self.sim_aligned_nm = None
-        self.show_real_afm()
-        self._update_real_afm_frame_controls()
-        self.sync_sim_params_to_real()
+        if roi_tip is not None:
+            meta = getattr(self, "real_meta", None) or {}
+            self._ensure_tip_xy_range_for_scan(
+                float(meta.get("scan_x_nm", 0.0) or 0.0),
+                float(meta.get("scan_y_nm", 0.0) or 0.0),
+            )
+            actual = self._set_tip_center_xy_nm(
+                roi_tip[0], roi_tip[1], update=False
+            )
+            self._update_pose_scan_center_nm(actual[0], actual[1])
+            self._refresh_after_roi_scan_remap(soft=True)
+        else:
+            self._refresh_after_roi_scan_remap(soft=False)
 
     def _clear_real_afm_roi_overlay(self):
         frame = getattr(self, 'real_afm_window_real_frame', None)
@@ -7301,14 +9294,41 @@ class pyNuD_simulator(QMainWindow):
         """Clear ROI and restore full Real AFM view."""
         if getattr(self, 'real_afm_nm_full', None) is None:
             return
+        had_roi = getattr(self, 'real_afm_roi_px', None) is not None
+        roi = getattr(self, "real_afm_roi_px", None)
+        geometry = self._real_afm_full_scan_geometry()
+        tip_x, tip_y = self._get_tip_center_xy_nm()
+        full_tip = None
+        if had_roi and roi is not None and geometry is not None:
+            full_tip = self._full_scan_center_from_roi_center(
+                tip_x,
+                tip_y,
+                roi,
+                geometry[0],
+                geometry[1],
+                geometry[2],
+                geometry[3],
+            )
+
         self.real_afm_roi_px = None
         self._clear_real_afm_roi_overlay()
         if not self._rebuild_real_afm_active_from_full():
             return
-        self.sim_aligned_nm = None
-        self.show_real_afm()
-        self._update_real_afm_frame_controls()
-        self.sync_sim_params_to_real()
+
+        if full_tip is not None:
+            self._ensure_tip_xy_range_for_scan(geometry[0], geometry[1])
+            actual = self._set_tip_center_xy_nm(
+                full_tip[0], full_tip[1], update=False
+            )
+            self._update_pose_scan_center_nm(actual[0], actual[1])
+            self._refresh_after_roi_scan_remap(soft=True)
+        elif had_roi:
+            self._refresh_after_roi_scan_remap(soft=False)
+        else:
+            self._update_real_afm_roi_controls()
+            self.show_real_afm()
+            self._update_real_afm_frame_controls()
+            self.sync_sim_params_to_real()
 
     def on_load_real_asd(self):
         """Load Real AFM ASD via file dialog."""
@@ -7531,6 +9551,157 @@ class pyNuD_simulator(QMainWindow):
         if sync:
             self.sync_sim_params_to_real()
 
+    def load_real_afm_from_handoff(self, filepath, sync=True):
+        """Load a processed AFM frame handed off from pyNuD.
+
+        The .npz carries the height map (nm) exactly as displayed in pyNuD
+        plus scan-size metadata, so no ASD re-reading or reprocessing happens here.
+        """
+        try:
+            data = np.load(filepath, allow_pickle=False)
+            real = np.asarray(data["height_nm"], dtype=np.float64)
+            scan_x_nm = float(data["scan_x_nm"].item()) if "scan_x_nm" in data else 0.0
+            scan_y_nm = float(data["scan_y_nm"].item()) if "scan_y_nm" in data else 0.0
+            scan_direction = str(data["scan_direction"].item()) if "scan_direction" in data else "L2R"
+            label = str(data["label"].item()) if "label" in data else "pyNuD-current"
+            frame_index = int(data["frame_index"].item()) if "frame_index" in data else 0
+        except Exception as e:
+            QMessageBox.critical(self, "Handoff Load Error", f"Failed to load pyNuD data:\n{e}")
+            return
+        if real.ndim != 2 or real.size == 0:
+            QMessageBox.critical(self, "Handoff Load Error", "Invalid handoff data shape.")
+            return
+
+        ny, nx = int(real.shape[0]), int(real.shape[1])
+        if scan_x_nm <= 0 or scan_y_nm <= 0:
+            scan_x_nm = scan_x_nm if scan_x_nm > 0 else scan_y_nm
+            scan_y_nm = scan_y_nm if scan_y_nm > 0 else scan_x_nm
+        meta = {
+            'nx': nx,
+            'ny': ny,
+            'scan_x_nm': scan_x_nm,
+            'scan_y_nm': scan_y_nm,
+            'nm_per_pixel_x': (scan_x_nm / nx) if nx else 0.0,
+            'nm_per_pixel_y': (scan_y_nm / ny) if ny else 0.0,
+            'scan_direction': scan_direction if scan_direction in ('L2R', 'R2L') else 'L2R',
+        }
+
+        self.real_afm_nm_full = real
+        self.real_meta_full = dict(meta)
+        self.real_afm_roi_px = None
+        self._clear_real_afm_roi_overlay()
+        self._rebuild_real_afm_active_from_full()
+        self.real_asd_path = label
+        self.real_asd_frame_num = 1
+        self.real_asd_frame_index = max(0, frame_index)
+        self.sim_aligned_nm = None
+
+        self._ensure_real_afm_window(show=True)
+        self.show_real_afm()
+        self._update_real_afm_frame_controls()
+        if sync:
+            self.sync_sim_params_to_real()
+
+    # ------------------------------------------------------------------
+    # Live sync from a running pyNuD (pull model via shared bridge)
+    # ------------------------------------------------------------------
+    def _pynud_bridge_dir(self):
+        # Fixed home-based path so both processes agree regardless of how each
+        # app is launched (macOS per-process TMPDIR would otherwise differ).
+        return os.path.join(os.path.expanduser("~"), ".pyNuD", "simulator_bridge")
+
+    def _pynud_is_connected(self):
+        """True if pyNuD's AFM Simulator plugin is alive and publishing frames."""
+        try:
+            state_path = os.path.join(self._pynud_bridge_dir(), "state.json")
+            if not os.path.isfile(state_path):
+                return False
+            with open(state_path) as f:
+                state = json.load(f)
+            if not state.get("active", False):
+                return False
+            return (time.time() - float(state.get("ts", 0) or 0)) < 6.0
+        except Exception:
+            return False
+
+    def _warn_pynud_not_connected(self):
+        QMessageBox.warning(
+            self,
+            "pyNuD not connected / pyNuD 未接続",
+            "pyNuD と接続されていません。\n"
+            "この操作は pyNuD の AFM Simulator プラグインが送る Real AFM フレームを使います。\n\n"
+            "pyNuD で AFM 画像を開き、AFM Simulator プラグインをロードした上で、"
+            "左パネルの『Live sync from pyNuD』を ON にしてください。\n\n"
+            "pyNuD is not connected. This action uses the Real AFM frame provided "
+            "by pyNuD's AFM Simulator plugin. Open an AFM image in pyNuD with the "
+            "plugin loaded, and enable 'Live sync from pyNuD' here.",
+        )
+
+    def _on_sync_sim_params_clicked(self):
+        """Button handler: require a live pyNuD connection before syncing when no Real AFM is loaded."""
+        if not self.real_meta and self._pynud_is_connected():
+            self._pynud_bridge_last_seq = None
+            self._poll_pynud_bridge()
+        if self.real_meta:
+            self.sync_sim_params_to_real()
+            return
+        if not self._pynud_is_connected():
+            self._warn_pynud_not_connected()
+            return
+        self.sync_sim_params_to_real()
+
+    def toggle_pynud_sync(self, enabled):
+        """Start/stop polling the pyNuD bridge for the displayed frame."""
+        timer = getattr(self, "_pynud_sync_timer", None)
+        if enabled:
+            if timer is None:
+                timer = QTimer(self)
+                timer.setInterval(500)
+                timer.timeout.connect(self._poll_pynud_bridge)
+                self._pynud_sync_timer = timer
+            self._pynud_bridge_last_seq = None
+            timer.start()
+        elif timer is not None:
+            timer.stop()
+
+    def _poll_pynud_bridge(self):
+        """Pull the frame pyNuD currently publishes, if it changed."""
+        bdir = self._pynud_bridge_dir()
+        # Heartbeat: lets the pyNuD plugin know a Simulator is already running
+        # so it will not spawn a duplicate instance when launching on open.
+        try:
+            os.makedirs(bdir, exist_ok=True)
+            hb_tmp = os.path.join(bdir, "consumer.json.tmp")
+            with open(hb_tmp, "w") as f:
+                json.dump({"pid": os.getpid(), "ts": time.time()}, f)
+            os.replace(hb_tmp, os.path.join(bdir, "consumer.json"))
+        except Exception:
+            pass
+        state_path = os.path.join(bdir, "state.json")
+        try:
+            if not os.path.isfile(state_path):
+                return
+            with open(state_path) as f:
+                state = json.load(f)
+        except Exception:
+            return
+        if not state.get("active", False):
+            return
+        seq = state.get("seq")
+        if seq is None or seq == getattr(self, "_pynud_bridge_last_seq", None):
+            return
+        npz_path = os.path.join(self._pynud_bridge_dir(), state.get("npz", "frame.npz"))
+        if not os.path.isfile(npz_path):
+            return
+        try:
+            self.load_real_afm_from_handoff(npz_path, sync=False)
+            if state.get("label"):
+                self.real_asd_path = str(state.get("label"))
+                self._update_real_afm_frame_controls()
+            self._pynud_bridge_last_seq = seq
+        except Exception as e:
+            print(f"[pyNuD sync] Failed to load bridge frame: {e}")
+
     def show_real_afm(self):
         """Display Real AFM (ASD) image in the dedicated window."""
         if self.real_afm_nm is None:
@@ -7540,6 +9711,7 @@ class pyNuD_simulator(QMainWindow):
         if target is None:
             return
         self.display_afm_image(self.real_afm_nm, target)
+        self._update_real_afm_roi_controls()
         # Clear aligned panel until pose is estimated
         if getattr(self, 'sim_aligned_nm', None) is None:
             self._clear_afm_panel(getattr(self, 'real_afm_window_aligned_frame', None))
@@ -7722,45 +9894,64 @@ class pyNuD_simulator(QMainWindow):
         shifted = scipy.ndimage.shift(rotated, shift=(dy_px, dx_px), order=1, mode='nearest')
         return shifted
 
-    def estimate_translation_phase_corr(self, real, sim):
-        """Phase correlation translation estimate."""
+    def estimate_translation_phase_corr(
+        self,
+        real,
+        sim,
+        max_shift_fraction=None,
+    ):
+        """Phase correlation translation estimate shared with Drift Compensation."""
         if real is None or sim is None or real.shape != sim.shape:
             return 0.0, 0.0
-        ny, nx = real.shape
-        win_y = np.hanning(ny)
-        win_x = np.hanning(nx)
-        if win_y.size == 0 or win_x.size == 0:
+        try:
+            result = estimate_phase_correlation_translation(
+                real,
+                sim,
+                apply_hann_window=True,
+                max_shift_fraction=max_shift_fraction,
+            )
+        except FlexibleFitBackendError:
             return 0.0, 0.0
-        window = np.outer(win_y, win_x)
-        A = fft2(real * window)
-        B = fft2(sim * window)
-        R = A * np.conj(B)
-        R /= (np.abs(R) + 1e-12)
-        r = np.real(ifft2(R))
-        py, px = np.unravel_index(np.argmax(r), r.shape)
+        return float(result["dx_px"]), float(result["dy_px"])
 
-        # Subpixel peak refinement (parabolic fit around correlation peak).
-        def _subpixel_1d(c_prev, c0, c_next):
-            denom = (c_prev - 2.0 * c0 + c_next)
-            if abs(denom) < 1e-12:
-                return 0.0
-            delta = 0.5 * (c_prev - c_next) / denom
-            return float(np.clip(delta, -1.0, 1.0))
-
-        py_m1 = (py - 1) % ny
-        py_p1 = (py + 1) % ny
-        px_m1 = (px - 1) % nx
-        px_p1 = (px + 1) % nx
-        dy_sub = _subpixel_1d(r[py_m1, px], r[py, px], r[py_p1, px])
-        dx_sub = _subpixel_1d(r[py, px_m1], r[py, px], r[py, px_p1])
-
-        shifts = np.array([py + dy_sub, px + dx_sub], dtype=float)
-        if shifts[0] > ny / 2:
-            shifts[0] -= ny
-        if shifts[1] > nx / 2:
-            shifts[1] -= nx
-        dy, dx = shifts
-        return float(dx), float(dy)
+    def _final_pose_image_correlation_alignment(self, real, simulated):
+        """Maximize final non-wrapping image correlation after pose ranking."""
+        if real is None or simulated is None:
+            return None
+        try:
+            real = np.asarray(real, dtype=np.float64)
+            sim_on_real, sim_valid = self._resample_sim_to_real_grid(
+                real,
+                simulated,
+            )
+            if sim_on_real is None or sim_valid is None:
+                return None
+            sim_on_real = np.asarray(sim_on_real, dtype=np.float64)
+            sim_valid = np.asarray(sim_valid, dtype=bool)
+            valid_values = sim_on_real[
+                sim_valid & np.isfinite(sim_on_real)
+            ]
+            if valid_values.size < 4:
+                return None
+            fill_value = float(np.percentile(valid_values, 5.0))
+            sim_for_correlation = np.where(
+                sim_valid,
+                sim_on_real,
+                fill_value,
+            )
+            real_preprocessed = prepare_pose_image_correlation_signal(
+                real
+            )
+            sim_preprocessed = prepare_pose_image_correlation_signal(
+                sim_for_correlation
+            )
+            return estimate_image_correlation_translation(
+                real_preprocessed,
+                sim_preprocessed,
+                max_shift_fraction=0.40,
+            )
+        except Exception:
+            return None
 
     def estimate_pose(self, real, sim0, theta_range_deg=180.0, coarse_step=5.0, fine_step=0.2, return_details=False, allow_mirror=True):
         """Estimate pose (mirror + theta + dx + dy) with robust coarse->fine search."""
@@ -7895,41 +10086,319 @@ class pyNuD_simulator(QMainWindow):
                     widget.blockSignals(False)
                 except Exception:
                     pass
+        self._ensure_tip_xy_range_for_scan(scan_x_nm, scan_y_nm)
 
-    def _get_tip_center_xy_nm(self):
-        """Return the current XY scan center controlled by the tip position sliders."""
-        x = self.tip_x_slider.value() / 5.0 if hasattr(self, 'tip_x_slider') else 0.0
-        y = self.tip_y_slider.value() / 5.0 if hasattr(self, 'tip_y_slider') else 0.0
-        return float(x), float(y)
+    def _tip_slider_units_per_nm(self):
+        """Tip position sliders store nm * 5 (0.2 nm per tick)."""
+        return 5.0
 
-    def _clamp_tip_center_xy_nm(self, x_nm, y_nm):
-        """Clamp an XY scan center to the existing tip slider ranges."""
-        x = float(x_nm)
-        y = float(y_nm)
-        if hasattr(self, 'tip_x_slider'):
-            x = min(max(x, self.tip_x_slider.minimum() / 5.0), self.tip_x_slider.maximum() / 5.0)
-        if hasattr(self, 'tip_y_slider'):
-            y = min(max(y, self.tip_y_slider.minimum() / 5.0), self.tip_y_slider.maximum() / 5.0)
-        return x, y
+    def _tip_nm_to_slider(self, value_nm):
+        return int(round(float(value_nm) * self._tip_slider_units_per_nm()))
 
-    def _set_tip_center_xy_nm(self, x_nm, y_nm, *, update=True):
-        """Set the XY scan center via the existing tip sliders and return actual values."""
-        x_nm, y_nm = self._clamp_tip_center_xy_nm(x_nm, y_nm)
+    def _tip_slider_to_nm(self, slider_value):
+        return float(slider_value) / self._tip_slider_units_per_nm()
+
+    def _sync_tip_spins_from_sliders(self):
+        """Copy current tip slider values into the nm spin boxes."""
+        widgets = getattr(self, "tip_position_widgets", None)
+        if not isinstance(widgets, dict):
+            return
+        for axis_widgets in widgets.values():
+            spin = axis_widgets.get("spin")
+            slider = axis_widgets.get("slider")
+            if spin is None or slider is None:
+                continue
+            try:
+                spin.blockSignals(True)
+                spin.setValue(self._tip_slider_to_nm(slider.value()))
+            finally:
+                try:
+                    spin.blockSignals(False)
+                except Exception:
+                    pass
+
+    def sync_tip_position_widgets(self):
+        """Keep tip nm spins and 0.2 nm sliders in sync, then refresh the tip."""
+        sender = self.sender()
+        widgets = getattr(self, "tip_position_widgets", None)
+        if not isinstance(widgets, dict):
+            self.update_tip_position()
+            return
+        for axis_widgets in widgets.values():
+            spin = axis_widgets.get("spin")
+            slider = axis_widgets.get("slider")
+            if spin is None or slider is None:
+                continue
+            if sender is spin:
+                try:
+                    slider.blockSignals(True)
+                    slider.setValue(self._tip_nm_to_slider(spin.value()))
+                finally:
+                    try:
+                        slider.blockSignals(False)
+                    except Exception:
+                        pass
+                break
+            if sender is slider:
+                try:
+                    spin.blockSignals(True)
+                    spin.setValue(self._tip_slider_to_nm(slider.value()))
+                finally:
+                    try:
+                        spin.blockSignals(False)
+                    except Exception:
+                        pass
+                break
+        self.update_tip_position()
+
+    def tip_position_spin_value_changed(self, _value=None):
+        """Debounced interactive update after tip spin / arrow changes."""
+        if hasattr(self, "tip_slider_pressed") and self.tip_slider_pressed:
+            return
+        if self.tip_position_debounce_timer:
+            self.tip_position_debounce_timer.stop()
+        self.tip_position_debounce_timer = QTimer(self)
+        self.tip_position_debounce_timer.setSingleShot(True)
+        self.tip_position_debounce_timer.timeout.connect(
+            self.trigger_interactive_simulation
+        )
+        self.tip_position_debounce_timer.start(100)
+
+    def tip_position_spin_editing_finished(self):
+        """Apply tip spin edits immediately when typing finishes."""
+        if self.tip_position_debounce_timer:
+            self.tip_position_debounce_timer.stop()
+        self.trigger_interactive_simulation()
+
+    def _ensure_tip_xy_range_for_scan(self, scan_x_nm=None, scan_y_nm=None):
+        """Fit tip XY slider/spin ranges to the AFM scan so the sim stays in frame.
+
+        Tip X/Y are the scan-window center. The usable range is centered on the
+        model XY centroid and spans roughly ±half the scan size per axis, so
+        dragging the slider cannot park the molecule completely outside the
+        AFM image. The current tip value is always included so the UI is not
+        yanked when the scan size changes.
+        """
+        try:
+            sx = float(
+                scan_x_nm
+                if scan_x_nm is not None
+                else getattr(self, "spinScanXNm", None).value()
+            )
+            sy = float(
+                scan_y_nm
+                if scan_y_nm is not None
+                else getattr(self, "spinScanYNm", None).value()
+            )
+        except Exception:
+            sx = sy = 50.0
+        sx = max(float(sx), 1.0)
+        sy = max(float(sy), 1.0)
+
+        try:
+            cur_x, cur_y = self._get_tip_center_xy_nm()
+        except Exception:
+            cur_x, cur_y = 0.0, 0.0
+
+        cx = float(cur_x)
+        cy = float(cur_y)
+        centroid = None
+        try:
+            centroid = self._model_xy_centroid_nm()
+        except Exception:
+            centroid = None
+        if centroid is not None:
+            cx, cy = float(centroid[0]), float(centroid[1])
+
+        # Keep the model centroid inside the scan window (± half scan), with a
+        # small pad so fine nudges near the edge remain possible.
+        pad_x = max(1.0, 0.05 * sx)
+        pad_y = max(1.0, 0.05 * sy)
+        x_lo = cx - 0.5 * sx - pad_x
+        x_hi = cx + 0.5 * sx + pad_x
+        y_lo = cy - 0.5 * sy - pad_y
+        y_hi = cy + 0.5 * sy + pad_y
+
+        # Never shrink past the current tip (and keep a usable minimum span).
+        x_lo = min(x_lo, float(cur_x))
+        x_hi = max(x_hi, float(cur_x))
+        y_lo = min(y_lo, float(cur_y))
+        y_hi = max(y_hi, float(cur_y))
+        min_span_x = max(2.0, 0.25 * sx)
+        min_span_y = max(2.0, 0.25 * sy)
+        if (x_hi - x_lo) < min_span_x:
+            mid = 0.5 * (x_lo + x_hi)
+            x_lo = mid - 0.5 * min_span_x
+            x_hi = mid + 0.5 * min_span_x
+        if (y_hi - y_lo) < min_span_y:
+            mid = 0.5 * (y_lo + y_hi)
+            y_lo = mid - 0.5 * min_span_y
+            y_hi = mid + 0.5 * min_span_y
+
+        axis_limits = {
+            "X": (x_lo, x_hi),
+            "Y": (y_lo, y_hi),
+        }
+        for axis, (lo_nm, hi_nm) in axis_limits.items():
+            axis_widgets = getattr(self, "tip_position_widgets", {}).get(axis)
+            slider = (
+                axis_widgets.get("slider")
+                if isinstance(axis_widgets, dict)
+                else getattr(self, f"tip_{axis.lower()}_slider", None)
+            )
+            spin = (
+                axis_widgets.get("spin")
+                if isinstance(axis_widgets, dict)
+                else getattr(self, f"tip_{axis.lower()}_spin", None)
+            )
+            if slider is None:
+                continue
+            lo_slider = self._tip_nm_to_slider(lo_nm)
+            hi_slider = self._tip_nm_to_slider(hi_nm)
+            if hi_slider <= lo_slider:
+                hi_slider = lo_slider + 1
+            current = int(slider.value())
+            current = min(max(current, lo_slider), hi_slider)
+            lo_ui = self._tip_slider_to_nm(lo_slider)
+            hi_ui = self._tip_slider_to_nm(hi_slider)
+            try:
+                slider.blockSignals(True)
+                if spin is not None:
+                    spin.blockSignals(True)
+                slider.setRange(lo_slider, hi_slider)
+                slider.setValue(current)
+                if spin is not None:
+                    spin.setRange(lo_ui, hi_ui)
+                    spin.setValue(self._tip_slider_to_nm(slider.value()))
+            finally:
+                try:
+                    slider.blockSignals(False)
+                except Exception:
+                    pass
+                if spin is not None:
+                    try:
+                        spin.blockSignals(False)
+                    except Exception:
+                        pass
+
+    def _model_xy_centroid_nm(self, coords=None):
+        """Return the finite-atom XY centroid used to center pose candidates."""
+        if coords is None:
+            try:
+                coords = self.get_rotated_atom_coords()
+            except Exception:
+                coords = None
+        if coords is None:
+            return None
+        arr = np.asarray(coords, dtype=np.float64)
+        if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] < 2:
+            return None
+        finite = np.all(np.isfinite(arr[:, :2]), axis=1)
+        if not np.any(finite):
+            return None
+        center = np.mean(arr[finite, :2], axis=0)
+        if not np.all(np.isfinite(center)):
+            return None
+        return float(center[0]), float(center[1])
+
+    def _get_tip_z_nm(self):
+        """Return current tip Z (nm). Used only for 3D tip display."""
+        if hasattr(self, "tip_z_spin"):
+            return float(self.tip_z_spin.value())
+        if hasattr(self, "tip_z_slider"):
+            return float(self._tip_slider_to_nm(self.tip_z_slider.value()))
+        return float(self.afm_params.get("tip_z", 2.0))
+
+    def _set_tip_z_nm(self, z_nm, *, update=True):
+        """Set tip Z without touching XY. Clamped to the Z slider range."""
+        z = float(z_nm)
         widgets = []
-        if hasattr(self, 'tip_x_slider'):
-            widgets.append(self.tip_x_slider)
-        if hasattr(self, 'tip_y_slider'):
-            widgets.append(self.tip_y_slider)
+        for name in ("tip_z_spin", "tip_z_slider"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widgets.append(widget)
         for widget in widgets:
             try:
                 widget.blockSignals(True)
             except Exception:
                 pass
         try:
-            if hasattr(self, 'tip_x_slider'):
-                self.tip_x_slider.setValue(int(round(float(x_nm) * 5.0)))
-            if hasattr(self, 'tip_y_slider'):
-                self.tip_y_slider.setValue(int(round(float(y_nm) * 5.0)))
+            if hasattr(self, "tip_z_slider"):
+                lo = int(self.tip_z_slider.minimum())
+                hi = int(self.tip_z_slider.maximum())
+                slider_value = int(round(self._tip_nm_to_slider(z)))
+                slider_value = max(lo, min(hi, slider_value))
+                self.tip_z_slider.setValue(slider_value)
+                z = float(self._tip_slider_to_nm(slider_value))
+            if hasattr(self, "tip_z_spin"):
+                self.tip_z_spin.setValue(z)
+        finally:
+            for widget in widgets:
+                try:
+                    widget.blockSignals(False)
+                except Exception:
+                    pass
+        if update:
+            try:
+                self.update_tip_position()
+            except Exception:
+                pass
+        return float(self._get_tip_z_nm())
+
+    def _get_tip_center_xy_nm(self):
+        """Return the current XY scan center controlled by the tip position UI."""
+        if hasattr(self, "tip_x_spin") and hasattr(self, "tip_y_spin"):
+            return float(self.tip_x_spin.value()), float(self.tip_y_spin.value())
+        x = (
+            self._tip_slider_to_nm(self.tip_x_slider.value())
+            if hasattr(self, "tip_x_slider")
+            else 0.0
+        )
+        y = (
+            self._tip_slider_to_nm(self.tip_y_slider.value())
+            if hasattr(self, "tip_y_slider")
+            else 0.0
+        )
+        return float(x), float(y)
+
+    def _clamp_tip_center_xy_nm(self, x_nm, y_nm):
+        """Clamp an XY scan center to the existing tip slider ranges."""
+        x = float(x_nm)
+        y = float(y_nm)
+        if hasattr(self, "tip_x_slider"):
+            x = min(
+                max(x, self._tip_slider_to_nm(self.tip_x_slider.minimum())),
+                self._tip_slider_to_nm(self.tip_x_slider.maximum()),
+            )
+        if hasattr(self, "tip_y_slider"):
+            y = min(
+                max(y, self._tip_slider_to_nm(self.tip_y_slider.minimum())),
+                self._tip_slider_to_nm(self.tip_y_slider.maximum()),
+            )
+        return x, y
+
+    def _set_tip_center_xy_nm(self, x_nm, y_nm, *, update=True):
+        """Set the XY scan center via tip spins/sliders and return actual values."""
+        x_nm, y_nm = self._clamp_tip_center_xy_nm(x_nm, y_nm)
+        widgets = []
+        for name in ("tip_x_spin", "tip_y_spin", "tip_x_slider", "tip_y_slider"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widgets.append(widget)
+        for widget in widgets:
+            try:
+                widget.blockSignals(True)
+            except Exception:
+                pass
+        try:
+            if hasattr(self, "tip_x_spin"):
+                self.tip_x_spin.setValue(float(x_nm))
+            if hasattr(self, "tip_y_spin"):
+                self.tip_y_spin.setValue(float(y_nm))
+            if hasattr(self, "tip_x_slider"):
+                self.tip_x_slider.setValue(self._tip_nm_to_slider(x_nm))
+            if hasattr(self, "tip_y_slider"):
+                self.tip_y_slider.setValue(self._tip_nm_to_slider(y_nm))
         finally:
             for widget in widgets:
                 try:
@@ -7960,8 +10429,8 @@ class pyNuD_simulator(QMainWindow):
             'scan_y_nm': float(scan_y_nm),
             'nx': int(nx),
             'ny': int(ny),
-            'center_x': self.tip_x_slider.value() / 5.0,
-            'center_y': self.tip_y_slider.value() / 5.0,
+            'center_x': self._get_tip_center_xy_nm()[0],
+            'center_y': self._get_tip_center_xy_nm()[1],
             'tip_radius': float(tip_params.get('tip_radius', self.tip_radius_spin.value())),
             'minitip_radius': float(tip_params.get('minitip_radius', self.minitip_radius_spin.value())),
             'tip_angle': float(tip_params.get('tip_angle', self.tip_angle_spin.value())),
@@ -8025,11 +10494,27 @@ class pyNuD_simulator(QMainWindow):
         # Do not apply synthetic noise/artifacts during pose search.
         return sim
 
+    def _score_pose_foreground_on_real_grid(self, real, sim):
+        """Score molecular foreground after resampling Sim onto the Real grid."""
+        sim_on_real, sim_valid = self._resample_sim_to_real_grid(real, sim)
+        if sim_on_real is None or sim_valid is None:
+            raise ValueError("Could not resample the simulated AFM image.")
+        # The resampler returns (image, mask). Passing that tuple directly to the
+        # scorer creates a 3-D array and silently disables foreground scoring.
+        sim_for_score = np.where(
+            np.asarray(sim_valid, dtype=bool),
+            np.asarray(sim_on_real, dtype=np.float64),
+            np.nan,
+        )
+        return score_pose_foreground_alignment(
+            np.asarray(real, dtype=np.float64),
+            sim_for_score,
+        )
+
     def _resample_sim_to_real_grid(self, real, sim):
         """Resample *sim* onto the 2D grid of *real*. Returns (sim_on_real_grid, sim_valid_mask)."""
         real = np.asarray(real, dtype=np.float64)
         sim = np.asarray(sim, dtype=np.float64)
-        real_valid = np.isfinite(real) & (real > -1e8)
         sim_valid = np.isfinite(sim) & (sim > -1e8)
         sim_f = np.where(sim_valid, sim, 0.0)
         sim_mask = sim_valid.astype(np.float64)
@@ -8040,7 +10525,9 @@ class pyNuD_simulator(QMainWindow):
                 sim_mask = scipy.ndimage.zoom(sim_mask, zoom, order=1)
             except Exception:
                 return None, None
-        return sim_f, (sim_mask > 0.5) & real_valid
+        # Keep the simulated-data mask independent from the fixed Real mask.
+        # The former is translated below; the latter must stay on the Real grid.
+        return sim_f, sim_mask > 0.5
 
     def _compute_comparison_metrics(self, real_nm, sim_nm, dx=None, dy=None):
         """Align Real vs Sim and return RMSD/ZNCC (same definition as the Difference panel).
@@ -8076,10 +10563,17 @@ class pyNuD_simulator(QMainWindow):
         if abs(dx) > 1e-6 or abs(dy) > 1e-6:
             try:
                 sim_f = scipy.ndimage.shift(sim_f, shift=(dy, dx), order=1, mode='nearest')
+                mask = scipy.ndimage.shift(
+                    mask.astype(np.float64),
+                    shift=(dy, dx),
+                    order=1,
+                    mode='constant',
+                    cval=0.0,
+                ) > 0.5
             except Exception:
                 pass
 
-        mask = np.isfinite(sim_f) & (sim_f > -1e8) & real_valid
+        mask = mask & np.isfinite(sim_f) & (sim_f > -1e8) & real_valid
         if np.count_nonzero(mask) < 4:
             return {'score': -1e9, 'dx': dx, 'dy': dy, 'rmsd': None, 'zncc': None}
 
@@ -8110,6 +10604,71 @@ class pyNuD_simulator(QMainWindow):
             return -1e9, 0.0, 0.0
         metrics = self._compute_comparison_metrics(real_nm, sim_img)
         return metrics['score'], metrics['dx'], metrics['dy']
+
+    def _sim_aligned_display_image(self, sim_nm=None):
+        """Return Sim Aligned image with the stored residual pose shift applied.
+
+        ``sim_aligned_nm`` itself stays unshifted so Difference can reapply the
+        residual translation with the same definition as scoring.
+        """
+        if sim_nm is None:
+            sim_nm = getattr(self, "sim_aligned_nm", None)
+        if sim_nm is None:
+            return None
+        display = np.asarray(sim_nm, dtype=np.float64)
+        pose = getattr(self, "pose", None)
+        if not isinstance(pose, dict):
+            return display
+        try:
+            dx = float(pose.get("dx_px", 0.0) or 0.0)
+            dy = float(pose.get("dy_px", 0.0) or 0.0)
+        except Exception:
+            return display
+        if abs(dx) <= 1e-6 and abs(dy) <= 1e-6:
+            return display
+        real = getattr(self, "real_afm_nm", None)
+        if real is not None and display.ndim == 2:
+            real = np.asarray(real)
+            if real.ndim == 2 and real.shape[0] > 0 and real.shape[1] > 0:
+                dx *= display.shape[1] / real.shape[1]
+                dy *= display.shape[0] / real.shape[0]
+        try:
+            valid = np.isfinite(display) & (display > -1e8)
+            shifted = scipy.ndimage.shift(
+                np.where(valid, display, 0.0),
+                shift=(dy, dx),
+                order=1,
+                mode="constant",
+                cval=0.0,
+            )
+            shifted_valid = scipy.ndimage.shift(
+                valid.astype(np.float64),
+                shift=(dy, dx),
+                order=1,
+                mode="constant",
+                cval=0.0,
+            ) > 0.5
+            # Pixels moved in from outside the simulated scan are undefined.
+            # Use the standard height-map sentinel so the display renders them
+            # black instead of stretching the nearest edge row/column.
+            return np.where(shifted_valid, shifted, -1e9)
+        except Exception:
+            return display
+
+    def _refresh_sim_aligned_panel(self):
+        """Redraw Sim Aligned after the stored pose translation changes."""
+        target_panel = getattr(self, "real_afm_window_aligned_frame", None)
+        if target_panel is None:
+            return
+        display = self._sim_aligned_display_image()
+        if display is None:
+            self._clear_afm_panel(target_panel)
+        else:
+            self.display_afm_image(display, target_panel)
+        try:
+            self._update_difference_panel()
+        except Exception:
+            pass
 
     def _simulate_xy_for_real_afm(self, *, update_panels=True, store_results=True, check_busy=True, show_messages=True):
         """Simulate XY using ASD scan metadata and return {'raw','processed','meta'} or None."""
@@ -8173,6 +10732,8 @@ class pyNuD_simulator(QMainWindow):
         if store_results:
             self.raw_simulation_results["XY_Frame"] = raw_xy
             self.simulation_results["XY_Frame"] = processed_xy
+            # Keep the unshifted simulation here; Difference and Sim Aligned
+            # display both reapply the residual pose shift when needed.
             self.sim_aligned_nm = processed_xy
 
         if update_panels:
@@ -8183,7 +10744,10 @@ class pyNuD_simulator(QMainWindow):
                 pass
             target_panel = getattr(self, 'real_afm_window_aligned_frame', None)
             if target_panel is not None:
-                self.display_afm_image(processed_xy, target_panel)
+                self.display_afm_image(
+                    self._sim_aligned_display_image(processed_xy),
+                    target_panel,
+                )
             try:
                 self._update_model_overlay()
             except Exception:
@@ -8204,7 +10768,16 @@ class pyNuD_simulator(QMainWindow):
             },
         }
 
-    def simulate_and_score(self, coords, real_img=None, meta=None, tip=None, lowpass=None):
+    def simulate_and_score(
+        self,
+        coords,
+        real_img=None,
+        meta=None,
+        tip=None,
+        lowpass=None,
+        foreground_pose=False,
+        estimate_foreground_translation=False,
+    ):
         """GUI-less forward simulation and Real-AFM scoring for pose/flexible fit.
 
         ``coords`` are already in simulation coordinates (including any current
@@ -8258,6 +10831,54 @@ class pyNuD_simulator(QMainWindow):
 
         metrics = self._compute_comparison_metrics(real, sim_for_pose, dx=0.0, dy=0.0)
         residual_metrics = self._compute_comparison_metrics(real, sim_for_pose)
+        # Pose ranking should primarily follow the molecular foreground, not
+        # flat margins, scan-line background, or absolute height amplitude
+        # (which also depends on the still-unknown tip geometry).
+        pose_score = -1e9
+        foreground_metrics = {}
+        foreground_translation = {}
+        if foreground_pose:
+            try:
+                foreground_metrics = self._score_pose_foreground_on_real_grid(
+                    real,
+                    sim_for_pose,
+                )
+                pose_score = float(foreground_metrics["score"])
+                if estimate_foreground_translation:
+                    sim_on_real, sim_valid = self._resample_sim_to_real_grid(
+                        real,
+                        sim_for_pose,
+                    )
+                    sim_for_translation = np.where(
+                        np.asarray(sim_valid, dtype=bool),
+                        np.asarray(sim_on_real, dtype=np.float64),
+                        np.nan,
+                    )
+                    foreground_translation = estimate_pose_foreground_translation(
+                        np.asarray(real, dtype=np.float64),
+                        sim_for_translation,
+                    )
+            except Exception:
+                pass
+        # Retain the whole-frame objective for Flexible Fit and as a fallback
+        # for unusually flat pose images where no foreground is identifiable.
+        if pose_score <= -1e8:
+            try:
+                real_arr = np.asarray(real, dtype=np.float64)
+                valid = np.isfinite(real_arr) & (real_arr > -1e8)
+                vals = real_arr[valid]
+                dynamic_range = float(
+                    np.percentile(vals, 99.0) - np.percentile(vals, 1.0)
+                )
+                dynamic_range = max(dynamic_range, 1e-6)
+                zncc = float(metrics.get("zncc", -1e9))
+                rmsd = float(metrics.get("rmsd"))
+                pose_score = (
+                    0.85 * zncc
+                    - 0.15 * min(rmsd / dynamic_range, 4.0)
+                )
+            except Exception:
+                pass
         return {
             "raw": raw_xy,
             "sim_img": sim_for_pose,
@@ -8268,27 +10889,268 @@ class pyNuD_simulator(QMainWindow):
                 "ny": ny,
             },
             "score": metrics.get("score", -1e9),
+            "pose_score": float(pose_score),
             "rmsd": metrics.get("rmsd"),
             "zncc": metrics.get("zncc"),
-            "dx": residual_metrics.get("dx", 0.0),
-            "dy": residual_metrics.get("dy", 0.0),
+            # Estimate Pose applies nearby shifts and uses the one that directly
+            # improves foreground overlap. A centroid is only its search seed.
+            "dx": foreground_translation.get(
+                "dx_px",
+                residual_metrics.get("dx", 0.0),
+            ),
+            "dy": foreground_translation.get(
+                "dy_px",
+                residual_metrics.get("dy", 0.0),
+            ),
+            "foreground_translation_score": foreground_translation.get("score"),
             "residual_score": residual_metrics.get("score", -1e9),
             "residual_rmsd": residual_metrics.get("rmsd"),
             "residual_zncc": residual_metrics.get("zncc"),
+            "foreground_score": foreground_metrics.get("score"),
+            "foreground_zncc": foreground_metrics.get("foreground_zncc"),
+            "foreground_dice": foreground_metrics.get("foreground_dice"),
+            "foreground_nrmse": foreground_metrics.get("foreground_nrmse"),
+            "centroid_distance_fraction": foreground_metrics.get(
+                "centroid_distance_fraction"
+            ),
         }
+
+    def _is_flexible_fit_live_preview_enabled(self):
+        check = getattr(self, "flex_fit_live_preview_check", None)
+        if check is None:
+            return False
+        try:
+            return bool(check.isChecked())
+        except Exception:
+            return False
+
+    def _begin_flexible_fit_live_preview(self, base_coords):
+        """Snapshot pre-fit state for optional mid-run candidate previews."""
+        aligned = getattr(self, "sim_aligned_nm", None)
+        self._flex_fit_live_preview = {
+            "active": True,
+            "base_coords": np.asarray(base_coords, dtype=float).copy(),
+            "sim_aligned_nm": (
+                None
+                if aligned is None
+                else np.asarray(aligned, dtype=float).copy()
+            ),
+            "last_preview_ts": 0.0,
+            "min_interval_s": 0.45,
+            "previewed": False,
+            "last_note": "",
+        }
+
+    def _apply_flexible_fit_preview_sim_aligned(self, sim_img):
+        """Show a preview-resolution sim on Sim Aligned / Difference panels."""
+        real = getattr(self, "real_afm_nm", None)
+        if real is None or sim_img is None:
+            return
+        preview = np.asarray(sim_img, dtype=float)
+        real_arr = np.asarray(real, dtype=float)
+        if preview.ndim != 2 or real_arr.ndim != 2:
+            return
+        if preview.shape != real_arr.shape:
+            zoom_y = float(real_arr.shape[0]) / max(float(preview.shape[0]), 1.0)
+            zoom_x = float(real_arr.shape[1]) / max(float(preview.shape[1]), 1.0)
+            preview = scipy.ndimage.zoom(preview, (zoom_y, zoom_x), order=1)
+        self.sim_aligned_nm = preview
+        target_panel = getattr(self, "real_afm_window_aligned_frame", None)
+        if target_panel is not None:
+            display = self._sim_aligned_display_image(preview)
+            if display is None:
+                self._clear_afm_panel(target_panel)
+            else:
+                self.display_afm_image(display, target_panel)
+        try:
+            self._update_difference_panel()
+        except Exception:
+            pass
+
+    def _preview_flexible_fit_candidate(
+        self,
+        local_coords,
+        sim_img=None,
+        *,
+        force=False,
+        note="",
+    ):
+        """Apply the current best candidate to the model / Sim Aligned (preview)."""
+        if not self._is_flexible_fit_live_preview_enabled():
+            return False
+        state = getattr(self, "_flex_fit_live_preview", None)
+        if not isinstance(state, dict) or not state.get("active"):
+            return False
+        now = time.monotonic()
+        min_interval = float(state.get("min_interval_s", 0.45))
+        if (
+            not force
+            and (now - float(state.get("last_preview_ts", 0.0))) < min_interval
+        ):
+            return False
+        if not self._set_atom_coords_array(
+            local_coords,
+            mark_edited=False,
+            preserve_domains=True,
+        ):
+            return False
+        try:
+            self.display_molecule()
+        except Exception:
+            pass
+        if sim_img is not None:
+            try:
+                self._apply_flexible_fit_preview_sim_aligned(sim_img)
+            except Exception:
+                pass
+        try:
+            self._queue_impose_overlay_refresh(0)
+        except Exception:
+            pass
+        state["last_preview_ts"] = now
+        state["previewed"] = True
+        if note:
+            state["last_note"] = str(note)
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
+        return True
+
+    def _finish_flexible_fit_live_preview(self, *, restore):
+        """End live preview; optionally restore the pre-fit structure."""
+        state = getattr(self, "_flex_fit_live_preview", None)
+        if not isinstance(state, dict):
+            return
+        try:
+            if restore and state.get("previewed"):
+                self._set_atom_coords_array(
+                    state["base_coords"],
+                    mark_edited=False,
+                    preserve_domains=True,
+                )
+                saved = state.get("sim_aligned_nm")
+                self.sim_aligned_nm = (
+                    None
+                    if saved is None
+                    else np.asarray(saved, dtype=float).copy()
+                )
+                try:
+                    self.display_molecule()
+                except Exception:
+                    pass
+                try:
+                    self._refresh_sim_aligned_panel()
+                except Exception:
+                    pass
+                try:
+                    self._queue_impose_overlay_refresh(0)
+                except Exception:
+                    pass
+        finally:
+            self._flex_fit_live_preview = None
+
+    def _flexible_fit_live_preview_label_suffix(self):
+        if not self._is_flexible_fit_live_preview_enabled():
+            return ""
+        state = getattr(self, "_flex_fit_live_preview", None)
+        note = ""
+        if isinstance(state, dict):
+            note = str(state.get("last_note") or "").strip()
+        if note:
+            return f"\nLive preview (not final): {note}"
+        return "\nLive preview (not final)"
+
+    def _update_flexible_fit_metrics_preserving_pose(
+        self,
+        final_pack,
+        fallback_score=-1e9,
+    ):
+        """Refresh fit metrics without changing Estimate Pose translation."""
+        pose = getattr(self, "pose", None)
+        if not isinstance(pose, dict):
+            pose = {}
+            self.pose = pose
+        try:
+            dx = float(pose.get("dx_px", 0.0) or 0.0)
+            dy = float(pose.get("dy_px", 0.0) or 0.0)
+        except Exception:
+            dx = dy = 0.0
+
+        applied_metrics = None
+        sim_image = (final_pack or {}).get("sim_img")
+        if sim_image is not None and self.real_afm_nm is not None:
+            try:
+                applied_metrics = self._compute_comparison_metrics(
+                    self.real_afm_nm,
+                    sim_image,
+                    dx=dx,
+                    dy=dy,
+                )
+            except Exception:
+                applied_metrics = None
+        if not isinstance(applied_metrics, dict):
+            applied_metrics = {
+                "score": (final_pack or {}).get("score", fallback_score),
+                "rmsd": (final_pack or {}).get("rmsd"),
+                "zncc": (final_pack or {}).get("zncc"),
+            }
+
+        # dx_px/dy_px remain the placement established by Estimate Pose.
+        # A flexible deformation may change the phase-correlation optimum, but
+        # applying that residual would silently move the entire fitted PDB.
+        pose["score"] = float(
+            applied_metrics.get("score", fallback_score)
+        )
+        pose["rmsd_nm"] = applied_metrics.get("rmsd")
+        pose["zncc"] = applied_metrics.get("zncc")
+        pose["flex_fit_suggested_dx_px"] = float(
+            (final_pack or {}).get("dx", 0.0) or 0.0
+        )
+        pose["flex_fit_suggested_dy_px"] = float(
+            (final_pack or {}).get("dy", 0.0) or 0.0
+        )
+        return applied_metrics
 
     def _build_flexible_fit_penalty_model(self, base_coords, domain_ids):
         nodes = self._extract_ca_domain_nodes()
         if nodes is None:
-            return {"node_indices": np.array([], dtype=int), "boundary_pairs": [], "boundary_dist": []}
+            return {
+                "node_indices": np.array([], dtype=int),
+                "boundary_pairs": [],
+                "boundary_dist": [],
+            }
         node_indices = np.asarray(nodes["node_indices"], dtype=int)
         if node_indices.size < 2:
-            return {"node_indices": node_indices, "boundary_pairs": [], "boundary_dist": []}
+            return {
+                "node_indices": node_indices,
+                "boundary_pairs": [],
+                "boundary_dist": [],
+            }
 
         node_coords = np.asarray(base_coords, dtype=float)[node_indices]
         node_domains = np.asarray(domain_ids, dtype=int)[node_indices]
         boundary_pairs = []
         boundary_dist = []
+        seen = set()
+
+        def add_boundary_pair(local_i, local_j):
+            di = int(node_domains[local_i])
+            dj = int(node_domains[local_j])
+            if di < 0 or dj < 0 or di == dj:
+                return
+            dist = float(np.linalg.norm(node_coords[local_j] - node_coords[local_i]))
+            if dist <= 1e-9:
+                return
+            atom_i = int(node_indices[local_i])
+            atom_j = int(node_indices[local_j])
+            key = (atom_i, atom_j) if atom_i < atom_j else (atom_j, atom_i)
+            if key in seen:
+                return
+            seen.add(key)
+            boundary_pairs.append(key)
+            boundary_dist.append(dist)
+
         try:
             from scipy.spatial import cKDTree
             pairs = cKDTree(node_coords).query_pairs(1.5)
@@ -8300,17 +11162,31 @@ class pyNuD_simulator(QMainWindow):
                         pairs.append((i, j))
 
         for i, j in pairs:
-            di = int(node_domains[i])
-            dj = int(node_domains[j])
-            if di < 0 or dj < 0 or di == dj:
-                continue
-            dist = float(np.linalg.norm(node_coords[j] - node_coords[i]))
-            if dist <= 1e-9:
-                continue
-            boundary_pairs.append((int(node_indices[i]), int(node_indices[j])))
-            boundary_dist.append(dist)
+            add_boundary_pair(i, j)
             if len(boundary_pairs) >= 2000:
                 break
+
+        # Sequence-adjacent residues in different domains are covalent linkers;
+        # keep them even when the spatial cutoff missed the interface.
+        chain_ids = np.asarray(nodes.get("chain_ids", []), dtype=object)
+        residue_ids = np.asarray(nodes.get("residue_ids", []), dtype=object)
+        if (
+            chain_ids.shape[0] == node_indices.shape[0]
+            and residue_ids.shape[0] == node_indices.shape[0]
+        ):
+            for i in range(node_indices.shape[0] - 1):
+                if str(chain_ids[i]).strip() != str(chain_ids[i + 1]).strip():
+                    continue
+                try:
+                    res_i = int(residue_ids[i])
+                    res_j = int(residue_ids[i + 1])
+                except (TypeError, ValueError):
+                    continue
+                if abs(res_j - res_i) != 1:
+                    continue
+                add_boundary_pair(i, i + 1)
+                if len(boundary_pairs) >= 2000:
+                    break
 
         return {
             "node_indices": node_indices,
@@ -8318,6 +11194,28 @@ class pyNuD_simulator(QMainWindow):
             "boundary_pairs": boundary_pairs,
             "boundary_dist": boundary_dist,
         }
+
+    def _flexible_fit_domains_connected(
+        self,
+        coords,
+        penalty_model,
+        max_stretch_nm=0.8,
+    ):
+        """Return True when interface/linker distances stay near the start pose."""
+        pairs = penalty_model.get("boundary_pairs", []) or []
+        base_dist = penalty_model.get("boundary_dist", []) or []
+        if not pairs:
+            return True
+        arr = np.asarray(coords, dtype=float)
+        limit = float(max_stretch_nm)
+        for (i, j), d0 in zip(pairs, base_dist):
+            d = float(np.linalg.norm(arr[int(j)] - arr[int(i)]))
+            # Allow hinge motion, but reject complete domain fly-apart.
+            if d > float(d0) + limit + 1e-9:
+                return False
+            if d > max(2.0, 2.5 * float(d0)) + 1e-9:
+                return False
+        return True
 
     def _flexible_fit_penalties(self, coords, penalty_model, domain_ids):
         arr = np.asarray(coords, dtype=float)
@@ -8361,6 +11259,465 @@ class pyNuD_simulator(QMainWindow):
                 clash_penalty = float(np.mean(vals))
         return boundary_penalty, clash_penalty
 
+    def _flexible_fit_structure_available(self):
+        result = getattr(self, "flexible_fit_result", None)
+        if not isinstance(result, dict) or self.atoms_data is None:
+            return False
+        try:
+            atom_count = len(self.atoms_data["x"])
+            select_flexible_fit_coordinates(
+                result,
+                "original",
+                atom_count,
+            )
+            select_flexible_fit_coordinates(
+                result,
+                "best_fit",
+                atom_count,
+            )
+        except (FlexibleFitBackendError, KeyError, TypeError):
+            return False
+        return True
+
+    def _flexible_fit_reset_coords(self):
+        """Return the originally loaded structure coordinates for Reset Fit."""
+        if getattr(self, "atoms_data", None) is None:
+            return None
+        atom_count = len(self.atoms_data["x"])
+        session = self._session_original_structure_coords(
+            expected_atom_count=atom_count
+        )
+        if session is not None:
+            return session
+        if not self._flexible_fit_structure_available():
+            return None
+        try:
+            return select_flexible_fit_coordinates(
+                self.flexible_fit_result,
+                "original",
+                atom_count,
+            )
+        except FlexibleFitBackendError:
+            return None
+
+    def _flexible_fit_reset_available(self):
+        # Reset is meaningful after an accepted fit; the target is always the
+        # originally loaded structure, not the previous fit's starting pose.
+        return (
+            self._flexible_fit_structure_available()
+            and self._flexible_fit_reset_coords() is not None
+        )
+
+    def _update_flexible_fit_action_buttons(self):
+        has_result = self._flexible_fit_structure_available()
+        can_reset = self._flexible_fit_reset_available()
+        for name, enabled in (
+            ("save_flex_fit_btn", has_result),
+            ("compare_flex_fit_btn", has_result),
+            ("reset_flex_fit_btn", can_reset),
+        ):
+            button = getattr(self, name, None)
+            if button is None:
+                continue
+            try:
+                button.setEnabled(bool(enabled))
+            except RuntimeError:
+                setattr(self, name, None)
+        self._sync_active_fit_structure_selector()
+
+    def _sync_active_fit_structure_selector(self):
+        combo = getattr(self, "active_fit_structure_combo", None)
+        available = self._flexible_fit_structure_available()
+        if not available:
+            self.active_fit_structure = "original"
+        if combo is None:
+            return
+        try:
+            combo.blockSignals(True)
+            combo.setEnabled(bool(available))
+            index = combo.findData(
+                str(getattr(self, "active_fit_structure", "original"))
+            )
+            combo.setCurrentIndex(max(0, index))
+        except RuntimeError:
+            self.active_fit_structure_combo = None
+        finally:
+            try:
+                combo.blockSignals(False)
+            except RuntimeError:
+                pass
+
+    def _initialize_active_fit_structure_state(self):
+        """Record independent pose states for pre-fit and best-fit models."""
+        result = getattr(self, "flexible_fit_result", None)
+        if not isinstance(result, dict):
+            self.active_fit_structure = "original"
+            self._update_flexible_fit_action_buttons()
+            return
+        # Keep / establish the loaded-session Original. Never replace it with
+        # the starting coordinates of a later Flexible Fit run.
+        if (
+            getattr(self, "flexible_fit_baseline_coords", None) is None
+            and getattr(self, "atoms_data", None) is not None
+        ):
+            try:
+                self.flexible_fit_baseline_coords = select_flexible_fit_coordinates(
+                    result,
+                    "original",
+                    len(self.atoms_data["x"]),
+                )
+            except FlexibleFitBackendError:
+                self.flexible_fit_baseline_coords = None
+        session_original = self._session_original_structure_coords(
+            expected_atom_count=(
+                len(self.atoms_data["x"])
+                if getattr(self, "atoms_data", None) is not None
+                else None
+            )
+        )
+        if session_original is not None:
+            result["original_coords"] = session_original
+        pose_snapshot = self._capture_current_structure_pose()
+        result["structure_poses"] = {
+            "original": dict(pose_snapshot),
+            "best_fit": dict(pose_snapshot),
+        }
+        result["active_structure"] = "best_fit"
+        self.active_fit_structure = "best_fit"
+        self._update_flexible_fit_action_buttons()
+
+    def _capture_current_structure_pose(self):
+        """Snapshot pose metrics plus the live Rotation XYZ / tip XY controls."""
+        pose = dict(getattr(self, "pose", None) or {})
+        try:
+            if hasattr(self, "rotation_widgets"):
+                pose["rot_x_deg"] = float(
+                    self.rotation_widgets["X"]["spin"].value()
+                )
+                pose["rot_y_deg"] = float(
+                    self.rotation_widgets["Y"]["spin"].value()
+                )
+                pose["rot_z_deg"] = float(
+                    self.rotation_widgets["Z"]["spin"].value()
+                )
+        except Exception:
+            pass
+        try:
+            center_x_nm, center_y_nm = self._get_tip_center_xy_nm()
+            pose["center_x_nm"] = float(center_x_nm)
+            pose["center_y_nm"] = float(center_y_nm)
+        except Exception:
+            pass
+        return pose
+
+    def _clear_estimated_pose_markers(self, pose=None):
+        """Drop Estimate Pose readiness markers from a pose dict."""
+        if pose is None:
+            pose = dict(getattr(self, "pose", None) or {})
+        else:
+            pose = dict(pose)
+        pose["score"] = None
+        pose["estimated"] = False
+        for key in (
+            "rot_x_deg",
+            "rot_y_deg",
+            "rot_z_deg",
+            "center_x_nm",
+            "center_y_nm",
+            "rmsd_nm",
+            "zncc",
+        ):
+            pose.pop(key, None)
+        return pose
+
+    def _store_pose_for_active_structure(self, pose_snapshot=None):
+        """Write a pose snapshot to the currently active Active Structure slot."""
+        result = getattr(self, "flexible_fit_result", None)
+        if not isinstance(result, dict):
+            return
+        mode = str(getattr(self, "active_fit_structure", "best_fit") or "best_fit")
+        if mode not in {"original", "best_fit"}:
+            mode = "best_fit"
+        snapshot = (
+            dict(pose_snapshot)
+            if isinstance(pose_snapshot, dict)
+            else self._capture_current_structure_pose()
+        )
+        poses = result.setdefault("structure_poses", {})
+        poses[mode] = snapshot
+
+    def _record_manual_pose_geometry(self):
+        """Keep live pose edits on both Active Structure snapshots.
+
+        Manual Rotation XYZ / tip XY adjustments are shared so switching
+        Original ↔ Best Fit does not rewind the user's correction. Estimate
+        Pose still writes a full pose only to the active structure.
+        """
+        if getattr(self, "_pose_estimation_running", False):
+            return
+        if getattr(self, "_restoring_active_structure_pose", False):
+            return
+        pose = self._capture_current_structure_pose()
+        self.pose = pose
+        result = getattr(self, "flexible_fit_result", None)
+        if not isinstance(result, dict):
+            return
+        poses = result.setdefault("structure_poses", {})
+        geometry_keys = (
+            "rot_x_deg",
+            "rot_y_deg",
+            "rot_z_deg",
+            "center_x_nm",
+            "center_y_nm",
+        )
+        for mode in ("original", "best_fit"):
+            entry = dict(poses.get(mode) or {})
+            for key in geometry_keys:
+                if key in pose:
+                    entry[key] = pose[key]
+            poses[mode] = entry
+
+    def _restore_active_structure_pose(self, pose_snapshot):
+        if not isinstance(pose_snapshot, dict):
+            return
+        self._restoring_active_structure_pose = True
+        try:
+            self.pose = dict(pose_snapshot)
+            try:
+                if all(
+                    key in pose_snapshot
+                    for key in ("rot_x_deg", "rot_y_deg", "rot_z_deg")
+                ):
+                    self.set_rotation_controls_xyz(
+                        float(pose_snapshot["rot_x_deg"]),
+                        float(pose_snapshot["rot_y_deg"]),
+                        float(pose_snapshot["rot_z_deg"]),
+                        apply_transform=True,
+                        trigger_simulation=False,
+                    )
+            except Exception:
+                pass
+            try:
+                if (
+                    pose_snapshot.get("center_x_nm") is not None
+                    and pose_snapshot.get("center_y_nm") is not None
+                ):
+                    self._set_tip_center_xy_nm(
+                        float(pose_snapshot["center_x_nm"]),
+                        float(pose_snapshot["center_y_nm"]),
+                        update=False,
+                    )
+            except Exception:
+                pass
+        finally:
+            self._restoring_active_structure_pose = False
+
+    def set_active_fit_structure(
+        self,
+        structure_mode,
+        *,
+        refresh=True,
+        show_messages=True,
+    ):
+        """Select the structure used by simulation, Estimate Pose, and overlay."""
+        mode = str(structure_mode).strip().lower()
+        result = getattr(self, "flexible_fit_result", None)
+        if not self._flexible_fit_structure_available():
+            self.active_fit_structure = "original"
+            self._sync_active_fit_structure_selector()
+            if show_messages:
+                QMessageBox.information(
+                    self,
+                    "Active Structure",
+                    "Run and accept a Flexible Fit before selecting Best Fit.",
+                )
+            return False
+        if mode not in {"original", "best_fit"}:
+            return False
+
+        for worker_name in (
+            "sim_worker",
+            "sim_worker_silent",
+            "sim_worker_high_res",
+        ):
+            if self.is_worker_running(
+                getattr(self, worker_name, None),
+                attr_name=worker_name,
+            ):
+                self._sync_active_fit_structure_selector()
+                if show_messages:
+                    QMessageBox.information(
+                        self,
+                        "Active Structure",
+                        "Another simulation is running. Please wait.",
+                    )
+                return False
+
+        current_mode = str(
+            getattr(self, "active_fit_structure", "best_fit")
+        )
+        poses = result.setdefault("structure_poses", {})
+        poses[current_mode] = self._capture_current_structure_pose()
+        try:
+            coordinates = select_flexible_fit_coordinates(
+                result,
+                mode,
+                len(self.atoms_data["x"]),
+            )
+        except FlexibleFitBackendError as exc:
+            self._sync_active_fit_structure_selector()
+            if show_messages:
+                QMessageBox.warning(self, "Active Structure", str(exc))
+            return False
+
+        if not self._set_atom_coords_array(
+            coordinates,
+            mark_edited=False,
+            preserve_domains=True,
+        ):
+            self._sync_active_fit_structure_selector()
+            return False
+        self.in_memory_structure_edited = True
+        self.pymol_structure_temp_dirty = True
+        self.pymol_loaded_path = None
+        self._vtk_overlay_signature_cache = None
+        self.active_fit_structure = mode
+        result["active_structure"] = mode
+        target_pose = poses.get(mode)
+        if not isinstance(target_pose, dict):
+            target_pose = self._capture_current_structure_pose()
+            poses[mode] = dict(target_pose)
+        self._restore_active_structure_pose(target_pose)
+        self._sync_active_fit_structure_selector()
+
+        if refresh:
+            self.display_molecule()
+            if self.real_afm_nm is not None:
+                self._simulate_xy_for_real_afm(
+                    update_panels=True,
+                    store_results=True,
+                    check_busy=False,
+                    show_messages=False,
+                )
+            else:
+                self._queue_impose_overlay_refresh(0)
+        return True
+
+    def reset_flexible_fit(self, *, show_messages=True, confirm=True):
+        """Restore the originally loaded structure without changing pose controls."""
+        coords = self._flexible_fit_reset_coords()
+        if coords is None:
+            if show_messages:
+                QMessageBox.information(
+                    self,
+                    "Reset Fit",
+                    "No accepted Flexible Fit is available to reset.",
+                )
+            return False
+
+        for worker_name in (
+            "sim_worker",
+            "sim_worker_silent",
+            "sim_worker_high_res",
+        ):
+            if self.is_worker_running(
+                getattr(self, worker_name, None),
+                attr_name=worker_name,
+            ):
+                if show_messages:
+                    QMessageBox.information(
+                        self,
+                        "Reset Fit",
+                        "Another simulation is running. Please wait.",
+                    )
+                return False
+
+        if confirm and show_messages:
+            reply = QMessageBox.question(
+                self,
+                "Reset Fit",
+                (
+                    "Restore the molecular structure to the originally loaded "
+                    "PDB/CIF coordinates?\n\n"
+                    "Rotation XYZ and tip XY are kept unchanged.\n"
+                    "The accepted fit result (Active structure / Save Fit) "
+                    "will be cleared."
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return False
+
+        if not self._set_atom_coords_array(
+            coords,
+            mark_edited=True,
+            preserve_domains=True,
+        ):
+            if show_messages:
+                QMessageBox.warning(
+                    self,
+                    "Reset Fit",
+                    "Failed to restore the originally loaded coordinates.",
+                )
+            return False
+
+        self.flexible_fit_result = None
+        self.flexible_fit_report_text = ""
+        # Keep flexible_fit_baseline_coords: it is the loaded-session Original.
+        self.active_fit_structure = "original"
+        self._update_flexible_fit_action_buttons()
+
+        self.display_molecule()
+        if self.real_afm_nm is not None:
+            self._simulate_xy_for_real_afm(
+                update_panels=True,
+                store_results=True,
+                check_busy=False,
+                show_messages=False,
+            )
+        else:
+            try:
+                self._queue_impose_overlay_refresh(0)
+            except Exception:
+                pass
+        if show_messages:
+            QMessageBox.information(
+                self,
+                "Reset Fit",
+                "Structure restored to the originally loaded coordinates.\n"
+                "Pose controls were left unchanged.",
+            )
+        return True
+
+    def _on_active_fit_structure_changed(self, index):
+        combo = getattr(self, "active_fit_structure_combo", None)
+        if combo is None:
+            return
+        mode = combo.itemData(int(index))
+        self.set_active_fit_structure(mode)
+
+    def run_selected_flexible_fit(self):
+        """Dispatch to the flexible-fit backend selected in the Real AFM UI."""
+        combo = getattr(self, "flex_fit_backend_combo", None)
+        backend = str(combo.currentData()) if combo is not None else "rigid_domains"
+        runners = {
+            "rigid_domains": self.run_flexible_fit,
+            "nma": self.run_nma_flexible_fit,
+            "nmff": self.run_nmff_flexible_fit,
+            "nolb": self.run_nolb_flexible_fit,
+            "afmfit": self.run_afmfit_flexible_fit,
+        }
+        runner = runners.get(backend)
+        if runner is None:
+            QMessageBox.warning(
+                self,
+                "Flexible Fit",
+                f"The selected backend is not available: {backend}",
+            )
+            return
+        runner()
+
     def run_flexible_fit(self):
         """Run single-frame rigid-domain flexible fitting from the Real AFM window."""
         if self.real_afm_nm is None:
@@ -8386,25 +11743,94 @@ class pyNuD_simulator(QMainWindow):
 
         domain_ids = np.asarray(self.domain_ids, dtype=int)
         domains = [int(d) for d in np.unique(domain_ids) if int(d) >= 0]
-        if not domains:
-            QMessageBox.warning(self, "Flexible Fit", "No movable domains are assigned.")
+        if len(domains) < 2:
+            QMessageBox.warning(
+                self,
+                "Flexible Fit",
+                "At least two detected domains are required. Run Detect Domains and inspect Domain colors.",
+            )
             return
+        domain_sizes = {domain: int(np.count_nonzero(domain_ids == domain)) for domain in domains}
+        anchor_domain = max(domains, key=lambda domain: domain_sizes[domain])
+        movable_domains = [domain for domain in domains if domain != anchor_domain]
 
-        precision_levels = ["Fast", "Medium", "Thorough"]
+        precision_levels = [
+            "Fast",
+            "Medium",
+            "Thorough",
+            "Large motion",
+        ]
         selected_level, ok = QInputDialog.getItem(
             self,
             "Flexible Fit",
-            "Run after Estimate Pose. Precision:",
+            "Precision:",
             precision_levels,
             0,
             False,
         )
         if not ok:
             return
+        connectivity_options = [
+            "Keep domains connected (no separation)",
+            "Allow domains to separate",
+        ]
+        selected_connectivity, ok = QInputDialog.getItem(
+            self,
+            "Flexible Fit",
+            "Domain connectivity:",
+            connectivity_options,
+            0,
+            False,
+        )
+        if not ok:
+            return
+        keep_domains_connected = (
+            str(selected_connectivity)
+            == "Keep domains connected (no separation)"
+        )
         profiles = {
-            "Fast": {"cycles": 1, "maxiter": 10, "max_rot_deg": 6.0, "xtol": 0.30, "ftol": 1e-3},
-            "Medium": {"cycles": 2, "maxiter": 16, "max_rot_deg": 10.0, "xtol": 0.20, "ftol": 5e-4},
-            "Thorough": {"cycles": 3, "maxiter": 24, "max_rot_deg": 14.0, "xtol": 0.12, "ftol": 2e-4},
+            "Fast": {
+                "cycles": 1,
+                "maxiter": 10,
+                "maxfev": 120,
+                "max_rot_deg": 6.0,
+                "max_trans_px": 2.5,
+                "max_stretch_nm": 0.8,
+                "xtol": 0.30,
+                "ftol": 1e-3,
+            },
+            "Medium": {
+                "cycles": 2,
+                "maxiter": 16,
+                "maxfev": 240,
+                "max_rot_deg": 10.0,
+                "max_trans_px": 2.5,
+                "max_stretch_nm": 0.8,
+                "xtol": 0.20,
+                "ftol": 5e-4,
+            },
+            "Thorough": {
+                "cycles": 3,
+                "maxiter": 24,
+                "maxfev": 360,
+                "max_rot_deg": 14.0,
+                "max_trans_px": 3.0,
+                "max_stretch_nm": 1.0,
+                "xtol": 0.12,
+                "ftol": 2e-4,
+            },
+            # Large hinge / arm opening relative to the AFM image while the
+            # connectivity option still prevents complete domain fly-apart.
+            "Large motion": {
+                "cycles": 4,
+                "maxiter": 40,
+                "maxfev": 720,
+                "max_rot_deg": 45.0,
+                "max_trans_px": 8.0,
+                "max_stretch_nm": 1.6,
+                "xtol": 0.08,
+                "ftol": 1e-4,
+            },
         }
         cfg = profiles.get(str(selected_level), profiles["Fast"])
 
@@ -8414,17 +11840,62 @@ class pyNuD_simulator(QMainWindow):
             return
         scan_x_nm, scan_y_nm, nx, ny = meta
         pixel_nm = max(float(scan_x_nm) / max(float(nx), 1.0), float(scan_y_nm) / max(float(ny), 1.0))
-        max_trans_nm = max(0.15, pixel_nm * 2.5)
+        fit_scale = min(1.0, 96.0 / max(float(nx), float(ny)))
+        fit_nx = min(int(nx), max(24, int(round(float(nx) * fit_scale))))
+        fit_ny = min(int(ny), max(24, int(round(float(ny) * fit_scale))))
+        if fit_nx != int(nx) or fit_ny != int(ny):
+            fit_real = scipy.ndimage.zoom(
+                np.asarray(self.real_afm_nm, dtype=np.float64),
+                (fit_ny / float(ny), fit_nx / float(nx)),
+                order=1,
+            )
+        else:
+            fit_real = self.real_afm_nm
+        fit_meta = (scan_x_nm, scan_y_nm, fit_nx, fit_ny)
 
         base_coords = self._current_atom_coords_array()
         if base_coords is None:
             return
-        before_pack = self.simulate_and_score(
+        # Domain rotation is about each domain centroid, so a large hinge angle
+        # needs enough translation to keep the linker near its starting place.
+        max_domain_radius_nm = 0.0
+        for domain in movable_domains:
+            mask = domain_ids == int(domain)
+            if not np.any(mask):
+                continue
+            pts = np.asarray(base_coords, dtype=float)[mask]
+            center = np.mean(pts, axis=0)
+            radii = np.linalg.norm(pts - center, axis=1)
+            if radii.size:
+                max_domain_radius_nm = max(
+                    max_domain_radius_nm,
+                    float(np.percentile(radii, 90)),
+                )
+        hinge_trans_nm = max_domain_radius_nm * float(
+            np.deg2rad(float(cfg["max_rot_deg"]))
+        )
+        max_trans_nm = max(
+            0.15,
+            float(pixel_nm) * float(cfg.get("max_trans_px", 2.5)),
+            1.15 * hinge_trans_nm,
+        )
+        max_stretch_nm = float(cfg.get("max_stretch_nm", 0.8))
+        before_full_pack = self.simulate_and_score(
             self._apply_current_rotation_to_coords(base_coords),
             self.real_afm_nm,
             meta=meta,
         )
-        if before_pack is None or before_pack.get("rmsd") is None:
+        before_pack = self.simulate_and_score(
+            self._apply_current_rotation_to_coords(base_coords),
+            fit_real,
+            meta=fit_meta,
+        )
+        if (
+            before_pack is None
+            or before_pack.get("rmsd") is None
+            or before_full_pack is None
+            or before_full_pack.get("rmsd") is None
+        ):
             QMessageBox.warning(self, "Flexible Fit", "Initial simulation/scoring failed.")
             return
 
@@ -8433,39 +11904,37 @@ class pyNuD_simulator(QMainWindow):
             for _ in range(max(domains) + 1)
         ]
         penalty_model = self._build_flexible_fit_penalty_model(base_coords, domain_ids)
-        total_steps = int(cfg["cycles"]) * len(domains)
+        total_steps = int(cfg["cycles"]) * len(movable_domains)
         progress = QProgressDialog("Flexible fitting...", "Cancel", 0, max(1, total_steps), self)
         progress.setWindowTitle("Flexible Fit")
         progress.setWindowModality(Qt.ApplicationModal)
         progress.setMinimumDuration(0)
         progress.setValue(0)
         progress.show()
-
-        try:
-            from scipy.optimize import minimize
-        except Exception as e:
-            progress.close()
-            QMessageBox.critical(self, "Flexible Fit", f"scipy.optimize is unavailable:\n{e}")
-            return
+        self._begin_flexible_fit_live_preview(base_coords)
 
         class _FitCanceled(Exception):
             pass
 
         best_pack = dict(before_pack)
+        best_pack["_objective"] = float("inf")
+        best_coords = None
         eval_count = 0
         step_count = 0
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             for cycle in range(int(cfg["cycles"])):
-                for domain in domains:
+                for domain in movable_domains:
                     if progress.wasCanceled():
                         raise _FitCanceled()
                     current_rot, current_trans = domain_params[domain]
                     x0 = np.concatenate([np.degrees(current_rot), current_trans])
                     eval_cache = {}
+                    local_best_value = float("inf")
+                    local_best_x = np.array(x0, dtype=float, copy=True)
 
                     def objective(x):
-                        nonlocal eval_count, best_pack
+                        nonlocal eval_count, best_pack, best_coords, local_best_value, local_best_x
                         if progress.wasCanceled():
                             raise _FitCanceled()
                         x = np.asarray(x, dtype=float)
@@ -8481,8 +11950,21 @@ class pyNuD_simulator(QMainWindow):
                                 global_pose=None,
                                 domain_params=trial_params,
                             )
+                        except Exception:
+                            value = 1e6
+                            eval_cache[key] = float(value)
+                            return float(value)
+                        if keep_domains_connected and not self._flexible_fit_domains_connected(
+                            local_coords,
+                            penalty_model,
+                            max_stretch_nm=max_stretch_nm,
+                        ):
+                            value = 1e6
+                            eval_cache[key] = float(value)
+                            return float(value)
+                        try:
                             rotated_coords = self._apply_current_rotation_to_coords(local_coords)
-                            pack = self.simulate_and_score(rotated_coords, self.real_afm_nm, meta=meta)
+                            pack = self.simulate_and_score(rotated_coords, fit_real, meta=fit_meta)
                         except Exception:
                             pack = None
                         eval_count += 1
@@ -8494,21 +11976,51 @@ class pyNuD_simulator(QMainWindow):
                                 penalty_model,
                                 domain_ids,
                             )
+                            # Soft boundary cost remains useful in allow-separate
+                            # mode; connected mode already hard-rejects fly-apart.
+                            boundary_weight = (
+                                0.25 if keep_domains_connected else 0.03
+                            )
                             value = (
-                                -float(pack.get("score", -1e9))
-                                + 0.03 * boundary_penalty
+                                -float(pack.get("pose_score", -1e9))
+                                + boundary_weight * boundary_penalty
                                 + 0.05 * clash_penalty
                             )
-                            if pack.get("score", -1e9) > best_pack.get("score", -1e9):
+                            if value < local_best_value:
+                                local_best_value = float(value)
+                                local_best_x = np.array(x, dtype=float, copy=True)
+                            # Track the best accepted objective, not raw AFM score
+                            # alone — otherwise a disconnected high-score outlier
+                            # can become the final structure.
+                            if value + 1e-9 < float(
+                                best_pack.get("_objective", float("inf"))
+                            ):
                                 best_pack = dict(pack)
+                                best_pack["_objective"] = float(value)
+                                best_coords = np.asarray(local_coords, dtype=float).copy()
+                                self._preview_flexible_fit_candidate(
+                                    best_coords,
+                                    pack.get("sim_img"),
+                                    note=(
+                                        f"score {float(pack.get('pose_score', -1e9)):.4f}"
+                                    ),
+                                )
                         if eval_count % 4 == 0:
                             rmsd_text = "-"
                             if best_pack.get("rmsd") is not None:
                                 rmsd_text = f"{best_pack['rmsd']:.3f} nm"
+                            connectivity_note = (
+                                "connected"
+                                if keep_domains_connected
+                                else "allow separate"
+                            )
                             progress.setLabelText(
-                                f"Flexible fitting ({selected_level})...\n"
-                                f"Cycle {cycle + 1}/{cfg['cycles']}  Domain {domain + 1}\n"
+                                f"Flexible fitting ({selected_level}, "
+                                f"{connectivity_note})...\n"
+                                f"Cycle {cycle + 1}/{cfg['cycles']}  Domain {domain + 1} "
+                                f"(anchor: {anchor_domain + 1})\n"
                                 f"Best RMSD: {rmsd_text}    Evaluations: {eval_count}"
+                                + self._flexible_fit_live_preview_label_suffix()
                             )
                             QApplication.processEvents()
                         eval_cache[key] = float(value)
@@ -8524,42 +12036,163 @@ class pyNuD_simulator(QMainWindow):
                         bounds=bounds,
                         options={
                             "maxiter": int(cfg["maxiter"]),
+                            "maxfev": int(cfg["maxfev"]),
                             "xtol": float(cfg["xtol"]),
                             "ftol": float(cfg["ftol"]),
                             "disp": False,
                         },
                     )
-                    x_best = np.asarray(result.x if hasattr(result, "x") else x0, dtype=float)
-                    domain_params[domain] = (np.radians(x_best[:3]), x_best[3:6])
+                    # Powell may stop at maxiter without returning its best sampled
+                    # point. Commit the best finite objective observed, not blindly
+                    # result.x. The anchor domain remains fixed at zero transform.
+                    if np.isfinite(local_best_value):
+                        domain_params[domain] = (
+                            np.radians(local_best_x[:3]),
+                            np.asarray(local_best_x[3:6], dtype=float),
+                        )
                     step_count += 1
                     progress.setValue(min(step_count, total_steps))
                     QApplication.processEvents()
 
+            # Commit candidate from domain_params, but also re-score the live
+            # preview best (low-res) at full resolution — Powell's last params
+            # are not always the best pose_score seen during search.
             final_coords = apply_domain_transforms(
                 base_coords,
                 domain_ids,
                 global_pose=None,
                 domain_params=domain_params,
             )
+            if keep_domains_connected and not self._flexible_fit_domains_connected(
+                final_coords,
+                penalty_model,
+                max_stretch_nm=max_stretch_nm,
+            ):
+                # Fall back to the last connected live-preview best if Powell
+                # somehow committed a disconnected set of domain params.
+                if best_coords is not None and self._flexible_fit_domains_connected(
+                    best_coords,
+                    penalty_model,
+                    max_stretch_nm=max_stretch_nm,
+                ):
+                    final_coords = np.asarray(best_coords, dtype=float).copy()
+                else:
+                    final_coords = np.asarray(base_coords, dtype=float).copy()
             final_rotated = self._apply_current_rotation_to_coords(final_coords)
             final_pack = self.simulate_and_score(final_rotated, self.real_afm_nm, meta=meta)
+            if best_coords is not None and (
+                not keep_domains_connected
+                or self._flexible_fit_domains_connected(
+                    best_coords,
+                    penalty_model,
+                    max_stretch_nm=max_stretch_nm,
+                )
+            ):
+                best_rotated = self._apply_current_rotation_to_coords(best_coords)
+                best_full_pack = self.simulate_and_score(
+                    best_rotated, self.real_afm_nm, meta=meta
+                )
+                if (
+                    best_full_pack is not None
+                    and best_full_pack.get("rmsd") is not None
+                    and (
+                        final_pack is None
+                        or final_pack.get("rmsd") is None
+                        or float(best_full_pack.get("pose_score", -1e9))
+                        > float(final_pack.get("pose_score", -1e9))
+                    )
+                ):
+                    final_coords = np.asarray(best_coords, dtype=float).copy()
+                    final_pack = best_full_pack
             if final_pack is None or final_pack.get("rmsd") is None:
                 QMessageBox.warning(self, "Flexible Fit", "Final simulation/scoring failed. Structure was not changed.")
                 return
 
-            self._set_atom_coords_array(final_coords, mark_edited=True)
+            if keep_domains_connected and not self._flexible_fit_domains_connected(
+                final_coords,
+                penalty_model,
+                max_stretch_nm=max_stretch_nm,
+            ):
+                QMessageBox.information(
+                    self,
+                    "Flexible Fit",
+                    "No connected-domain improvement was found. "
+                    "The structure was not changed.\n\n"
+                    "Try Allow domains to separate only if the molecule "
+                    "is expected to break into independent pieces.",
+                )
+                return
+
+            before_score = float(before_full_pack.get("pose_score", -1e9))
+            after_score = float(final_pack.get("pose_score", -1e9))
+            before_residual_rmsd = before_full_pack.get("residual_rmsd")
+            after_residual_rmsd = final_pack.get("residual_rmsd")
+            rmsd_not_worse = (
+                before_residual_rmsd is not None
+                and after_residual_rmsd is not None
+                and float(after_residual_rmsd) <= float(before_residual_rmsd) + 1e-4
+            )
+            if (
+                not np.isfinite(after_score)
+                or after_score <= before_score + 1e-4
+                or not rmsd_not_worse
+            ):
+                preview_note = ""
+                if getattr(self, "_flex_fit_live_preview", None) is not None:
+                    preview_note = (
+                        "\n\nLive preview showed temporary low-resolution candidates; "
+                        "they are discarded when full-resolution scoring does not improve."
+                    )
+                QMessageBox.information(
+                    self,
+                    "Flexible Fit",
+                    "No reliable fit improvement was found. The structure was not changed.\n\n"
+                    f"Pose score: {before_score:.4f} -> {after_score:.4f}\n"
+                    f"Aligned RMSD: {before_residual_rmsd} -> {after_residual_rmsd} nm"
+                    f"{preview_note}",
+                )
+                return
+
+            self._finish_flexible_fit_live_preview(restore=False)
+            self._set_atom_coords_array(
+                final_coords,
+                mark_edited=True,
+                preserve_domains=True,
+            )
+            comparison_before = dict(before_full_pack)
+            comparison_after = dict(final_pack)
+            for target, source in (
+                (comparison_before, before_full_pack),
+                (comparison_after, final_pack),
+            ):
+                if source.get("residual_rmsd") is not None:
+                    target["rmsd"] = source.get("residual_rmsd")
+                if source.get("residual_zncc") is not None:
+                    target["zncc"] = source.get("residual_zncc")
+
+            self._update_flexible_fit_metrics_preserving_pose(
+                final_pack,
+                after_score,
+            )
             self.flexible_fit_result = {
+                "fit_model": "rigid_domains",
                 "profile": str(selected_level),
-                "original_coords": base_coords,
+                "keep_domains_connected": bool(keep_domains_connected),
+                "max_rot_deg": float(cfg["max_rot_deg"]),
+                "max_trans_nm": float(max_trans_nm),
+                "max_stretch_nm": float(max_stretch_nm),
+                "original_coords": self._flexible_fit_result_original_coords(base_coords),
+                "fitted_coords": np.asarray(final_coords, dtype=float),
                 "domain_params": domain_params,
-                "before": before_pack,
-                "after": final_pack,
+                "before": comparison_before,
+                "after": comparison_after,
                 "domain_ids": np.array(domain_ids, copy=True),
                 "eval_count": int(eval_count),
+                "anchor_domain": int(anchor_domain),
             }
+            self._initialize_active_fit_structure_state()
             self.flexible_fit_report_text = self._format_flexible_fit_report(self.flexible_fit_result)
-            if hasattr(self, "save_flex_fit_btn"):
-                self.save_flex_fit_btn.setEnabled(True)
+            self._update_flexible_fit_action_buttons()
 
             self.display_molecule()
             self._simulate_xy_for_real_afm(
@@ -8570,21 +12203,30 @@ class pyNuD_simulator(QMainWindow):
             )
             self._update_domain_status_label()
 
-            before_rmsd = before_pack.get("rmsd")
-            after_rmsd = final_pack.get("rmsd")
+            before_rmsd = comparison_before.get("rmsd")
+            after_rmsd = comparison_after.get("rmsd")
             before_text = f"{before_rmsd:.3f} nm" if before_rmsd is not None else "-"
             after_text = f"{after_rmsd:.3f} nm" if after_rmsd is not None else "-"
+            connectivity_text = (
+                "keep connected"
+                if keep_domains_connected
+                else "allow separate"
+            )
             QMessageBox.information(
                 self,
                 "Flexible Fit",
                 f"Flexible fit complete.\n"
                 f"RMSD: {before_text} -> {after_text}\n"
-                f"Domains: {len(domains)}   Evaluations: {eval_count}\n"
+                f"Domains: {len(domains)} (anchor: {anchor_domain + 1})   "
+                f"Connectivity: {connectivity_text}\n"
+                f"Evaluations: {eval_count}\n"
                 f"Use Save Fit to export PDB and report."
             )
         except _FitCanceled:
             QMessageBox.information(self, "Flexible Fit", "Flexible fitting canceled. Structure was not changed.")
         finally:
+            if getattr(self, "_flex_fit_live_preview", None) is not None:
+                self._finish_flexible_fit_live_preview(restore=True)
             try:
                 progress.setValue(max(1, total_steps))
                 progress.close()
@@ -8592,13 +12234,2982 @@ class pyNuD_simulator(QMainWindow):
                 pass
             QApplication.restoreOverrideCursor()
 
+    def _extract_nma_fit_nodes(self, atom_selection):
+        """Return NMA nodes matching plugin-compatible atom selections."""
+        atom_selection = str(atom_selection)
+        if atom_selection == "calpha_p":
+            return self._extract_ca_domain_nodes()
+        base_coords = self._current_atom_coords_array()
+        if base_coords is None or base_coords.shape[0] == 0:
+            return None
+        n_atoms = base_coords.shape[0]
+        atom_names = np.asarray(
+            self.atoms_data.get("atom_name", [""] * n_atoms)
+        ).astype(str)
+        if atom_selection == "calpha":
+            node_indices = np.where(atom_names == "CA")[0]
+            if node_indices.size == 0:
+                return None
+            residue_keys = [
+                self._sequence_key_from_atom_arrays(int(index))
+                for index in node_indices
+            ]
+            key_to_node = {
+                key: node for node, key in enumerate(residue_keys)
+            }
+            atom_to_node = np.full(n_atoms, -1, dtype=int)
+            for atom_index in range(n_atoms):
+                atom_to_node[atom_index] = int(
+                    key_to_node.get(
+                        self._sequence_key_from_atom_arrays(atom_index),
+                        -1,
+                    )
+                )
+        else:
+            protein_residues = {
+                "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU",
+                "GLY", "HIS", "ILE", "LEU", "LYS", "MET", "PHE",
+                "PRO", "SER", "THR", "TRP", "TYR", "VAL", "ASX",
+                "GLX", "SEC", "PYL", "MSE",
+            }
+            residue_names = np.asarray(
+                self.atoms_data.get("residue_name", [""] * n_atoms)
+            ).astype(str)
+            protein_mask = np.array(
+                [
+                    name.strip().upper() in protein_residues
+                    for name in residue_names
+                ],
+                dtype=bool,
+            )
+            node_indices = np.where(protein_mask)[0]
+            if node_indices.size == 0:
+                return None
+            atom_to_node = np.full(n_atoms, -1, dtype=int)
+            atom_to_node[node_indices] = np.arange(
+                node_indices.size, dtype=int
+            )
+        return {
+            "coords": np.asarray(base_coords[node_indices], dtype=float),
+            "node_indices": np.asarray(node_indices, dtype=int),
+            "atom_to_node": atom_to_node,
+            "chain_ids": np.asarray(
+                self.atoms_data.get("chain_id", [" "] * n_atoms)
+            )[node_indices],
+            "residue_ids": np.asarray(
+                self.atoms_data.get("residue_id", np.arange(n_atoms))
+            )[node_indices],
+        }
+
+    def _get_nma_fit_settings(self):
+        """Show PDB-safe automatic or explicit ANM fit controls."""
+        defaults = {
+            "atom_selection": "calpha",
+            "cutoff_angstrom": 15.0,
+            "first_mode": 1,
+            "n_modes": 5,
+            "max_amplitude_nm": 0.35,
+            "max_total_rms_nm": 0.35,
+            "preview_max_px": 96,
+            "maxfev": 240,
+            "mode_energy_weight": 0.050,
+            "backbone_strain_weight": 0.150,
+            "clash_weight": 0.500,
+            "auto_estimate": True,
+        }
+        saved_settings = getattr(self, "nma_fit_settings", None) or {}
+        previous = dict(
+            defaults,
+            **saved_settings,
+        )
+        if not saved_settings:
+            atom_names = np.char.upper(
+                np.asarray(
+                    self.atoms_data.get("atom_name", [])
+                ).astype(str)
+            )
+            if np.any(atom_names == "P"):
+                previous["atom_selection"] = "calpha_p"
+            elif not np.any(atom_names == "CA"):
+                previous["atom_selection"] = "all"
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NMA Fit Settings")
+        dialog.setMinimumWidth(520)
+        outer = QVBoxLayout(dialog)
+        explanation = QLabel(
+            "Recommended: keep PDB-safe automatic settings enabled. "
+            "The molecular size and node spacing set the elastic-network "
+            "cutoff and conservative displacement limits. Candidates that "
+            "create a new severe atomic clash are rejected during fitting."
+        )
+        explanation.setWordWrap(True)
+        outer.addWidget(explanation)
+
+        auto_check = QCheckBox(
+            "Use PDB-safe automatic settings (recommended)",
+            dialog,
+        )
+        auto_check.setChecked(bool(previous.get("auto_estimate", True)))
+        outer.addWidget(auto_check)
+        auto_summary = QLabel(dialog)
+        auto_summary.setWordWrap(True)
+        auto_summary.setStyleSheet(
+            "padding: 6px; background: #eef5ff; border-radius: 4px;"
+        )
+        outer.addWidget(auto_summary)
+
+        advanced_check = QCheckBox("Show advanced/manual controls", dialog)
+        advanced_check.setChecked(not auto_check.isChecked())
+        outer.addWidget(advanced_check)
+
+        grid = QGridLayout()
+        outer.addLayout(grid)
+
+        atom_combo = QComboBox(dialog)
+        atom_combo.addItem("C-alpha (NMA plugin compatible)", "calpha")
+        atom_combo.addItem(
+            "C-alpha / P nodes (protein + nucleic acid)", "calpha_p"
+        )
+        atom_combo.addItem(
+            "All protein atoms (NMA plugin compatible, slow)", "all"
+        )
+        atom_index = atom_combo.findData(previous["atom_selection"])
+        atom_combo.setCurrentIndex(max(0, atom_index))
+
+        cutoff_spin = QDoubleSpinBox(dialog)
+        cutoff_spin.setRange(5.0, 30.0)
+        cutoff_spin.setDecimals(1)
+        cutoff_spin.setSingleStep(0.5)
+        cutoff_spin.setSuffix(" Å")
+        cutoff_spin.setValue(float(previous["cutoff_angstrom"]))
+        cutoff_spin.setToolTip(
+            "Distance used to connect nodes in the elastic network. "
+            "Automatic mode estimates it from local PDB node density."
+        )
+
+        first_mode_spin = QSpinBox(dialog)
+        first_mode_spin.setRange(1, 100)
+        first_mode_spin.setValue(int(previous["first_mode"]))
+        first_mode_spin.setToolTip(
+            "1 selects the lowest-frequency non-rigid mode."
+        )
+
+        mode_count_spin = QSpinBox(dialog)
+        mode_count_spin.setRange(1, 20)
+        mode_count_spin.setValue(int(previous["n_modes"]))
+        mode_count_spin.setToolTip(
+            "Number of low-frequency internal modes fitted together."
+        )
+
+        amplitude_spin = QDoubleSpinBox(dialog)
+        amplitude_spin.setRange(0.01, 3.0)
+        amplitude_spin.setDecimals(2)
+        amplitude_spin.setSingleStep(0.05)
+        amplitude_spin.setSuffix(" nm RMS")
+        amplitude_spin.setValue(float(previous["max_amplitude_nm"]))
+        amplitude_spin.setToolTip(
+            "Largest coefficient allowed for one 1-nm-RMS-normalized mode. "
+            "This is a search limit, not the expected displacement."
+        )
+
+        total_rms_spin = QDoubleSpinBox(dialog)
+        total_rms_spin.setRange(0.01, 5.0)
+        total_rms_spin.setDecimals(2)
+        total_rms_spin.setSingleStep(0.05)
+        total_rms_spin.setSuffix(" nm")
+        total_rms_spin.setValue(float(previous["max_total_rms_nm"]))
+        total_rms_spin.setToolTip(
+            "Hard limit on the combined RMS displacement from the input PDB."
+        )
+
+        preview_spin = QSpinBox(dialog)
+        preview_spin.setRange(32, 256)
+        preview_spin.setSingleStep(16)
+        preview_spin.setSuffix(" px")
+        preview_spin.setValue(int(previous["preview_max_px"]))
+
+        maxfev_spin = QSpinBox(dialog)
+        maxfev_spin.setRange(20, 3000)
+        maxfev_spin.setSingleStep(20)
+        maxfev_spin.setValue(int(previous["maxfev"]))
+
+        energy_spin = QDoubleSpinBox(dialog)
+        energy_spin.setRange(0.0, 1.0)
+        energy_spin.setDecimals(3)
+        energy_spin.setSingleStep(0.005)
+        energy_spin.setValue(float(previous["mode_energy_weight"]))
+        energy_spin.setToolTip(
+            "Discourages large amplitudes, especially for stiffer modes."
+        )
+
+        strain_spin = QDoubleSpinBox(dialog)
+        strain_spin.setRange(0.0, 1.0)
+        strain_spin.setDecimals(3)
+        strain_spin.setSingleStep(0.005)
+        strain_spin.setValue(float(previous["backbone_strain_weight"]))
+        strain_spin.setToolTip(
+            "Discourages changes in sequential backbone-node distances."
+        )
+
+        clash_spin = QDoubleSpinBox(dialog)
+        clash_spin.setRange(0.0, 1.0)
+        clash_spin.setDecimals(3)
+        clash_spin.setSingleStep(0.01)
+        clash_spin.setValue(float(previous["clash_weight"]))
+        clash_spin.setToolTip(
+            "Adds a soft penalty for close NMA nodes. New severe heavy-atom "
+            "clashes are rejected separately regardless of this value."
+        )
+
+        rows = [
+            ("Atom Selection:", atom_combo),
+            ("Cutoff Distance:", cutoff_spin),
+            ("First Fitted Mode:", first_mode_spin),
+            ("Number of Fitted Modes:", mode_count_spin),
+            ("Max Amplitude / Mode:", amplitude_spin),
+            ("Max Total RMS Displacement:", total_rms_spin),
+            ("Preview Resolution (max):", preview_spin),
+            ("Maximum Evaluations:", maxfev_spin),
+            ("Mode Energy Penalty:", energy_spin),
+            ("Backbone Strain Penalty:", strain_spin),
+            ("Steric Clash Penalty:", clash_spin),
+        ]
+        advanced_row_widgets = []
+        for row, (label_text, widget) in enumerate(rows):
+            label = QLabel(label_text, dialog)
+            grid.addWidget(label, row, 0)
+            grid.addWidget(widget, row, 1)
+            if row > 0:
+                advanced_row_widgets.append((label, widget))
+
+        automatic_widgets = [
+            cutoff_spin,
+            first_mode_spin,
+            mode_count_spin,
+            amplitude_spin,
+            total_rms_spin,
+            preview_spin,
+            maxfev_spin,
+            energy_spin,
+            strain_spin,
+            clash_spin,
+        ]
+
+        def apply_pdb_estimate():
+            nodes = self._extract_nma_fit_nodes(
+                str(atom_combo.currentData())
+            )
+            if nodes is None or nodes["coords"].shape[0] < 4:
+                auto_summary.setText(
+                    "Automatic estimation is unavailable for this atom "
+                    "selection. Choose another selection or enter values "
+                    "manually."
+                )
+                auto_summary.setStyleSheet(
+                    "padding: 6px; background: #fff0f0; border-radius: 4px;"
+                )
+                return False
+            try:
+                image_shape = (
+                    np.asarray(self.real_afm_nm).shape
+                    if self.real_afm_nm is not None else None
+                )
+                estimate = estimate_nma_fit_parameters(
+                    nodes["coords"],
+                    str(atom_combo.currentData()),
+                    image_shape=image_shape,
+                )
+            except Exception as error:
+                auto_summary.setText(
+                    f"Automatic estimation failed: {error}"
+                )
+                auto_summary.setStyleSheet(
+                    "padding: 6px; background: #fff0f0; border-radius: 4px;"
+                )
+                return False
+
+            cutoff_spin.setValue(float(estimate["cutoff_angstrom"]))
+            first_mode_spin.setValue(int(estimate["first_mode"]))
+            mode_count_spin.setValue(int(estimate["n_modes"]))
+            amplitude_spin.setValue(float(estimate["max_amplitude_nm"]))
+            total_rms_spin.setValue(float(estimate["max_total_rms_nm"]))
+            preview_spin.setValue(int(estimate["preview_max_px"]))
+            maxfev_spin.setValue(int(estimate["maxfev"]))
+            energy_spin.setValue(float(estimate["mode_energy_weight"]))
+            strain_spin.setValue(
+                float(estimate["backbone_strain_weight"])
+            )
+            clash_spin.setValue(float(estimate["clash_weight"]))
+            auto_summary.setStyleSheet(
+                "padding: 6px; background: #eef5ff; border-radius: 4px;"
+            )
+            auto_summary.setText(
+                f"PDB estimate: {int(estimate['node_count'])} nodes, "
+                f"molecular span {float(estimate['extent_nm']):.2f} nm. "
+                f"Cutoff {float(estimate['cutoff_angstrom']):.1f} Å; "
+                f"per-mode / total RMS limits "
+                f"{float(estimate['max_amplitude_nm']):.2f} / "
+                f"{float(estimate['max_total_rms_nm']):.2f} nm. "
+                "The final per-mode limit is tightened again after the "
+                "actual normal modes are calculated."
+            )
+            return True
+
+        def update_automatic_mode(checked):
+            checked = bool(checked)
+            for widget in automatic_widgets:
+                widget.setEnabled(not checked)
+            if checked:
+                apply_pdb_estimate()
+            else:
+                advanced_check.setChecked(True)
+
+        def update_advanced_visibility(visible):
+            for label, widget in advanced_row_widgets:
+                label.setVisible(bool(visible))
+                widget.setVisible(bool(visible))
+            dialog.adjustSize()
+
+        auto_check.toggled.connect(update_automatic_mode)
+        atom_combo.currentIndexChanged.connect(
+            lambda _index: apply_pdb_estimate()
+            if auto_check.isChecked() else None
+        )
+        advanced_check.toggled.connect(update_advanced_visibility)
+        update_automatic_mode(auto_check.isChecked())
+        update_advanced_visibility(advanced_check.isChecked())
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        outer.addWidget(buttons)
+        if dialog.exec_() != QDialog.Accepted:
+            return None
+
+        settings = {
+            "atom_selection": str(atom_combo.currentData()),
+            "cutoff_angstrom": float(cutoff_spin.value()),
+            "first_mode": int(first_mode_spin.value()),
+            "n_modes": int(mode_count_spin.value()),
+            "max_amplitude_nm": float(amplitude_spin.value()),
+            "max_total_rms_nm": float(total_rms_spin.value()),
+            "preview_max_px": int(preview_spin.value()),
+            "maxfev": int(maxfev_spin.value()),
+            "mode_energy_weight": float(energy_spin.value()),
+            "backbone_strain_weight": float(strain_spin.value()),
+            "clash_weight": float(clash_spin.value()),
+            "auto_estimate": bool(auto_check.isChecked()),
+        }
+        settings["maxiter"] = max(10, int(settings["maxfev"] // 12))
+        settings["xtol"] = 0.025
+        settings["ftol"] = 5e-4
+        settings["profile"] = (
+            "PDB-safe auto" if settings["auto_estimate"] else "Custom"
+        )
+        self.nma_fit_settings = dict(settings)
+        return settings
+
+    def run_nma_flexible_fit(self):
+        """Fit low-frequency ANM amplitudes to Real AFM with global pose fixed."""
+        if self.real_afm_nm is None:
+            QMessageBox.information(self, "NMA Flexible Fit", "Real AFM is not loaded.")
+            return
+        if getattr(self, "atoms_data", None) is None:
+            QMessageBox.warning(
+                self, "NMA Flexible Fit", "PDB/CIF structure is not loaded."
+            )
+            return
+        if (
+            self.is_worker_running(
+                getattr(self, "sim_worker", None), attr_name="sim_worker"
+            )
+            or self.is_worker_running(
+                getattr(self, "sim_worker_high_res", None),
+                attr_name="sim_worker_high_res",
+            )
+        ):
+            QMessageBox.information(
+                self, "NMA Flexible Fit",
+                "Another simulation is running. Please wait.",
+            )
+            return
+        if self.is_worker_running(
+            getattr(self, "sim_worker_silent", None),
+            attr_name="sim_worker_silent",
+        ):
+            self.stop_worker(
+                self.sim_worker_silent,
+                timeout_ms=300,
+                allow_terminate=True,
+                worker_name="sim_worker_silent",
+            )
+            if self.is_worker_running(
+                getattr(self, "sim_worker_silent", None),
+                attr_name="sim_worker_silent",
+            ):
+                QMessageBox.information(
+                    self, "NMA Flexible Fit",
+                    "Another simulation is running. Please wait.",
+                )
+                return
+
+        cfg = self._get_nma_fit_settings()
+        if cfg is None:
+            return
+        selected_level = str(cfg.get("profile", "Custom"))
+        nodes = self._extract_nma_fit_nodes(cfg["atom_selection"])
+        if nodes is None or nodes["coords"].shape[0] < 4:
+            QMessageBox.warning(
+                self,
+                "NMA Flexible Fit",
+                "At least four selected NMA atoms are required.",
+            )
+            return
+
+        meta = self._get_real_afm_simulation_meta()
+        if meta is None:
+            QMessageBox.warning(
+                self, "NMA Flexible Fit", "Real AFM metadata is incomplete."
+            )
+            return
+        scan_x_nm, scan_y_nm, nx, ny = meta
+        fit_scale = min(
+            1.0,
+            float(cfg["preview_max_px"]) / max(float(nx), float(ny)),
+        )
+        fit_nx = min(int(nx), max(24, int(round(float(nx) * fit_scale))))
+        fit_ny = min(int(ny), max(24, int(round(float(ny) * fit_scale))))
+        if fit_nx != int(nx) or fit_ny != int(ny):
+            fit_real = scipy.ndimage.zoom(
+                np.asarray(self.real_afm_nm, dtype=np.float64),
+                (fit_ny / float(ny), fit_nx / float(nx)),
+                order=1,
+            )
+        else:
+            fit_real = self.real_afm_nm
+        fit_meta = (scan_x_nm, scan_y_nm, fit_nx, fit_ny)
+
+        base_coords = self._current_atom_coords_array()
+        if base_coords is None:
+            return
+        requested_positive_modes = (
+            int(cfg["first_mode"]) - 1 + int(cfg["n_modes"])
+        )
+        requested_modes = requested_positive_modes + 12
+        cutoff_nm = float(cfg["cutoff_angstrom"]) / 10.0
+        try:
+            eigvals, eigvecs, nma_method = _anm_modes_with_prody(
+                nodes["coords"], cutoff_nm, requested_modes
+            )
+        except Exception as prody_error:
+            try:
+                eigvals, eigvecs, nma_method = _anm_modes_numpy(
+                    nodes["coords"], cutoff_nm, requested_modes
+                )
+            except Exception as numpy_error:
+                QMessageBox.critical(
+                    self,
+                    "NMA Flexible Fit",
+                    "Normal-mode calculation failed.\n\n"
+                    f"ProDy: {prody_error}\nNumPy: {numpy_error}",
+                )
+                return
+
+        mode_basis, mode_eigenvalues, mode_indices = prepare_nma_atom_mode_basis(
+            eigvals,
+            eigvecs,
+            len(nodes["coords"]),
+            nodes["atom_to_node"],
+            requested_positive_modes,
+        )
+        first_mode_offset = int(cfg["first_mode"]) - 1
+        last_mode_offset = first_mode_offset + int(cfg["n_modes"])
+        mode_basis = mode_basis[first_mode_offset:last_mode_offset]
+        mode_eigenvalues = mode_eigenvalues[
+            first_mode_offset:last_mode_offset
+        ]
+        mode_indices = mode_indices[first_mode_offset:last_mode_offset]
+        if mode_basis.shape[0] == 0:
+            QMessageBox.warning(
+                self, "NMA Flexible Fit",
+                "No positive non-rigid modes were available in the selected "
+                "mode range.",
+            )
+            return
+
+        before_full_pack = self.simulate_and_score(
+            self._apply_current_rotation_to_coords(base_coords),
+            self.real_afm_nm,
+            meta=meta,
+        )
+        before_pack = self.simulate_and_score(
+            self._apply_current_rotation_to_coords(base_coords),
+            fit_real,
+            meta=fit_meta,
+        )
+        if (
+            before_pack is None
+            or before_pack.get("rmsd") is None
+            or before_full_pack is None
+            or before_full_pack.get("rmsd") is None
+        ):
+            QMessageBox.warning(
+                self, "NMA Flexible Fit", "Initial simulation/scoring failed."
+            )
+            return
+
+        node_indices = np.asarray(nodes["node_indices"], dtype=int)
+        chains = np.asarray(nodes.get("chain_ids", [" "] * len(node_indices)))
+        residue_ids = np.asarray(
+            nodes.get("residue_ids", np.arange(len(node_indices)))
+        )
+        edge_i = []
+        edge_j = []
+        edge_lengths = []
+        if cfg["atom_selection"] == "all":
+            for left, right in cKDTree(
+                np.asarray(nodes["coords"], dtype=float)
+            ).query_pairs(0.22):
+                distance = float(
+                    np.linalg.norm(
+                        nodes["coords"][right] - nodes["coords"][left]
+                    )
+                )
+                if 0.08 < distance < 0.22:
+                    edge_i.append(int(left))
+                    edge_j.append(int(right))
+                    edge_lengths.append(distance)
+        else:
+            for index in range(len(node_indices) - 1):
+                if (
+                    str(chains[index]).strip()
+                    != str(chains[index + 1]).strip()
+                ):
+                    continue
+                try:
+                    if (
+                        int(residue_ids[index + 1])
+                        - int(residue_ids[index])
+                        != 1
+                    ):
+                        continue
+                except (TypeError, ValueError):
+                    pass
+                distance = float(
+                    np.linalg.norm(
+                        nodes["coords"][index + 1]
+                        - nodes["coords"][index]
+                    )
+                )
+                if 0.1 < distance < 0.75:
+                    edge_i.append(index)
+                    edge_j.append(index + 1)
+                    edge_lengths.append(distance)
+        edge_i = np.asarray(edge_i, dtype=int)
+        edge_j = np.asarray(edge_j, dtype=int)
+        edge_lengths = np.asarray(edge_lengths, dtype=float)
+
+        minimum_eigenvalue = max(float(np.min(mode_eigenvalues)), 1e-12)
+        mode_energy_weights = np.clip(
+            mode_eigenvalues / minimum_eigenvalue, 1.0, 10.0
+        )
+        elements = np.asarray(
+            self.atoms_data.get(
+                "element", ["C"] * base_coords.shape[0]
+            )
+        )
+        heavy_indices = heavy_atom_indices(
+            elements,
+            base_coords.shape[0],
+        )
+        if bool(cfg.get("auto_estimate", False)):
+            requested_amplitude = float(cfg["max_amplitude_nm"])
+            safe_amplitude = estimate_clash_safe_nma_amplitude(
+                base_coords,
+                mode_basis,
+                heavy_indices,
+                requested_amplitude,
+            )
+            cfg["pdb_estimated_max_amplitude_nm"] = requested_amplitude
+            cfg["max_amplitude_nm"] = min(
+                requested_amplitude,
+                safe_amplitude,
+            )
+            cfg["max_total_rms_nm"] = min(
+                float(cfg["max_total_rms_nm"]),
+                float(cfg["max_amplitude_nm"]),
+            )
+            cfg["mode_specific_safety_clamped"] = bool(
+                float(cfg["max_amplitude_nm"])
+                < requested_amplitude - 1e-8
+            )
+            self.nma_fit_settings = dict(cfg)
+        max_amplitude = float(cfg["max_amplitude_nm"])
+        max_total_rms = float(cfg["max_total_rms_nm"])
+        mapped_atoms = np.asarray(nodes["atom_to_node"], dtype=int) >= 0
+
+        class _NMAFitCanceled(Exception):
+            pass
+
+        progress = QProgressDialog(
+            "Fitting normal-mode amplitudes...",
+            "Cancel",
+            0,
+            int(cfg["maxfev"]),
+            self,
+        )
+        progress.setWindowTitle("NMA Flexible Fit")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+
+        eval_count = 0
+        best_value = float("inf")
+        best_coefficients = np.zeros(mode_basis.shape[0], dtype=float)
+        best_pack = dict(before_pack)
+        evaluation_cache = {}
+
+        def deformed_coords(coefficients):
+            displacement = np.tensordot(
+                np.asarray(coefficients, dtype=float),
+                mode_basis,
+                axes=(0, 0),
+            )
+            return base_coords + displacement, displacement
+
+        def objective(coefficients):
+            nonlocal eval_count, best_value, best_coefficients, best_pack
+            if progress.wasCanceled():
+                raise _NMAFitCanceled()
+            coefficients = np.asarray(coefficients, dtype=float)
+            key = tuple(np.round(coefficients, 5))
+            if key in evaluation_cache:
+                return evaluation_cache[key]
+            severe_clash = False
+            try:
+                local_coords, displacement = deformed_coords(coefficients)
+                severe_clash = introduces_severe_atomic_clash(
+                    base_coords,
+                    local_coords,
+                    heavy_indices,
+                )
+                if severe_clash:
+                    pack = None
+                else:
+                    rotated_coords = self._apply_current_rotation_to_coords(
+                        local_coords
+                    )
+                    pack = self.simulate_and_score(
+                        rotated_coords, fit_real, meta=fit_meta
+                    )
+            except Exception:
+                pack = None
+                displacement = None
+                local_coords = None
+            eval_count += 1
+            if pack is None or pack.get("rmsd") is None:
+                value = 1e7 if severe_clash else 1e6
+            else:
+                energy_penalty = float(
+                    np.mean(
+                        mode_energy_weights
+                        * (coefficients / max(max_amplitude, 1e-8)) ** 2
+                    )
+                )
+                if displacement is not None and np.any(mapped_atoms):
+                    total_rms = float(
+                        np.sqrt(
+                            np.mean(
+                                np.sum(
+                                    displacement[mapped_atoms] ** 2,
+                                    axis=1,
+                                )
+                            )
+                        )
+                    )
+                else:
+                    total_rms = 0.0
+                excess = max(
+                    0.0,
+                    total_rms / max(max_total_rms, 1e-8) - 1.0,
+                )
+                is_feasible = total_rms <= max_total_rms + 1e-8
+                strain_penalty = 0.0
+                clash_penalty = 0.0
+                if edge_i.size and local_coords is not None:
+                    node_coords = local_coords[node_indices]
+                    new_lengths = np.linalg.norm(
+                        node_coords[edge_j] - node_coords[edge_i],
+                        axis=1,
+                    )
+                    strain_penalty = float(
+                        np.mean(
+                            np.minimum(
+                                ((new_lengths - edge_lengths) / 0.05) ** 2,
+                                100.0,
+                            )
+                        )
+                    )
+                if local_coords is not None:
+                    node_coords = local_coords[node_indices]
+                    new_clashes = []
+                    for left, right in cKDTree(node_coords).query_pairs(0.32):
+                        base_distance = float(
+                            np.linalg.norm(
+                                nodes["coords"][right]
+                                - nodes["coords"][left]
+                            )
+                        )
+                        if base_distance <= 0.35:
+                            continue
+                        distance = float(
+                            np.linalg.norm(
+                                node_coords[right] - node_coords[left]
+                            )
+                        )
+                        new_clashes.append(
+                            ((0.32 - distance) / 0.32) ** 2
+                        )
+                    if new_clashes:
+                        clash_penalty = float(np.mean(new_clashes))
+                value = (
+                    -float(pack.get("pose_score", -1e9))
+                    + float(cfg["mode_energy_weight"]) * energy_penalty
+                    + float(cfg["backbone_strain_weight"])
+                    * strain_penalty
+                    + float(cfg["clash_weight"]) * clash_penalty
+                    + (1000.0 + 100.0 * excess)
+                    * (not is_feasible)
+                )
+                if is_feasible and value < best_value:
+                    best_value = float(value)
+                    best_coefficients = np.array(
+                        coefficients, dtype=float, copy=True
+                    )
+                    best_pack = dict(pack)
+                    self._preview_flexible_fit_candidate(
+                        local_coords,
+                        pack.get("sim_img"),
+                        note=(
+                            f"score {float(pack.get('pose_score', -1e9)):.4f}"
+                        ),
+                    )
+            if eval_count % 4 == 0:
+                rmsd_text = (
+                    f"{best_pack['rmsd']:.3f} nm"
+                    if best_pack.get("rmsd") is not None else "-"
+                )
+                progress.setValue(min(eval_count, int(cfg["maxfev"])))
+                progress.setLabelText(
+                    f"NMA fitting ({selected_level}, {mode_basis.shape[0]} modes)\n"
+                    f"Best RMSD: {rmsd_text}    Evaluations: {eval_count}"
+                    + self._flexible_fit_live_preview_label_suffix()
+                )
+                QApplication.processEvents()
+            evaluation_cache[key] = float(value)
+            return float(value)
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self._begin_flexible_fit_live_preview(base_coords)
+        try:
+            bounds = [(-max_amplitude, max_amplitude)] * mode_basis.shape[0]
+            minimize(
+                objective,
+                np.zeros(mode_basis.shape[0], dtype=float),
+                method="Powell",
+                bounds=bounds,
+                options={
+                    "maxiter": int(cfg["maxiter"]),
+                    "maxfev": int(cfg["maxfev"]),
+                    "xtol": float(cfg["xtol"]),
+                    "ftol": float(cfg["ftol"]),
+                    "disp": False,
+                },
+            )
+            final_coords, final_displacement = deformed_coords(
+                best_coefficients
+            )
+            fitted_rms = float(
+                np.sqrt(
+                    np.mean(
+                        np.sum(
+                            final_displacement[mapped_atoms] ** 2,
+                            axis=1,
+                        )
+                    )
+                )
+            ) if np.any(mapped_atoms) else 0.0
+            if fitted_rms > max_total_rms + 1e-8:
+                QMessageBox.warning(
+                    self,
+                    "NMA Flexible Fit",
+                    "The best candidate exceeded the configured RMS "
+                    "displacement limit. Structure was not changed.",
+                )
+                return
+
+            if introduces_severe_atomic_clash(
+                base_coords,
+                final_coords,
+                heavy_indices,
+            ):
+                QMessageBox.warning(
+                    self,
+                    "NMA Flexible Fit",
+                    "The best candidate introduced a severe atomic "
+                    "clash. Structure was not changed.",
+                )
+                return
+            final_rotated = self._apply_current_rotation_to_coords(final_coords)
+            final_pack = self.simulate_and_score(
+                final_rotated, self.real_afm_nm, meta=meta
+            )
+            if final_pack is None or final_pack.get("rmsd") is None:
+                QMessageBox.warning(
+                    self,
+                    "NMA Flexible Fit",
+                    "Final simulation/scoring failed. Structure was not changed.",
+                )
+                return
+
+            before_score = float(before_full_pack.get("pose_score", -1e9))
+            after_score = float(final_pack.get("pose_score", -1e9))
+            before_residual_rmsd = before_full_pack.get("residual_rmsd")
+            after_residual_rmsd = final_pack.get("residual_rmsd")
+            rmsd_not_worse = (
+                before_residual_rmsd is not None
+                and after_residual_rmsd is not None
+                and float(after_residual_rmsd)
+                <= float(before_residual_rmsd) + 1e-4
+            )
+            if (
+                not np.isfinite(after_score)
+                or after_score <= before_score + 1e-4
+                or not rmsd_not_worse
+            ):
+                QMessageBox.information(
+                    self,
+                    "NMA Flexible Fit",
+                    "No reliable NMA fit improvement was found. "
+                    "The structure was not changed.\n\n"
+                    f"Pose score: {before_score:.4f} -> {after_score:.4f}\n"
+                    f"Aligned RMSD: {before_residual_rmsd} -> "
+                    f"{after_residual_rmsd} nm",
+                )
+                return
+
+            comparison_before = dict(before_full_pack)
+            comparison_after = dict(final_pack)
+            for target, source in (
+                (comparison_before, before_full_pack),
+                (comparison_after, final_pack),
+            ):
+                if source.get("residual_rmsd") is not None:
+                    target["rmsd"] = source.get("residual_rmsd")
+                if source.get("residual_zncc") is not None:
+                    target["zncc"] = source.get("residual_zncc")
+
+            self._finish_flexible_fit_live_preview(restore=False)
+            self._set_atom_coords_array(
+                final_coords,
+                mark_edited=True,
+                preserve_domains=False,
+            )
+            self._update_flexible_fit_metrics_preserving_pose(
+                final_pack,
+                after_score,
+            )
+            self.flexible_fit_result = {
+                "fit_model": "nma",
+                "profile": str(selected_level),
+                "settings": dict(cfg),
+                "original_coords": self._flexible_fit_result_original_coords(base_coords),
+                "fitted_coords": np.asarray(final_coords, dtype=float),
+                "before": comparison_before,
+                "after": comparison_after,
+                "eval_count": int(eval_count),
+                "nma_method": str(nma_method),
+                "mode_indices": np.asarray(mode_indices, dtype=int),
+                "fitted_mode_numbers": np.arange(
+                    int(cfg["first_mode"]),
+                    int(cfg["first_mode"]) + len(best_coefficients),
+                    dtype=int,
+                ),
+                "mode_eigenvalues": np.asarray(
+                    mode_eigenvalues, dtype=float
+                ),
+                "mode_amplitudes_nm": np.asarray(
+                    best_coefficients, dtype=float
+                ),
+                "fitted_rms_displacement_nm": fitted_rms,
+                "max_total_rms_nm": max_total_rms,
+            }
+            self._initialize_active_fit_structure_state()
+            self.flexible_fit_report_text = self._format_flexible_fit_report(
+                self.flexible_fit_result
+            )
+            self._update_flexible_fit_action_buttons()
+            self.display_molecule()
+            self._simulate_xy_for_real_afm(
+                update_panels=True,
+                store_results=True,
+                check_busy=False,
+                show_messages=False,
+            )
+            before_text = (
+                f"{comparison_before['rmsd']:.3f} nm"
+                if comparison_before.get("rmsd") is not None else "-"
+            )
+            after_text = (
+                f"{comparison_after['rmsd']:.3f} nm"
+                if comparison_after.get("rmsd") is not None else "-"
+            )
+            QMessageBox.information(
+                self,
+                "NMA Flexible Fit",
+                "NMA flexible fit complete.\n"
+                f"RMSD: {before_text} -> {after_text}\n"
+                f"Modes: {mode_basis.shape[0]}   "
+                f"RMS displacement: {fitted_rms:.3f} nm   "
+                f"Evaluations: {eval_count}\n"
+                "Use Save Fit to export PDB and report.",
+            )
+        except _NMAFitCanceled:
+            QMessageBox.information(
+                self,
+                "NMA Flexible Fit",
+                "NMA fitting canceled. Structure was not changed.",
+            )
+        finally:
+            if getattr(self, "_flex_fit_live_preview", None) is not None:
+                self._finish_flexible_fit_live_preview(restore=True)
+            progress.setValue(min(eval_count, int(cfg["maxfev"])))
+            progress.close()
+            QApplication.restoreOverrideCursor()
+
+    def _get_nmff_fit_settings(self):
+        """Show controls for the built-in iterative NMFF-AFM implementation."""
+        defaults = {
+            "atom_selection": "calpha",
+            "cutoff_angstrom": 8.0,
+            "first_mode": 1,
+            "n_modes": 15,
+            "step_amplitude_nm": 0.05,
+            "max_iterations": 70,
+            "max_total_rms_nm": 1.5,
+            "minimum_cc_gain": 0.0001,
+            "convergence_fraction": 0.03,
+            "convergence_patience": 3,
+            "preview_max_px": 96,
+        }
+        previous = dict(
+            defaults,
+            **(getattr(self, "nmff_fit_settings", None) or {}),
+        )
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Iterative NMFF-AFM Settings")
+        dialog.setMinimumWidth(540)
+        outer = QVBoxLayout(dialog)
+        explanation = QLabel(
+            "This independent built-in implementation follows the published "
+            "NMFF-AFM iteration: recalculate ANM modes, score -Q, -Q/2, 0, "
+            "+Q/2, and +Q for every mode, then apply the mode with the largest "
+            "Pearson-correlation slope. Global pose remains fixed after "
+            "Estimate Pose."
+        )
+        explanation.setWordWrap(True)
+        outer.addWidget(explanation)
+        grid = QGridLayout()
+        outer.addLayout(grid)
+
+        atom_combo = QComboBox(dialog)
+        atom_combo.addItem("C-alpha", "calpha")
+        atom_combo.addItem("C-alpha / P nodes", "calpha_p")
+        atom_combo.addItem("All protein atoms (slow)", "all")
+        atom_index = atom_combo.findData(previous["atom_selection"])
+        atom_combo.setCurrentIndex(max(0, atom_index))
+
+        cutoff_spin = QDoubleSpinBox(dialog)
+        cutoff_spin.setRange(5.0, 30.0)
+        cutoff_spin.setDecimals(1)
+        cutoff_spin.setSingleStep(0.5)
+        cutoff_spin.setSuffix(" Å")
+        cutoff_spin.setValue(float(previous["cutoff_angstrom"]))
+
+        first_mode_spin = QSpinBox(dialog)
+        first_mode_spin.setRange(1, 100)
+        first_mode_spin.setValue(int(previous["first_mode"]))
+        first_mode_spin.setToolTip(
+            "1 is the lowest-frequency non-rigid mode. Estimate Pose handles "
+            "the six rigid-body modes separately."
+        )
+
+        mode_count_spin = QSpinBox(dialog)
+        mode_count_spin.setRange(1, 30)
+        mode_count_spin.setValue(int(previous["n_modes"]))
+
+        amplitude_spin = QDoubleSpinBox(dialog)
+        amplitude_spin.setRange(0.005, 0.5)
+        amplitude_spin.setDecimals(3)
+        amplitude_spin.setSingleStep(0.01)
+        amplitude_spin.setSuffix(" nm RMS")
+        amplitude_spin.setValue(float(previous["step_amplitude_nm"]))
+
+        iteration_spin = QSpinBox(dialog)
+        iteration_spin.setRange(1, 500)
+        iteration_spin.setSingleStep(10)
+        iteration_spin.setValue(int(previous["max_iterations"]))
+
+        total_rms_spin = QDoubleSpinBox(dialog)
+        total_rms_spin.setRange(0.05, 10.0)
+        total_rms_spin.setDecimals(2)
+        total_rms_spin.setSingleStep(0.1)
+        total_rms_spin.setSuffix(" nm")
+        total_rms_spin.setValue(float(previous["max_total_rms_nm"]))
+
+        gain_spin = QDoubleSpinBox(dialog)
+        gain_spin.setRange(0.000001, 0.1)
+        gain_spin.setDecimals(6)
+        gain_spin.setSingleStep(0.0001)
+        gain_spin.setValue(float(previous["minimum_cc_gain"]))
+
+        fraction_spin = QDoubleSpinBox(dialog)
+        fraction_spin.setRange(0.001, 0.5)
+        fraction_spin.setDecimals(3)
+        fraction_spin.setSingleStep(0.01)
+        fraction_spin.setValue(float(previous["convergence_fraction"]))
+
+        patience_spin = QSpinBox(dialog)
+        patience_spin.setRange(1, 20)
+        patience_spin.setValue(int(previous["convergence_patience"]))
+
+        preview_spin = QSpinBox(dialog)
+        preview_spin.setRange(32, 256)
+        preview_spin.setSingleStep(16)
+        preview_spin.setSuffix(" px")
+        preview_spin.setValue(int(previous["preview_max_px"]))
+
+        rows = [
+            ("Atom Selection:", atom_combo),
+            ("Elastic-network Cutoff:", cutoff_spin),
+            ("First Non-rigid Mode:", first_mode_spin),
+            ("Number of Modes:", mode_count_spin),
+            ("Step Amplitude Q:", amplitude_spin),
+            ("Maximum Iterations:", iteration_spin),
+            ("Max Total RMS Displacement:", total_rms_spin),
+            ("Minimum CC Gain:", gain_spin),
+            ("Decay Threshold Fraction:", fraction_spin),
+            ("Convergence Patience:", patience_spin),
+            ("Preview Resolution (max):", preview_spin),
+        ]
+        for row, (label_text, widget) in enumerate(rows):
+            grid.addWidget(QLabel(label_text, dialog), row, 0)
+            grid.addWidget(widget, row, 1)
+
+        note = QLabel(
+            "The published method uses RTB normal modes and includes rigid-body "
+            "modes. pyNuD uses its built-in ANM and keeps the previously "
+            "estimated global pose fixed, so this is an independent compatible "
+            "implementation rather than the official BioAFMviewer code."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #666;")
+        outer.addWidget(note)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        outer.addWidget(buttons)
+        if dialog.exec_() != QDialog.Accepted:
+            return None
+
+        settings = {
+            "atom_selection": str(atom_combo.currentData()),
+            "cutoff_angstrom": float(cutoff_spin.value()),
+            "first_mode": int(first_mode_spin.value()),
+            "n_modes": int(mode_count_spin.value()),
+            "step_amplitude_nm": float(amplitude_spin.value()),
+            "max_iterations": int(iteration_spin.value()),
+            "max_total_rms_nm": float(total_rms_spin.value()),
+            "minimum_cc_gain": float(gain_spin.value()),
+            "convergence_fraction": float(fraction_spin.value()),
+            "convergence_patience": int(patience_spin.value()),
+            "preview_max_px": int(preview_spin.value()),
+        }
+        self.nmff_fit_settings = dict(settings)
+        return settings
+
+    def run_nmff_flexible_fit(self):
+        """Run iterative normal-mode flexible fitting against the Real AFM."""
+        title = "Iterative NMFF-AFM"
+        if self.real_afm_nm is None:
+            QMessageBox.information(self, title, "Real AFM is not loaded.")
+            return
+        if getattr(self, "atoms_data", None) is None:
+            QMessageBox.warning(self, title, "PDB/CIF structure is not loaded.")
+            return
+        if (
+            self.is_worker_running(
+                getattr(self, "sim_worker", None), attr_name="sim_worker"
+            )
+            or self.is_worker_running(
+                getattr(self, "sim_worker_high_res", None),
+                attr_name="sim_worker_high_res",
+            )
+        ):
+            QMessageBox.information(
+                self, title, "Another simulation is running. Please wait."
+            )
+            return
+        if self.is_worker_running(
+            getattr(self, "sim_worker_silent", None),
+            attr_name="sim_worker_silent",
+        ):
+            self.stop_worker(
+                self.sim_worker_silent,
+                timeout_ms=300,
+                allow_terminate=True,
+                worker_name="sim_worker_silent",
+            )
+            if self.is_worker_running(
+                getattr(self, "sim_worker_silent", None),
+                attr_name="sim_worker_silent",
+            ):
+                QMessageBox.information(
+                    self, title, "Another simulation is running. Please wait."
+                )
+                return
+
+        cfg = self._get_nmff_fit_settings()
+        if cfg is None:
+            return
+        nodes = self._extract_nma_fit_nodes(cfg["atom_selection"])
+        if nodes is None or nodes["coords"].shape[0] < 4:
+            QMessageBox.warning(
+                self, title, "At least four selected NMA atoms are required."
+            )
+            return
+        meta = self._get_real_afm_simulation_meta()
+        if meta is None:
+            QMessageBox.warning(
+                self, title, "Real AFM metadata is incomplete."
+            )
+            return
+
+        scan_x_nm, scan_y_nm, nx, ny = meta
+        fit_scale = min(
+            1.0,
+            float(cfg["preview_max_px"]) / max(float(nx), float(ny)),
+        )
+        fit_nx = min(int(nx), max(24, int(round(float(nx) * fit_scale))))
+        fit_ny = min(int(ny), max(24, int(round(float(ny) * fit_scale))))
+        if fit_nx != int(nx) or fit_ny != int(ny):
+            fit_real = scipy.ndimage.zoom(
+                np.asarray(self.real_afm_nm, dtype=np.float64),
+                (fit_ny / float(ny), fit_nx / float(nx)),
+                order=1,
+            )
+        else:
+            fit_real = self.real_afm_nm
+        fit_meta = (scan_x_nm, scan_y_nm, fit_nx, fit_ny)
+
+        base_coords = self._current_atom_coords_array()
+        if base_coords is None or base_coords.shape[0] < 4:
+            QMessageBox.warning(self, title, "The loaded structure is incomplete.")
+            return
+        before_full_pack = self.simulate_and_score(
+            self._apply_current_rotation_to_coords(base_coords),
+            self.real_afm_nm,
+            meta=meta,
+        )
+        before_pack = self.simulate_and_score(
+            self._apply_current_rotation_to_coords(base_coords),
+            fit_real,
+            meta=fit_meta,
+        )
+        if (
+            before_pack is None
+            or before_pack.get("zncc") is None
+            or before_full_pack is None
+            or before_full_pack.get("zncc") is None
+        ):
+            QMessageBox.warning(
+                self, title, "Initial simulation/scoring failed."
+            )
+            return
+
+        node_indices = np.asarray(nodes["node_indices"], dtype=int)
+        requested_positive_modes = (
+            int(cfg["first_mode"]) - 1 + int(cfg["n_modes"])
+        )
+        requested_modes = requested_positive_modes + 12
+        cutoff_nm = float(cfg["cutoff_angstrom"]) / 10.0
+        estimated_evaluations = (
+            1
+            + int(cfg["max_iterations"])
+            * int(cfg["n_modes"])
+            * 4
+        )
+        progress = QProgressDialog(
+            "Preparing iterative normal-mode fitting...",
+            "Cancel",
+            0,
+            estimated_evaluations,
+            self,
+        )
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+
+        latest_method = {"name": "-"}
+        scored_packs = {}
+
+        def calculate_modes(current_coords):
+            node_coords = np.asarray(current_coords, dtype=float)[node_indices]
+            try:
+                eigvals, eigvecs, nma_method = _anm_modes_with_prody(
+                    node_coords, cutoff_nm, requested_modes
+                )
+            except Exception:
+                eigvals, eigvecs, nma_method = _anm_modes_numpy(
+                    node_coords, cutoff_nm, requested_modes
+                )
+            mode_basis, mode_eigenvalues, _ = prepare_nma_atom_mode_basis(
+                eigvals,
+                eigvecs,
+                len(node_coords),
+                nodes["atom_to_node"],
+                requested_positive_modes,
+            )
+            first_offset = int(cfg["first_mode"]) - 1
+            last_offset = first_offset + int(cfg["n_modes"])
+            mode_basis = mode_basis[first_offset:last_offset]
+            mode_eigenvalues = mode_eigenvalues[first_offset:last_offset]
+            mode_numbers = np.arange(
+                int(cfg["first_mode"]),
+                int(cfg["first_mode"]) + mode_basis.shape[0],
+                dtype=int,
+            )
+            latest_method["name"] = str(nma_method)
+            return (
+                mode_basis,
+                mode_eigenvalues,
+                mode_numbers,
+                str(nma_method),
+            )
+
+        def score_coordinates(candidate_coords):
+            pack = self.simulate_and_score(
+                self._apply_current_rotation_to_coords(candidate_coords),
+                fit_real,
+                meta=fit_meta,
+            )
+            key = tuple(
+                np.round(
+                    np.asarray(candidate_coords, dtype=float).ravel(),
+                    4,
+                )
+            )
+            scored_packs[key] = pack
+            if pack is None or pack.get("zncc") is None:
+                return float("nan")
+            return float(pack["zncc"])
+
+        def keep_running():
+            QApplication.processEvents()
+            return not progress.wasCanceled()
+
+        elements = np.asarray(
+            self.atoms_data.get(
+                "element", ["C"] * base_coords.shape[0]
+            )
+        )
+        heavy_indices = heavy_atom_indices(
+            elements,
+            base_coords.shape[0],
+        )
+        clash_rejections = {"count": 0}
+
+        def candidate_is_clash_safe(candidate_coords):
+            clashes = introduces_severe_atomic_clash(
+                base_coords,
+                candidate_coords,
+                heavy_indices,
+                clash_distance_nm=0.18,
+                original_neighbor_nm=0.28,
+            )
+            if clashes:
+                clash_rejections["count"] += 1
+            return not clashes
+
+        def update_progress(iteration, evaluations, current_correlation):
+            progress.setValue(min(int(evaluations), estimated_evaluations))
+            progress.setLabelText(
+                f"NMFF-AFM iteration {int(iteration) + 1} / "
+                f"{int(cfg['max_iterations'])}\n"
+                f"Current ZNCC: {float(current_correlation):.5f}    "
+                f"Evaluations: {int(evaluations)}    "
+                f"Clash-rejected: {int(clash_rejections['count'])}"
+                + self._flexible_fit_live_preview_label_suffix()
+            )
+
+        def on_nmff_accepted(coords, correlation):
+            key = tuple(
+                np.round(np.asarray(coords, dtype=float).ravel(), 4)
+            )
+            pack = scored_packs.get(key)
+            sim_img = None if pack is None else pack.get("sim_img")
+            self._preview_flexible_fit_candidate(
+                coords,
+                sim_img,
+                force=True,
+                note=f"ZNCC {float(correlation):.5f}",
+            )
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self._begin_flexible_fit_live_preview(base_coords)
+        try:
+            result = run_iterative_nmff(
+                base_coords,
+                calculate_modes,
+                score_coordinates,
+                NmffRunConfig(
+                    step_amplitude_nm=float(cfg["step_amplitude_nm"]),
+                    max_iterations=int(cfg["max_iterations"]),
+                    max_total_rms_nm=float(cfg["max_total_rms_nm"]),
+                    minimum_cc_gain=float(cfg["minimum_cc_gain"]),
+                    convergence_fraction=float(cfg["convergence_fraction"]),
+                    convergence_patience=int(cfg["convergence_patience"]),
+                    minimum_iterations=min(5, int(cfg["max_iterations"])),
+                ),
+                keep_running=keep_running,
+                progress_callback=update_progress,
+                acceptance_callback=on_nmff_accepted,
+                candidate_validator=candidate_is_clash_safe,
+                candidate_projector=lambda candidate: (
+                    align_coordinates_kabsch(candidate, base_coords)
+                ),
+            )
+            final_coords = np.asarray(result.coordinates, dtype=float)
+            if not result.iterations:
+                QMessageBox.information(
+                    self,
+                    title,
+                    "No improving normal-mode step was found. "
+                    "The structure was not changed.",
+                )
+                return
+
+            fitted_rms = float(
+                np.sqrt(
+                    np.mean(np.sum((final_coords - base_coords) ** 2, axis=1))
+                )
+            )
+            if not candidate_is_clash_safe(final_coords):
+                QMessageBox.warning(
+                    self,
+                    title,
+                    "NMFF-AFM's final safety invariant failed unexpectedly. "
+                    "Structure was not changed.",
+                )
+                return
+
+            final_pack = self.simulate_and_score(
+                self._apply_current_rotation_to_coords(final_coords),
+                self.real_afm_nm,
+                meta=meta,
+            )
+            if final_pack is None or final_pack.get("rmsd") is None:
+                QMessageBox.warning(
+                    self,
+                    title,
+                    "Final full-resolution scoring failed. "
+                    "Structure was not changed.",
+                )
+                return
+            before_score = float(before_full_pack.get("pose_score", -1e9))
+            after_score = float(final_pack.get("pose_score", -1e9))
+            before_residual_rmsd = before_full_pack.get("residual_rmsd")
+            after_residual_rmsd = final_pack.get("residual_rmsd")
+            before_zncc = before_full_pack.get("zncc")
+            after_zncc = final_pack.get("zncc")
+            aligned_rmsd_worsened = (
+                before_residual_rmsd is not None
+                and after_residual_rmsd is not None
+                and float(after_residual_rmsd)
+                > float(before_residual_rmsd) + 1e-4
+            )
+            if not is_flexible_fit_score_improvement(
+                before_score,
+                after_score,
+            ):
+                QMessageBox.information(
+                    self,
+                    title,
+                    "No NMFF-AFM candidate improved the composite AFM score. "
+                    "The structure was not changed.\n\n"
+                    f"Pose score: {before_score:.4f} -> {after_score:.4f}\n"
+                    f"Aligned RMSD: {before_residual_rmsd} -> "
+                    f"{after_residual_rmsd} nm\n"
+                    f"ZNCC: {before_zncc} -> {after_zncc}",
+                )
+                return
+
+            comparison_before = dict(before_full_pack)
+            comparison_after = dict(final_pack)
+            for target, source in (
+                (comparison_before, before_full_pack),
+                (comparison_after, final_pack),
+            ):
+                if source.get("residual_rmsd") is not None:
+                    target["rmsd"] = source.get("residual_rmsd")
+                if source.get("residual_zncc") is not None:
+                    target["zncc"] = source.get("residual_zncc")
+
+            self._finish_flexible_fit_live_preview(restore=False)
+            self._set_atom_coords_array(
+                final_coords,
+                mark_edited=True,
+                preserve_domains=False,
+            )
+            self._update_flexible_fit_metrics_preserving_pose(
+                final_pack,
+                after_score,
+            )
+            self.flexible_fit_result = {
+                "fit_model": "nmff",
+                "profile": "Iterative NMFF-AFM",
+                "settings": dict(cfg),
+                "original_coords": self._flexible_fit_result_original_coords(base_coords),
+                "fitted_coords": np.asarray(final_coords, dtype=float),
+                "before": comparison_before,
+                "after": comparison_after,
+                "eval_count": int(result.evaluations),
+                "iteration_count": len(result.iterations),
+                "iterations": tuple(result.iterations),
+                "nma_method": str(latest_method["name"]),
+                "stop_reason": str(result.stop_reason),
+                "rejected_clash_candidate_count": int(
+                    result.rejected_candidate_count
+                ),
+                "fitted_rms_displacement_nm": fitted_rms,
+                "max_total_rms_nm": float(cfg["max_total_rms_nm"]),
+                "preview_initial_zncc": float(result.initial_correlation),
+                "preview_final_zncc": float(result.final_correlation),
+                "aligned_rmsd_worsened": bool(aligned_rmsd_worsened),
+            }
+            self._initialize_active_fit_structure_state()
+            self.flexible_fit_report_text = self._format_flexible_fit_report(
+                self.flexible_fit_result
+            )
+            self._update_flexible_fit_action_buttons()
+            self.display_molecule()
+            self._simulate_xy_for_real_afm(
+                update_panels=True,
+                store_results=True,
+                check_busy=False,
+                show_messages=False,
+            )
+            before_rmsd = comparison_before.get("rmsd")
+            after_rmsd = comparison_after.get("rmsd")
+            before_text = (
+                f"{float(before_rmsd):.3f} nm"
+                if before_rmsd is not None else "-"
+            )
+            after_text = (
+                f"{float(after_rmsd):.3f} nm"
+                if after_rmsd is not None else "-"
+            )
+            QMessageBox.information(
+                self,
+                title,
+                "Iterative NMFF-AFM fit complete.\n"
+                f"ZNCC: {before_zncc:.5f} -> {after_zncc:.5f}\n"
+                f"RMSD: {before_text} -> {after_text}\n"
+                f"Accepted iterations: {len(result.iterations)}   "
+                f"Clash-rejected candidates: "
+                f"{int(result.rejected_candidate_count)}\n"
+                f"RMS displacement: {fitted_rms:.3f} nm\n"
+                f"Stop: {result.stop_reason}",
+            )
+        except FlexibleFitBackendCanceled:
+            QMessageBox.information(
+                self,
+                title,
+                "NMFF-AFM fitting canceled. Structure was not changed.",
+            )
+        except FlexibleFitBackendError as exc:
+            QMessageBox.critical(self, title, str(exc))
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                title,
+                f"NMFF-AFM fitting failed:\n{exc}",
+            )
+        finally:
+            if getattr(self, "_flex_fit_live_preview", None) is not None:
+                self._finish_flexible_fit_live_preview(restore=True)
+            progress.close()
+            QApplication.restoreOverrideCursor()
+
+    def _locate_afmfit_bridge(self):
+        """Locate the bundled/source bridge script without importing AFMfit."""
+        candidates = []
+        try:
+            here = Path(__file__).resolve().parent
+            candidates.append(here / "afmfit_bridge.py")
+            # Plugin lives in plugins/; support files stay at the app/repo root.
+            candidates.append(here.parent / "afmfit_bridge.py")
+        except Exception:
+            pass
+        frozen_root = getattr(sys, "_MEIPASS", None)
+        if frozen_root:
+            candidates.append(Path(frozen_root) / "afmfit_bridge.py")
+        candidates.append(Path.cwd() / "afmfit_bridge.py")
+        for entry in list(sys.path):
+            try:
+                if entry:
+                    candidates.append(Path(entry) / "afmfit_bridge.py")
+            except Exception:
+                pass
+        seen = set()
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except Exception:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            try:
+                if resolved.is_file():
+                    return str(resolved)
+            except Exception:
+                pass
+        return ""
+
+    def _get_afmfit_fit_settings(self):
+        """Show controls for the separately installed official AFMfit package."""
+        structure_coords = self._current_atom_coords_array()
+        if structure_coords is not None and structure_coords.shape[0] >= 3:
+            structure_span_angstrom = float(
+                np.linalg.norm(np.ptp(structure_coords, axis=0)) * 10.0
+            )
+            recommended_rmsd_angstrom = round(
+                float(np.clip(0.02 * structure_span_angstrom, 2.0, 4.0))
+                * 2.0
+            ) / 2.0
+        else:
+            structure_span_angstrom = 0.0
+            recommended_rmsd_angstrom = 3.0
+        default_python = ""
+        afmfit_python_candidates = [
+            os.environ.get("PYNUD_AFMFIT_PYTHON", ""),
+            str(Path.home() / "afmfit-env" / "bin" / "python"),
+            str(
+                Path.home()
+                / "Downloads"
+                / "afmfit-env"
+                / "bin"
+                / "python"
+            ),
+        ]
+        for candidate in afmfit_python_candidates:
+            candidate_path = Path(
+                os.path.expanduser(str(candidate).strip())
+            )
+            if candidate and candidate_path.is_file() and os.access(
+                candidate_path,
+                os.X_OK,
+            ):
+                # Keep the venv launcher rather than resolving its symlink to
+                # the base interpreter.
+                default_python = str(candidate_path.absolute())
+                break
+        if not default_python:
+            default_python = (
+                "python3"
+                if bool(getattr(sys, "frozen", False))
+                else str(sys.executable)
+            )
+        defaults = {
+            "python_executable": default_python,
+            "n_cpu": max(1, min(4, (os.cpu_count() or 2) // 2)),
+            "nmodes": 10,
+            "cutoff_angstrom": 8.0,
+            "sigma_angstrom": 4.0,
+            "angular_distance_deg": 10.0,
+            "rigid_angle_limit_deg": 25.0,
+            "z_shift_range_angstrom": 20.0,
+            "z_shift_points": 5,
+            "n_best_views": 5,
+            "view_separation_deg": 15.0,
+            "iterations": 10,
+            "regularization_lambda": 25.0,
+            "preview_max_px": 96,
+            "max_rmsd_angstrom": recommended_rmsd_angstrom,
+            "auto_safe_rmsd": True,
+            "timeout_seconds": 900,
+        }
+        previous = dict(
+            defaults,
+            **(getattr(self, "afmfit_fit_settings", None) or {}),
+        )
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("AFMfit Flexible Fit Settings")
+        dialog.setMinimumWidth(620)
+        outer = QVBoxLayout(dialog)
+        explanation = QLabel(
+            "Official AFMfit performs local rigid projection matching followed "
+            "by nonlinear NMA fitting with its bundled NOLB-RTB engine. pyNuD "
+            "runs it in the selected external Python, then independently checks "
+            "the fitted PDB for displacement, atomic clashes, and AFM-score "
+            "improvement before applying it."
+        )
+        explanation.setWordWrap(True)
+        outer.addWidget(explanation)
+        grid = QGridLayout()
+        outer.addLayout(grid)
+
+        python_widget = QWidget(dialog)
+        python_layout = QHBoxLayout(python_widget)
+        python_layout.setContentsMargins(0, 0, 0, 0)
+        python_line = QLineEdit(
+            str(previous["python_executable"]),
+            python_widget,
+        )
+        browse_python_button = QPushButton("Browse...", python_widget)
+
+        def browse_python():
+            start_path = os.path.expanduser(python_line.text().strip())
+            if not os.path.isfile(start_path):
+                start_path = ""
+            selected, _ = QFileDialog.getOpenFileName(
+                dialog,
+                "Select Python with AFMfit installed",
+                start_path,
+                "All Files (*)",
+                options=QFileDialog.DontUseNativeDialog,
+            )
+            if selected:
+                python_line.setText(selected)
+
+        browse_python_button.clicked.connect(browse_python)
+        python_layout.addWidget(python_line, 1)
+        python_layout.addWidget(browse_python_button)
+
+        ncpu_spin = QSpinBox(dialog)
+        ncpu_spin.setRange(1, max(1, os.cpu_count() or 1))
+        ncpu_spin.setValue(int(previous["n_cpu"]))
+
+        nmodes_spin = QSpinBox(dialog)
+        nmodes_spin.setRange(1, 50)
+        nmodes_spin.setValue(int(previous["nmodes"]))
+
+        cutoff_spin = QDoubleSpinBox(dialog)
+        cutoff_spin.setRange(3.0, 30.0)
+        cutoff_spin.setDecimals(1)
+        cutoff_spin.setSingleStep(0.5)
+        cutoff_spin.setSuffix(" Å")
+        cutoff_spin.setValue(float(previous["cutoff_angstrom"]))
+
+        sigma_spin = QDoubleSpinBox(dialog)
+        sigma_spin.setRange(1.0, 15.0)
+        sigma_spin.setDecimals(1)
+        sigma_spin.setSingleStep(0.2)
+        sigma_spin.setSuffix(" Å")
+        sigma_spin.setValue(float(previous["sigma_angstrom"]))
+        sigma_spin.setToolTip(
+            "AFMfit pseudo-AFM Gaussian smoothness. This is not identical to "
+            "pyNuD's physical tip radius."
+        )
+
+        angular_spin = QDoubleSpinBox(dialog)
+        angular_spin.setRange(5.0, 30.0)
+        angular_spin.setDecimals(0)
+        angular_spin.setSingleStep(5.0)
+        angular_spin.setSuffix("°")
+        angular_spin.setValue(float(previous["angular_distance_deg"]))
+
+        rigid_limit_spin = QDoubleSpinBox(dialog)
+        rigid_limit_spin.setRange(5.0, 90.0)
+        rigid_limit_spin.setDecimals(0)
+        rigid_limit_spin.setSingleStep(5.0)
+        rigid_limit_spin.setSuffix("°")
+        rigid_limit_spin.setValue(
+            float(previous["rigid_angle_limit_deg"])
+        )
+
+        z_range_spin = QDoubleSpinBox(dialog)
+        z_range_spin.setRange(2.0, 100.0)
+        z_range_spin.setDecimals(1)
+        z_range_spin.setSingleStep(2.0)
+        z_range_spin.setSuffix(" Å")
+        z_range_spin.setValue(
+            float(previous["z_shift_range_angstrom"])
+        )
+
+        z_points_spin = QSpinBox(dialog)
+        z_points_spin.setRange(2, 21)
+        z_points_spin.setValue(int(previous["z_shift_points"]))
+
+        best_views_spin = QSpinBox(dialog)
+        best_views_spin.setRange(1, 30)
+        best_views_spin.setValue(int(previous["n_best_views"]))
+
+        view_separation_spin = QDoubleSpinBox(dialog)
+        view_separation_spin.setRange(1.0, 90.0)
+        view_separation_spin.setDecimals(0)
+        view_separation_spin.setSuffix("°")
+        view_separation_spin.setValue(
+            float(previous["view_separation_deg"])
+        )
+
+        iterations_spin = QSpinBox(dialog)
+        iterations_spin.setRange(1, 50)
+        iterations_spin.setValue(int(previous["iterations"]))
+
+        lambda_spin = QDoubleSpinBox(dialog)
+        lambda_spin.setRange(0.1, 10000.0)
+        lambda_spin.setDecimals(1)
+        lambda_spin.setSingleStep(5.0)
+        lambda_spin.setValue(
+            float(previous["regularization_lambda"])
+        )
+
+        preview_spin = QSpinBox(dialog)
+        preview_spin.setRange(32, 256)
+        preview_spin.setSingleStep(16)
+        preview_spin.setSuffix(" px")
+        preview_spin.setValue(int(previous["preview_max_px"]))
+
+        auto_rmsd_check = QCheckBox(
+            "Use PDB-safe RMS displacement limit (recommended)",
+            dialog,
+        )
+        auto_rmsd_check.setChecked(
+            bool(previous.get("auto_safe_rmsd", True))
+        )
+        rmsd_spin = QDoubleSpinBox(dialog)
+        rmsd_spin.setRange(0.1, 50.0)
+        rmsd_spin.setDecimals(1)
+        rmsd_spin.setSingleStep(0.5)
+        rmsd_spin.setSuffix(" Å")
+        rmsd_spin.setValue(float(previous["max_rmsd_angstrom"]))
+
+        def update_safe_rmsd(automatic):
+            rmsd_spin.setEnabled(not bool(automatic))
+            if automatic:
+                rmsd_spin.setValue(recommended_rmsd_angstrom)
+
+        auto_rmsd_check.toggled.connect(update_safe_rmsd)
+        update_safe_rmsd(auto_rmsd_check.isChecked())
+
+        timeout_spin = QSpinBox(dialog)
+        timeout_spin.setRange(60, 14400)
+        timeout_spin.setSingleStep(60)
+        timeout_spin.setSuffix(" s")
+        timeout_spin.setValue(int(previous["timeout_seconds"]))
+
+        rows = [
+            ("AFMfit Python:", python_widget),
+            ("CPU Cores:", ncpu_spin),
+            ("Nonlinear Modes:", nmodes_spin),
+            ("NMA Cutoff:", cutoff_spin),
+            ("AFMfit Sigma:", sigma_spin),
+            ("Angular Sampling:", angular_spin),
+            ("Rigid Refinement Limit:", rigid_limit_spin),
+            ("Z-shift Search Range:", z_range_spin),
+            ("Z-shift Samples:", z_points_spin),
+            ("Best Rigid Views:", best_views_spin),
+            ("View Separation:", view_separation_spin),
+            ("Flexible Iterations:", iterations_spin),
+            ("Regularization Lambda:", lambda_spin),
+            ("Preview Resolution (max):", preview_spin),
+            ("Safe Displacement:", auto_rmsd_check),
+            ("Maximum Structural RMS:", rmsd_spin),
+            ("Maximum Runtime:", timeout_spin),
+        ]
+        for row, (label_text, widget) in enumerate(rows):
+            grid.addWidget(QLabel(label_text, dialog), row, 0)
+            grid.addWidget(widget, row, 1)
+
+        note = QLabel(
+            f"PDB span: {structure_span_angstrom:.1f} Å; recommended structural "
+            f"RMS limit: {recommended_rmsd_angstrom:.1f} Å.\n"
+            "AFMfit is GPL-3.0-or-later software and is not bundled with pyNuD. "
+            "Install it separately in this Python environment. Official "
+            "AFMfit/NOLB support is limited to Linux and macOS."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #666;")
+        outer.addWidget(note)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        outer.addWidget(buttons)
+        if dialog.exec_() != QDialog.Accepted:
+            return None
+
+        settings = {
+            "python_executable": python_line.text().strip(),
+            "n_cpu": int(ncpu_spin.value()),
+            "nmodes": int(nmodes_spin.value()),
+            "cutoff_angstrom": float(cutoff_spin.value()),
+            "sigma_angstrom": float(sigma_spin.value()),
+            "angular_distance_deg": float(angular_spin.value()),
+            "rigid_angle_limit_deg": float(rigid_limit_spin.value()),
+            "z_shift_range_angstrom": float(z_range_spin.value()),
+            "z_shift_points": int(z_points_spin.value()),
+            "n_best_views": int(best_views_spin.value()),
+            "view_separation_deg": float(view_separation_spin.value()),
+            "iterations": int(iterations_spin.value()),
+            "regularization_lambda": float(lambda_spin.value()),
+            "preview_max_px": int(preview_spin.value()),
+            "max_rmsd_angstrom": float(rmsd_spin.value()),
+            "auto_safe_rmsd": bool(auto_rmsd_check.isChecked()),
+            "timeout_seconds": int(timeout_spin.value()),
+        }
+        self.afmfit_fit_settings = dict(settings)
+        return settings
+
+    def run_afmfit_flexible_fit(self):
+        """Run official AFMfit externally and verify its fitted PDB in pyNuD."""
+        title = "AFMfit Flexible Fit"
+        if self.real_afm_nm is None:
+            QMessageBox.information(self, title, "Real AFM is not loaded.")
+            return
+        if getattr(self, "atoms_data", None) is None:
+            QMessageBox.warning(
+                self,
+                title,
+                "PDB/CIF structure is not loaded.",
+            )
+            return
+        if sys.platform.startswith("win"):
+            QMessageBox.warning(
+                self,
+                title,
+                "Official AFMfit's bundled NOLB currently supports Linux and "
+                "macOS, not native Windows.",
+            )
+            return
+        if self.is_worker_running(
+            getattr(self, "sim_worker", None),
+            attr_name="sim_worker",
+        ) or self.is_worker_running(
+            getattr(self, "sim_worker_high_res", None),
+            attr_name="sim_worker_high_res",
+        ):
+            QMessageBox.information(
+                self,
+                title,
+                "Another simulation is running.",
+            )
+            return
+
+        cfg = self._get_afmfit_fit_settings()
+        if cfg is None:
+            return
+        bridge_path = self._locate_afmfit_bridge()
+        if not bridge_path:
+            QMessageBox.critical(
+                self,
+                title,
+                "pyNuD's afmfit_bridge.py was not found.",
+            )
+            return
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            QApplication.processEvents()
+            environment = probe_afmfit_environment(
+                cfg["python_executable"],
+                bridge_path,
+            )
+        except FlexibleFitBackendError as exc:
+            environment = None
+            selected_path = os.path.abspath(
+                os.path.expanduser(str(cfg["python_executable"]))
+            )
+            fallback_candidates = [
+                os.environ.get("PYNUD_AFMFIT_PYTHON", ""),
+                str(Path.home() / "afmfit-env" / "bin" / "python"),
+                str(
+                    Path.home()
+                    / "Downloads"
+                    / "afmfit-env"
+                    / "bin"
+                    / "python"
+                ),
+            ]
+            for candidate in fallback_candidates:
+                candidate = str(candidate).strip()
+                if not candidate:
+                    continue
+                candidate_path = os.path.abspath(
+                    os.path.expanduser(candidate)
+                )
+                if candidate_path == selected_path:
+                    continue
+                if not (
+                    os.path.isfile(candidate_path)
+                    and os.access(candidate_path, os.X_OK)
+                ):
+                    continue
+                try:
+                    environment = probe_afmfit_environment(
+                        candidate_path,
+                        bridge_path,
+                    )
+                except FlexibleFitBackendError:
+                    continue
+                cfg["python_executable"] = candidate_path
+                self.afmfit_fit_settings = dict(cfg)
+                break
+            if environment is None:
+                QMessageBox.critical(
+                    self,
+                    title,
+                    str(exc)
+                    + "\n\nInstall the official package in a separate "
+                    "environment:\n"
+                    "git clone https://gricad-gitlab.univ-grenoble-alpes.fr/"
+                    "GruLab/AFMfit.git\n"
+                    "CMAKE_POLICY_VERSION_MINIMUM=3.5 "
+                    f"{cfg['python_executable']} -m pip install ./AFMfit\n\n"
+                    "The CMake compatibility setting is required when libasd "
+                    "is built with CMake 4.",
+                )
+                return
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not environment.get("nolb_exists") or not environment.get(
+            "nolb_executable"
+        ):
+            QMessageBox.critical(
+                self,
+                title,
+                "AFMfit was found, but its bundled NOLB executable is missing "
+                "or not executable:\n"
+                f"{environment.get('nolb_path', '-')}",
+            )
+            return
+
+        meta = self._get_real_afm_simulation_meta()
+        if meta is None:
+            QMessageBox.warning(
+                self,
+                title,
+                "Real AFM metadata is incomplete.",
+            )
+            return
+        scan_x_nm, scan_y_nm, nx, ny = meta
+        fit_scale = min(
+            1.0,
+            float(cfg["preview_max_px"]) / max(float(nx), float(ny)),
+        )
+        fit_nx = min(int(nx), max(24, int(round(float(nx) * fit_scale))))
+        fit_ny = min(int(ny), max(24, int(round(float(ny) * fit_scale))))
+        real_array = np.asarray(self.real_afm_nm, dtype=np.float64)
+        real_valid = np.isfinite(real_array) & (real_array > -1e8)
+        if np.count_nonzero(real_valid) < 16:
+            QMessageBox.warning(self, title, "Real AFM image is invalid.")
+            return
+        fill_height = float(np.percentile(real_array[real_valid], 5.0))
+        fit_real_source = np.where(real_valid, real_array, fill_height)
+        if fit_nx != int(nx) or fit_ny != int(ny):
+            fit_real = scipy.ndimage.zoom(
+                fit_real_source,
+                (fit_ny / float(ny), fit_nx / float(nx)),
+                order=1,
+            )
+        else:
+            fit_real = fit_real_source
+
+        base_coords = self._current_atom_coords_array()
+        if base_coords is None or base_coords.shape[0] < 4:
+            QMessageBox.warning(
+                self,
+                title,
+                "The loaded structure is incomplete.",
+            )
+            return
+        before_pack = self.simulate_and_score(
+            self._apply_current_rotation_to_coords(base_coords),
+            self.real_afm_nm,
+            meta=meta,
+        )
+        if before_pack is None or before_pack.get("rmsd") is None:
+            QMessageBox.warning(
+                self,
+                title,
+                "Initial pyNuD simulation/scoring failed.",
+            )
+            return
+
+        progress = QProgressDialog(
+            "Starting external AFMfit...",
+            "Cancel",
+            0,
+            100,
+            self,
+        )
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="pynud_afmfit_"
+            ) as directory:
+                directory_path = Path(directory)
+                input_pdb = directory_path / "pynud_afmfit_input.pdb"
+                input_image = directory_path / "pynud_afmfit_input.npz"
+                self._write_current_structure_pdb(
+                    input_pdb,
+                    apply_display_rotation=True,
+                )
+                np.savez_compressed(
+                    input_image,
+                    height_nm=np.asarray(fit_real, dtype=np.float32),
+                    pixel_x_nm=np.asarray(
+                        float(scan_x_nm) / float(fit_nx)
+                    ),
+                    pixel_y_nm=np.asarray(
+                        float(scan_y_nm) / float(fit_ny)
+                    ),
+                )
+
+                def keep_running():
+                    QApplication.processEvents()
+                    return not progress.wasCanceled()
+
+                def update_progress(status):
+                    elapsed = max(0, int(status.elapsed_seconds))
+                    elapsed_text = (
+                        f"{elapsed // 60:02d}:{elapsed % 60:02d}"
+                    )
+                    message = status.message or "AFMfit is running."
+                    if len(message) > 150:
+                        message = message[-150:]
+                    progress.setValue(
+                        max(0, min(100, int(round(status.percent))))
+                    )
+                    progress.setLabelText(
+                        "Official AFMfit external backend\n"
+                        f"Stage: {status.stage}    Elapsed: {elapsed_text}    "
+                        f"Log: {int(status.log_bytes)} bytes\n"
+                        f"{message}"
+                    )
+                    QApplication.processEvents()
+
+                result = run_afmfit_external(
+                    input_pdb,
+                    input_image,
+                    directory_path,
+                    AfmfitRunConfig(
+                        python_executable=str(
+                            cfg["python_executable"]
+                        ),
+                        bridge_path=bridge_path,
+                        n_cpu=int(cfg["n_cpu"]),
+                        nmodes=int(cfg["nmodes"]),
+                        cutoff_angstrom=float(cfg["cutoff_angstrom"]),
+                        sigma_angstrom=float(cfg["sigma_angstrom"]),
+                        angular_distance_deg=float(
+                            cfg["angular_distance_deg"]
+                        ),
+                        rigid_angle_limit_deg=float(
+                            cfg["rigid_angle_limit_deg"]
+                        ),
+                        z_shift_range_angstrom=float(
+                            cfg["z_shift_range_angstrom"]
+                        ),
+                        z_shift_points=int(cfg["z_shift_points"]),
+                        n_best_views=int(cfg["n_best_views"]),
+                        view_separation_deg=float(
+                            cfg["view_separation_deg"]
+                        ),
+                        iterations=int(cfg["iterations"]),
+                        regularization_lambda=float(
+                            cfg["regularization_lambda"]
+                        ),
+                        timeout_seconds=float(cfg["timeout_seconds"]),
+                    ),
+                    keep_running=keep_running,
+                    progress_callback=update_progress,
+                )
+
+                expected_atom_keys = []
+                for atom_index in range(base_coords.shape[0]):
+                    try:
+                        residue_id = int(
+                            self.atoms_data["residue_id"][atom_index]
+                        )
+                    except Exception:
+                        residue_id = 1
+                    icode = ""
+                    if "icode" in self.atoms_data:
+                        icode = str(
+                            self.atoms_data["icode"][atom_index]
+                        ).strip()[:1]
+                    expected_atom_keys.append((
+                        str(
+                            self.atoms_data["atom_name"][atom_index]
+                        ).strip(),
+                        str(
+                            self.atoms_data["residue_name"][atom_index]
+                        ).strip().upper()[:3] or "UNK",
+                        str(
+                            self.atoms_data["chain_id"][atom_index]
+                        ).strip()[:1],
+                        str(max(-999, min(9999, residue_id))),
+                        icode,
+                    ))
+                models = read_mapped_pdb_coordinate_models(
+                    result.output_pdb_path,
+                    reference_coords=base_coords,
+                    reference_atom_keys=expected_atom_keys,
+                )
+                if len(models) != 1:
+                    raise FlexibleFitBackendError(
+                        "AFMfit output must contain exactly one fitted model."
+                    )
+                fitted_coords = align_coordinates_kabsch(
+                    models[0],
+                    base_coords,
+                )
+
+            elements = np.asarray(
+                self.atoms_data.get(
+                    "element",
+                    ["C"] * base_coords.shape[0],
+                )
+            )
+            safety = evaluate_nolb_candidate_safety(
+                base_coords,
+                fitted_coords,
+                elements,
+                float(cfg["max_rmsd_angstrom"]) / 10.0,
+            )
+            if not safety.accepted:
+                QMessageBox.warning(
+                    self,
+                    title,
+                    "AFMfit completed, but pyNuD rejected the fitted structure "
+                    f"for {safety.reason}.\n\n"
+                    f"RMS displacement: {safety.rms_displacement_nm:.4f} nm\n"
+                    f"99th percentile displacement: "
+                    f"{safety.peak_displacement_nm:.4f} nm",
+                )
+                return
+
+            final_pack = self.simulate_and_score(
+                self._apply_current_rotation_to_coords(fitted_coords),
+                self.real_afm_nm,
+                meta=meta,
+            )
+            if final_pack is None or final_pack.get("rmsd") is None:
+                QMessageBox.warning(
+                    self,
+                    title,
+                    "Final pyNuD simulation/scoring failed. "
+                    "The structure was not changed.",
+                )
+                return
+            before_score = float(before_pack.get("pose_score", -1e9))
+            after_score = float(final_pack.get("pose_score", -1e9))
+            before_rmsd = before_pack.get("residual_rmsd")
+            after_rmsd = final_pack.get("residual_rmsd")
+            reliable_improvement = (
+                np.isfinite(after_score)
+                and after_score > before_score + 1e-4
+                and before_rmsd is not None
+                and after_rmsd is not None
+                and float(after_rmsd) <= float(before_rmsd) + 1e-4
+            )
+            if not reliable_improvement:
+                QMessageBox.information(
+                    self,
+                    title,
+                    "AFMfit completed, but the fitted structure did not "
+                    "improve pyNuD's independent full-resolution score. "
+                    "The structure was not changed.\n\n"
+                    f"Pose score: {before_score:.4f} -> {after_score:.4f}\n"
+                    f"Aligned RMSD: {before_rmsd} -> {after_rmsd} nm",
+                )
+                return
+
+            comparison_before = dict(before_pack)
+            comparison_after = dict(final_pack)
+            for comparison, source in (
+                (comparison_before, before_pack),
+                (comparison_after, final_pack),
+            ):
+                if source.get("residual_rmsd") is not None:
+                    comparison["rmsd"] = source.get("residual_rmsd")
+                if source.get("residual_zncc") is not None:
+                    comparison["zncc"] = source.get("residual_zncc")
+
+            self._set_atom_coords_array(
+                fitted_coords,
+                mark_edited=True,
+                preserve_domains=False,
+            )
+            self._update_flexible_fit_metrics_preserving_pose(
+                final_pack,
+                after_score,
+            )
+            self.flexible_fit_result = {
+                "fit_model": "afmfit",
+                "profile": (
+                    "Official AFMfit "
+                    f"{environment.get('afmfit_version', 'unknown')}"
+                ),
+                "settings": dict(cfg),
+                "environment": dict(environment),
+                "afmfit_metadata": dict(result.metadata),
+                "original_coords": self._flexible_fit_result_original_coords(base_coords),
+                "fitted_coords": np.asarray(fitted_coords, dtype=float),
+                "before": comparison_before,
+                "after": comparison_after,
+                "eval_count": int(cfg["iterations"]),
+                "fitted_rms_displacement_nm": float(
+                    safety.rms_displacement_nm
+                ),
+                "peak_displacement_nm": float(
+                    safety.peak_displacement_nm
+                ),
+                "afmfit_command": list(result.command),
+                "afmfit_output": str(result.output),
+                "afmfit_elapsed_seconds": float(
+                    result.elapsed_seconds
+                ),
+            }
+            self._initialize_active_fit_structure_state()
+            self.flexible_fit_report_text = (
+                self._format_flexible_fit_report(
+                    self.flexible_fit_result
+                )
+            )
+            self._update_flexible_fit_action_buttons()
+            self.display_molecule()
+            self._simulate_xy_for_real_afm(
+                update_panels=True,
+                store_results=True,
+                check_busy=False,
+                show_messages=False,
+            )
+            QMessageBox.information(
+                self,
+                title,
+                "AFMfit completed and passed pyNuD's independent safety and "
+                "full-resolution checks.\n\n"
+                f"AFMfit version: "
+                f"{environment.get('afmfit_version', '-')}\n"
+                f"Structural RMS displacement: "
+                f"{safety.rms_displacement_nm:.4f} nm\n"
+                f"Aligned RMSD: {comparison_before.get('rmsd')} -> "
+                f"{comparison_after.get('rmsd')} nm\n\n"
+                "Use Save Fit to export the PDB and report.",
+            )
+        except FlexibleFitBackendCanceled:
+            QMessageBox.information(
+                self,
+                title,
+                "AFMfit fitting canceled. Structure was not changed.",
+            )
+        except FlexibleFitBackendError as exc:
+            QMessageBox.critical(self, title, str(exc))
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                title,
+                f"AFMfit fitting failed:\n{exc}",
+            )
+        finally:
+            progress.close()
+            QApplication.restoreOverrideCursor()
+
+    def _get_nolb_fit_settings(self):
+        """Show standalone NOLB ensemble and AFM-scoring settings."""
+        installed_nolb = os.path.expanduser("~/.local/bin/NOLB")
+        default_binary = (
+            installed_nolb if os.path.isfile(installed_nolb) else "NOLB"
+        )
+        structure_coords = self._current_atom_coords_array()
+        if structure_coords is not None and structure_coords.shape[0] >= 3:
+            structure_span_angstrom = float(
+                np.linalg.norm(np.ptp(structure_coords, axis=0)) * 10.0
+            )
+            recommended_rmsd_angstrom = round(
+                float(
+                    np.clip(
+                        0.02 * structure_span_angstrom,
+                        2.0,
+                        4.0,
+                    )
+                )
+                * 2.0
+            ) / 2.0
+        else:
+            structure_span_angstrom = 0.0
+            recommended_rmsd_angstrom = 3.0
+        defaults = {
+            "binary_path": default_binary,
+            "num_structures": 50,
+            "max_rmsd_angstrom": recommended_rmsd_angstrom,
+            "auto_safe_rmsd": True,
+            "cutoff_angstrom": 5.0,
+            "minimize": True,
+            "preview_max_px": 96,
+            "timeout_seconds": 600,
+        }
+        previous = dict(
+            defaults,
+            **(getattr(self, "nolb_fit_settings", None) or {}),
+        )
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NOLB Flexible Fit Settings")
+        dialog.setMinimumWidth(560)
+        outer = QVBoxLayout(dialog)
+        explanation = QLabel(
+            "NOLB is an independent nonlinear normal-mode program. pyNuD "
+            "writes the current structure, asks NOLB to generate an ensemble, "
+            "then ranks every conformation using the current Real AFM image. "
+            "The academic NOLB executable must be downloaded separately."
+        )
+        explanation.setWordWrap(True)
+        outer.addWidget(explanation)
+        grid = QGridLayout()
+        outer.addLayout(grid)
+
+        binary_widget = QWidget(dialog)
+        binary_layout = QHBoxLayout(binary_widget)
+        binary_layout.setContentsMargins(0, 0, 0, 0)
+        binary_line = QLineEdit(str(previous["binary_path"]), binary_widget)
+        browse_button = QPushButton("Browse...", binary_widget)
+
+        def browse_binary():
+            start_path = binary_line.text().strip()
+            if not os.path.isfile(os.path.expanduser(start_path)):
+                start_path = ""
+            selected, _ = QFileDialog.getOpenFileName(
+                dialog,
+                "Select NOLB executable",
+                start_path,
+                "All Files (*)",
+                options=QFileDialog.DontUseNativeDialog,
+            )
+            if selected:
+                binary_line.setText(selected)
+
+        browse_button.clicked.connect(browse_binary)
+        binary_layout.addWidget(binary_line, 1)
+        binary_layout.addWidget(browse_button)
+
+        structures_spin = QSpinBox(dialog)
+        structures_spin.setRange(5, 5000)
+        structures_spin.setSingleStep(25)
+        structures_spin.setValue(int(previous["num_structures"]))
+
+        auto_rmsd_check = QCheckBox(
+            "Use PDB-safe RMSD limit (recommended)",
+            dialog,
+        )
+        auto_rmsd_check.setChecked(
+            bool(previous.get("auto_safe_rmsd", True))
+        )
+
+        rmsd_spin = QDoubleSpinBox(dialog)
+        rmsd_spin.setRange(0.1, 50.0)
+        rmsd_spin.setDecimals(1)
+        rmsd_spin.setSingleStep(0.5)
+        rmsd_spin.setSuffix(" Å")
+        rmsd_spin.setValue(float(previous["max_rmsd_angstrom"]))
+
+        rmsd_summary = QLabel(dialog)
+        rmsd_summary.setWordWrap(True)
+        rmsd_summary.setStyleSheet("color: #555;")
+
+        def update_safe_rmsd(automatic):
+            automatic = bool(automatic)
+            rmsd_spin.setEnabled(not automatic)
+            if automatic:
+                rmsd_spin.setValue(recommended_rmsd_angstrom)
+            rmsd_summary.setText(
+                f"PDB span: {structure_span_angstrom:.1f} Å. "
+                f"Recommended ensemble RMSD limit: "
+                f"{recommended_rmsd_angstrom:.1f} Å."
+            )
+
+        auto_rmsd_check.toggled.connect(update_safe_rmsd)
+        update_safe_rmsd(auto_rmsd_check.isChecked())
+
+        cutoff_spin = QDoubleSpinBox(dialog)
+        cutoff_spin.setRange(3.0, 30.0)
+        cutoff_spin.setDecimals(1)
+        cutoff_spin.setSingleStep(0.5)
+        cutoff_spin.setSuffix(" Å")
+        cutoff_spin.setValue(float(previous["cutoff_angstrom"]))
+
+        minimize_check = QCheckBox("Minimize generated structures (-m)", dialog)
+        minimize_check.setChecked(bool(previous["minimize"]))
+
+        preview_spin = QSpinBox(dialog)
+        preview_spin.setRange(32, 256)
+        preview_spin.setSingleStep(16)
+        preview_spin.setSuffix(" px")
+        preview_spin.setValue(int(previous["preview_max_px"]))
+
+        timeout_spin = QSpinBox(dialog)
+        timeout_spin.setRange(30, 7200)
+        timeout_spin.setSingleStep(60)
+        timeout_spin.setSuffix(" s")
+        timeout_spin.setValue(int(previous["timeout_seconds"]))
+        timeout_spin.setToolTip(
+            "NOLB is stopped if ensemble generation exceeds this time. "
+            "The progress dialog shows elapsed time and output activity."
+        )
+
+        rows = [
+            ("NOLB Executable:", binary_widget),
+            ("Generated Structures:", structures_spin),
+            ("Safe Displacement:", auto_rmsd_check),
+            ("Maximum Ensemble RMSD:", rmsd_spin),
+            ("Elastic-network Cutoff:", cutoff_spin),
+            ("Geometry Refinement:", minimize_check),
+            ("Preview Resolution (max):", preview_spin),
+            ("Maximum NOLB Runtime:", timeout_spin),
+        ]
+        for row, (label_text, widget) in enumerate(rows):
+            grid.addWidget(QLabel(label_text, dialog), row, 0)
+            grid.addWidget(widget, row, 1)
+        outer.addWidget(rmsd_summary)
+
+        note = QLabel(
+            "NOLB v1.9 for macOS may require Rosetta on Apple Silicon. "
+            "NOLB is not bundled because its academic license is separate."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #666;")
+        outer.addWidget(note)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        outer.addWidget(buttons)
+        if dialog.exec_() != QDialog.Accepted:
+            return None
+
+        settings = {
+            "binary_path": binary_line.text().strip(),
+            "num_structures": int(structures_spin.value()),
+            "max_rmsd_angstrom": float(rmsd_spin.value()),
+            "auto_safe_rmsd": bool(auto_rmsd_check.isChecked()),
+            "cutoff_angstrom": float(cutoff_spin.value()),
+            "minimize": bool(minimize_check.isChecked()),
+            "preview_max_px": int(preview_spin.value()),
+            "timeout_seconds": int(timeout_spin.value()),
+        }
+        self.nolb_fit_settings = dict(settings)
+        return settings
+
+    def run_nolb_flexible_fit(self):
+        """Generate nonlinear NMA conformations with NOLB and rank by AFM fit."""
+        if self.real_afm_nm is None:
+            QMessageBox.information(
+                self, "NOLB Flexible Fit", "Real AFM is not loaded."
+            )
+            return
+        if getattr(self, "atoms_data", None) is None:
+            QMessageBox.warning(
+                self, "NOLB Flexible Fit", "PDB/CIF structure is not loaded."
+            )
+            return
+        if self.is_worker_running(
+            getattr(self, "sim_worker", None), attr_name="sim_worker"
+        ) or self.is_worker_running(
+            getattr(self, "sim_worker_high_res", None),
+            attr_name="sim_worker_high_res",
+        ):
+            QMessageBox.information(
+                self, "NOLB Flexible Fit", "Another simulation is running."
+            )
+            return
+
+        cfg = self._get_nolb_fit_settings()
+        if cfg is None:
+            return
+        try:
+            cfg["binary_path"] = resolve_executable(str(cfg["binary_path"]))
+        except FlexibleFitBackendError as exc:
+            QMessageBox.warning(
+                self,
+                "NOLB Installation Required",
+                f"{exc}\n\n"
+                "Nonlinear NMA (NOLB) requires the separate academic NOLB "
+                "executable, which is not included with pyNuD Simulator.\n\n"
+                "Install NOLB from:\n"
+                "https://team.inria.fr/nano-d/software/nolb-normal-modes/\n\n"
+                "Then open NOLB Flexible Fit Settings and select the downloaded "
+                "executable. On Apple Silicon, NOLB v1.9 may also require "
+                "Rosetta. Flexible fitting was not started.",
+            )
+            return
+        self.nolb_fit_settings = dict(cfg)
+        meta = self._get_real_afm_simulation_meta()
+        if meta is None:
+            QMessageBox.warning(
+                self, "NOLB Flexible Fit", "Real AFM metadata is incomplete."
+            )
+            return
+
+        scan_x_nm, scan_y_nm, nx, ny = meta
+        fit_scale = min(
+            1.0,
+            float(cfg["preview_max_px"]) / max(float(nx), float(ny)),
+        )
+        fit_nx = min(int(nx), max(24, int(round(float(nx) * fit_scale))))
+        fit_ny = min(int(ny), max(24, int(round(float(ny) * fit_scale))))
+        if fit_nx != int(nx) or fit_ny != int(ny):
+            fit_real = scipy.ndimage.zoom(
+                np.asarray(self.real_afm_nm, dtype=np.float64),
+                (fit_ny / float(ny), fit_nx / float(nx)),
+                order=1,
+            )
+        else:
+            fit_real = self.real_afm_nm
+        fit_meta = (scan_x_nm, scan_y_nm, fit_nx, fit_ny)
+
+        base_coords = self._current_atom_coords_array()
+        if base_coords is None or base_coords.shape[0] < 3:
+            QMessageBox.warning(
+                self, "NOLB Flexible Fit", "The loaded structure is incomplete."
+            )
+            return
+        before_full_pack = self.simulate_and_score(
+            self._apply_current_rotation_to_coords(base_coords),
+            self.real_afm_nm,
+            meta=meta,
+        )
+        before_pack = self.simulate_and_score(
+            self._apply_current_rotation_to_coords(base_coords),
+            fit_real,
+            meta=fit_meta,
+        )
+        if (
+            before_pack is None
+            or before_pack.get("rmsd") is None
+            or before_full_pack is None
+            or before_full_pack.get("rmsd") is None
+        ):
+            QMessageBox.warning(
+                self, "NOLB Flexible Fit", "Initial simulation/scoring failed."
+            )
+            return
+
+        progress = QProgressDialog(
+            "Generating nonlinear NMA ensemble with NOLB...",
+            "Cancel",
+            0,
+            0,
+            self,
+        )
+        progress.setWindowTitle("NOLB Flexible Fit")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+
+        candidate_count = 0
+        valid_candidate_count = 0
+        rejected_displacement_count = 0
+        rejected_clash_count = 0
+        best_coords = None
+        best_pack = dict(before_pack)
+        nolb_result = None
+        elements = np.asarray(
+            self.atoms_data.get(
+                "element", ["C"] * base_coords.shape[0]
+            )
+        )
+        max_candidate_rms_nm = float(cfg["max_rmsd_angstrom"]) / 10.0
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self._begin_flexible_fit_live_preview(base_coords)
+        try:
+            with tempfile.TemporaryDirectory(prefix="pynud_nolb_") as directory:
+                input_path = Path(directory) / "pynud_input.pdb"
+                self._write_current_structure_pdb(
+                    input_path,
+                    apply_display_rotation=False,
+                )
+
+                def keep_running():
+                    QApplication.processEvents()
+                    return not progress.wasCanceled()
+
+                last_activity = {
+                    "log_bytes": -1,
+                    "output_pdb_bytes": -1,
+                    "changed_at": 0.0,
+                }
+
+                def update_nolb_progress(status):
+                    if (
+                        int(status.log_bytes) != last_activity["log_bytes"]
+                        or int(status.output_pdb_bytes)
+                        != last_activity["output_pdb_bytes"]
+                    ):
+                        last_activity["log_bytes"] = int(status.log_bytes)
+                        last_activity["output_pdb_bytes"] = int(
+                            status.output_pdb_bytes
+                        )
+                        last_activity["changed_at"] = float(
+                            status.elapsed_seconds
+                        )
+                    elapsed = max(0, int(status.elapsed_seconds))
+                    elapsed_text = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
+                    quiet_seconds = max(
+                        0,
+                        int(
+                            float(status.elapsed_seconds)
+                            - float(last_activity["changed_at"])
+                        ),
+                    )
+                    activity = (
+                        status.last_output_line
+                        or "NOLB process is alive; no text output yet."
+                    )
+                    if len(activity) > 130:
+                        activity = activity[-130:]
+                    progress.setLabelText(
+                        "Generating nonlinear NMA ensemble with NOLB...\n"
+                        f"Elapsed: {elapsed_text}    "
+                        f"Log: {int(status.log_bytes)} bytes    "
+                        f"Output PDB: {int(status.output_pdb_bytes)} bytes\n"
+                        f"Last output activity: {quiet_seconds} s ago\n"
+                        f"{activity}"
+                    )
+                    QApplication.processEvents()
+
+                nolb_result = run_nolb_ensemble(
+                    input_path,
+                    directory,
+                    NolbRunConfig(
+                        binary_path=str(cfg["binary_path"]),
+                        num_structures=int(cfg["num_structures"]),
+                        max_rmsd_angstrom=float(cfg["max_rmsd_angstrom"]),
+                        cutoff_angstrom=float(cfg["cutoff_angstrom"]),
+                        minimize=bool(cfg["minimize"]),
+                        timeout_seconds=float(cfg["timeout_seconds"]),
+                    ),
+                    keep_running=keep_running,
+                    progress_callback=update_nolb_progress,
+                )
+                expected_atom_keys = []
+                for atom_index in range(base_coords.shape[0]):
+                    try:
+                        residue_id = int(
+                            self.atoms_data["residue_id"][atom_index]
+                        )
+                    except Exception:
+                        residue_id = 1
+                    residue_id = max(-999, min(9999, residue_id))
+                    icode = ""
+                    if "icode" in self.atoms_data:
+                        icode = str(
+                            self.atoms_data["icode"][atom_index]
+                        ).strip()[:1]
+                    expected_atom_keys.append((
+                        str(
+                            self.atoms_data["atom_name"][atom_index]
+                        ).strip(),
+                        str(
+                            self.atoms_data["residue_name"][atom_index]
+                        ).strip().upper()[:3] or "UNK",
+                        str(
+                            self.atoms_data["chain_id"][atom_index]
+                        ).strip()[:1],
+                        str(residue_id),
+                        icode,
+                    ))
+                models = read_mapped_pdb_coordinate_models(
+                    nolb_result.ensemble_path,
+                    reference_coords=base_coords,
+                    reference_atom_keys=expected_atom_keys,
+                )
+                progress.setMaximum(len(models) + 1)
+                progress.setMinimum(0)
+                progress.setValue(0)
+
+                for index, model_coords in enumerate(models, start=1):
+                    if progress.wasCanceled():
+                        raise FlexibleFitBackendCanceled(
+                            "NOLB AFM scoring was canceled."
+                        )
+                    local_coords = align_coordinates_kabsch(
+                        model_coords,
+                        base_coords,
+                    )
+                    candidate_count += 1
+                    safety = evaluate_nolb_candidate_safety(
+                        base_coords,
+                        local_coords,
+                        elements,
+                        max_candidate_rms_nm,
+                    )
+                    rejection_reason = str(safety.reason)
+                    if rejection_reason == "excessive displacement":
+                        rejected_displacement_count += 1
+                    elif rejection_reason == "new heavy-atom clash":
+                        rejected_clash_count += 1
+                    else:
+                        valid_candidate_count += 1
+                        rotated_coords = (
+                            self._apply_current_rotation_to_coords(
+                                local_coords
+                            )
+                        )
+                        pack = self.simulate_and_score(
+                            rotated_coords,
+                            fit_real,
+                            meta=fit_meta,
+                        )
+                        if (
+                            pack is not None
+                            and pack.get("rmsd") is not None
+                            and float(pack.get("pose_score", -1e9))
+                            > float(best_pack.get("pose_score", -1e9))
+                        ):
+                            best_pack = dict(pack)
+                            best_coords = np.asarray(
+                                local_coords,
+                                dtype=float,
+                            )
+                            self._preview_flexible_fit_candidate(
+                                best_coords,
+                                pack.get("sim_img"),
+                                note=(
+                                    f"score "
+                                    f"{float(pack.get('pose_score', -1e9)):.4f}"
+                                ),
+                            )
+
+                    progress.setValue(index)
+                    best_rmsd = best_pack.get("residual_rmsd")
+                    if best_rmsd is None:
+                        best_rmsd = best_pack.get("rmsd")
+                    progress.setLabelText(
+                        "Scoring NOLB conformations against Real AFM...\n"
+                        f"Candidate {index}/{len(models)}    "
+                        f"Structurally valid: {valid_candidate_count}    "
+                        f"Rejected: "
+                        f"{rejected_displacement_count + rejected_clash_count}\n"
+                        f"Best RMSD: "
+                        f"{best_rmsd if best_rmsd is not None else '-'} nm"
+                        + (
+                            f"    Current rejected: {rejection_reason}"
+                            if rejection_reason else ""
+                        )
+                        + self._flexible_fit_live_preview_label_suffix()
+                    )
+                    QApplication.processEvents()
+
+            if best_coords is None:
+                QMessageBox.information(
+                    self,
+                    "NOLB Flexible Fit",
+                    "NOLB generated an ensemble, but none of its conformations "
+                    "passed structural safety checks and improved the preview "
+                    "score. The structure was not changed.\n\n"
+                    f"Generated: {candidate_count}\n"
+                    f"Structurally valid: {valid_candidate_count}\n"
+                    f"Rejected for displacement: "
+                    f"{rejected_displacement_count}\n"
+                    f"Rejected for atomic clash: {rejected_clash_count}",
+                )
+                return
+
+            fitted_rms = float(
+                np.sqrt(np.mean(np.sum((best_coords - base_coords) ** 2, axis=1)))
+            )
+            final_pack = self.simulate_and_score(
+                self._apply_current_rotation_to_coords(best_coords),
+                self.real_afm_nm,
+                meta=meta,
+            )
+            if final_pack is None or final_pack.get("rmsd") is None:
+                QMessageBox.warning(
+                    self,
+                    "NOLB Flexible Fit",
+                    "Final simulation/scoring failed. Structure was not changed.",
+                )
+                return
+
+            before_score = float(before_full_pack.get("pose_score", -1e9))
+            after_score = float(final_pack.get("pose_score", -1e9))
+            before_residual_rmsd = before_full_pack.get("residual_rmsd")
+            after_residual_rmsd = final_pack.get("residual_rmsd")
+            aligned_rmsd_worsened = (
+                before_residual_rmsd is not None
+                and after_residual_rmsd is not None
+                and float(after_residual_rmsd)
+                > float(before_residual_rmsd) + 1e-4
+            )
+            if not is_flexible_fit_score_improvement(
+                before_score,
+                after_score,
+            ):
+                QMessageBox.information(
+                    self,
+                    "NOLB Flexible Fit",
+                    "No NOLB candidate improved the composite AFM score. "
+                    "The structure was not changed.\n\n"
+                    f"Pose score: {before_score:.4f} -> {after_score:.4f}\n"
+                    f"Aligned RMSD: {before_residual_rmsd} -> "
+                    f"{after_residual_rmsd} nm",
+                )
+                return
+
+            comparison_before = dict(before_full_pack)
+            comparison_after = dict(final_pack)
+            for target, source in (
+                (comparison_before, before_full_pack),
+                (comparison_after, final_pack),
+            ):
+                if source.get("residual_rmsd") is not None:
+                    target["rmsd"] = source.get("residual_rmsd")
+                if source.get("residual_zncc") is not None:
+                    target["zncc"] = source.get("residual_zncc")
+
+            self._finish_flexible_fit_live_preview(restore=False)
+            self._set_atom_coords_array(
+                best_coords,
+                mark_edited=True,
+                preserve_domains=False,
+            )
+            self._update_flexible_fit_metrics_preserving_pose(
+                final_pack,
+                after_score,
+            )
+            self.flexible_fit_result = {
+                "fit_model": "nolb",
+                "profile": "NOLB ensemble",
+                "settings": dict(cfg),
+                "original_coords": self._flexible_fit_result_original_coords(base_coords),
+                "fitted_coords": np.asarray(best_coords, dtype=float),
+                "before": comparison_before,
+                "after": comparison_after,
+                "eval_count": int(candidate_count),
+                "candidate_count": int(candidate_count),
+                "valid_candidate_count": int(valid_candidate_count),
+                "rejected_displacement_count": int(
+                    rejected_displacement_count
+                ),
+                "rejected_clash_count": int(rejected_clash_count),
+                "fitted_rms_displacement_nm": fitted_rms,
+                "aligned_rmsd_worsened": bool(aligned_rmsd_worsened),
+                "nolb_command": list(nolb_result.command),
+                "nolb_output": str(nolb_result.output),
+                "nolb_elapsed_seconds": float(
+                    nolb_result.elapsed_seconds
+                ),
+            }
+            self._initialize_active_fit_structure_state()
+            self.flexible_fit_report_text = self._format_flexible_fit_report(
+                self.flexible_fit_result
+            )
+            self._update_flexible_fit_action_buttons()
+            self.display_molecule()
+            self._simulate_xy_for_real_afm(
+                update_panels=True,
+                store_results=True,
+                check_busy=False,
+                show_messages=False,
+            )
+            QMessageBox.information(
+                self,
+                "NOLB Flexible Fit",
+                "NOLB fitting completed and the best conformation was applied.\n\n"
+                f"Candidates: {candidate_count}\n"
+                f"Structurally valid: {valid_candidate_count}   "
+                f"Rejected: "
+                f"{rejected_displacement_count + rejected_clash_count}\n"
+                f"Structural RMS displacement: {fitted_rms:.4f} nm\n"
+                f"Composite AFM score: {before_score:.4f} -> "
+                f"{after_score:.4f}\n"
+                f"Aligned RMSD: {comparison_before.get('rmsd')} -> "
+                f"{comparison_after.get('rmsd')} nm\n"
+                + (
+                    "\nAligned RMSD worsened, but it was retained as a "
+                    "diagnostic because the composite AFM score already "
+                    "includes height error and improved overall.\n"
+                    if aligned_rmsd_worsened
+                    else ""
+                )
+                + "\n"
+                "Use Save Fit to export the PDB and report.",
+            )
+        except FlexibleFitBackendCanceled:
+            QMessageBox.information(
+                self,
+                "NOLB Flexible Fit",
+                "NOLB fitting canceled. Structure was not changed.",
+            )
+        except FlexibleFitBackendError as exc:
+            QMessageBox.critical(self, "NOLB Flexible Fit", str(exc))
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "NOLB Flexible Fit",
+                f"NOLB fitting failed:\n{exc}",
+            )
+        finally:
+            if getattr(self, "_flex_fit_live_preview", None) is not None:
+                self._finish_flexible_fit_live_preview(restore=True)
+            progress.close()
+            QApplication.restoreOverrideCursor()
+
     def _format_flexible_fit_report(self, result):
+        if result.get("fit_model") == "afmfit":
+            return self._format_afmfit_flexible_fit_report(result)
+        if result.get("fit_model") == "nolb":
+            return self._format_nolb_flexible_fit_report(result)
+        if result.get("fit_model") == "nmff":
+            return self._format_nmff_flexible_fit_report(result)
+        if result.get("fit_model") == "nma":
+            return self._format_nma_flexible_fit_report(result)
         before = result.get("before", {}) or {}
         after = result.get("after", {}) or {}
         domain_params = result.get("domain_params", []) or []
         domain_ids = np.asarray(result.get("domain_ids", []), dtype=int)
         domains = [int(d) for d in np.unique(domain_ids) if int(d) >= 0]
-        dof = 6 * len(domains)
+        anchor_domain = result.get("anchor_domain", None)
+        fitted_domains = [domain for domain in domains if domain != anchor_domain]
+        dof = 6 * len(fitted_domains)
         before_rmsd = before.get("rmsd")
         after_rmsd = after.get("rmsd")
         improvement = None
@@ -8614,10 +15225,20 @@ class pyNuD_simulator(QMainWindow):
             f"Real AFM: {getattr(self, 'real_asd_path', '') or '(current frame)'}",
             f"Profile: {result.get('profile', '-')}",
             f"Domains: {len(domains)}",
+            f"Anchor domain: {int(anchor_domain) + 1 if anchor_domain is not None else '-'}",
+            f"Domain connectivity: "
+            f"{'keep connected' if result.get('keep_domains_connected', True) else 'allow separate'}",
+            f"Search limits: rot±{result.get('max_rot_deg', '-')} deg, "
+            f"trans±{result.get('max_trans_nm', '-')} nm, "
+            f"stretch≤{result.get('max_stretch_nm', '-')} nm",
             f"Fitted DOF: {dof} (global pose fixed after Estimate Pose)",
             f"Evaluations: {int(result.get('eval_count', 0))}",
             "",
             "Metrics",
+            f"  Composite AFM score before: "
+            f"{before.get('pose_score', '-')}",
+            f"  Composite AFM score after : "
+            f"{after.get('pose_score', '-')}",
             f"  RMSD before: {before_rmsd if before_rmsd is not None else '-'} nm",
             f"  RMSD after : {after_rmsd if after_rmsd is not None else '-'} nm",
             f"  ZNCC before: {before.get('zncc', '-')}",
@@ -8636,6 +15257,7 @@ class pyNuD_simulator(QMainWindow):
             lines.append(
                 f"  Domain {domain + 1}: atoms={n_atoms}, angle={angle_deg:.3f} deg, "
                 f"rotvec_deg={np.degrees(rotvec).tolist()}, trans_nm={trans.tolist()}"
+                + (" (fixed anchor)" if domain == anchor_domain else "")
             )
         lines.extend([
             "",
@@ -8645,13 +15267,383 @@ class pyNuD_simulator(QMainWindow):
         ])
         return "\n".join(lines) + "\n"
 
-    def _write_current_structure_pdb(self, path):
+    def _format_afmfit_flexible_fit_report(self, result):
+        before = result.get("before", {}) or {}
+        after = result.get("after", {}) or {}
+        settings = result.get("settings", {}) or {}
+        environment = result.get("environment", {}) or {}
+        metadata = result.get("afmfit_metadata", {}) or {}
+        image_metadata = metadata.get("image", {}) or {}
+        before_rmsd = before.get("rmsd")
+        after_rmsd = after.get("rmsd")
+        improvement = None
+        if before_rmsd is not None and after_rmsd is not None:
+            improvement = float(before_rmsd) - float(after_rmsd)
+        command = result.get("afmfit_command", []) or []
+        command_text = " ".join(str(value) for value in command)
+        output_lines = [
+            re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line).strip()
+            for line in str(result.get("afmfit_output", "")).splitlines()
+            if line.strip()
+        ]
+
+        lines = [
+            "AFM Simulator Official AFMfit Flexible Fit Report",
+            f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Real AFM: "
+            f"{getattr(self, 'real_asd_path', '') or '(current frame)'}",
+            "Conformational engine: official external AFMfit",
+            f"AFMfit version: {environment.get('afmfit_version', '-')}",
+            f"AFMfit Python: {settings.get('python_executable', '-')}",
+            f"AFMfit package: {environment.get('afmfit_path', '-')}",
+            f"Bundled NOLB used by AFMfit: "
+            f"{environment.get('nolb_path', '-')}",
+            f"External license: {environment.get('license', 'GPL-3.0-or-later')}",
+            f"Platform: {environment.get('platform', '-')}",
+            "Fit scope: current Real AFM frame/ROI",
+            f"CPU cores: {settings.get('n_cpu', '-')}",
+            f"Nonlinear modes: {settings.get('nmodes', '-')}",
+            f"NMA cutoff: {settings.get('cutoff_angstrom', '-')} Å",
+            f"AFMfit sigma: {settings.get('sigma_angstrom', '-')} Å",
+            f"Angular sampling: "
+            f"{settings.get('angular_distance_deg', '-')} deg",
+            f"Local rigid-angle limit: "
+            f"{settings.get('rigid_angle_limit_deg', '-')} deg",
+            f"Z-shift range: "
+            f"{settings.get('z_shift_range_angstrom', '-')} Å",
+            f"Z-shift samples: {settings.get('z_shift_points', '-')}",
+            f"Best rigid views: {settings.get('n_best_views', '-')}",
+            f"View separation: "
+            f"{settings.get('view_separation_deg', '-')} deg",
+            f"Flexible iterations: {settings.get('iterations', '-')}",
+            f"Regularization lambda: "
+            f"{settings.get('regularization_lambda', '-')}",
+            f"Preview max resolution: "
+            f"{settings.get('preview_max_px', '-')} px",
+            f"Prepared AFMfit image: "
+            f"{image_metadata.get('fit_shape', '-')} px, "
+            f"{image_metadata.get('pixel_size_angstrom', '-')} Å/px",
+            f"PDB-safe RMSD limit: "
+            f"{settings.get('max_rmsd_angstrom', '-')} Å",
+            f"Automatic safe RMSD: "
+            f"{bool(settings.get('auto_safe_rmsd', False))}",
+            f"Runtime limit: {settings.get('timeout_seconds', '-')} s",
+            f"AFMfit elapsed time: "
+            f"{float(result.get('afmfit_elapsed_seconds', 0.0)):.3f} s",
+            f"Selected structural RMS displacement: "
+            f"{float(result.get('fitted_rms_displacement_nm', 0.0)):.6g} nm",
+            f"99th-percentile displacement: "
+            f"{float(result.get('peak_displacement_nm', 0.0)):.6g} nm",
+            "",
+            "Official AFMfit metrics",
+            f"  Rigid score: {metadata.get('rigid_score', '-')}",
+            f"  Flexible score: {metadata.get('flexible_score', '-')}",
+            f"  Structural RMSD: "
+            f"{metadata.get('afmfit_structural_rmsd_angstrom', '-')} Å",
+            "",
+            "Independent pyNuD full-resolution metrics",
+            f"  RMSD before: "
+            f"{before_rmsd if before_rmsd is not None else '-'} nm",
+            f"  RMSD after : "
+            f"{after_rmsd if after_rmsd is not None else '-'} nm",
+            f"  ZNCC before: {before.get('zncc', '-')}",
+            f"  ZNCC after : {after.get('zncc', '-')}",
+            f"  Pose score before: {before.get('pose_score', '-')}",
+            f"  Pose score after : {after.get('pose_score', '-')}",
+        ]
+        if improvement is not None:
+            lines.append(f"  RMSD improvement: {improvement:.6g} nm")
+        if command_text:
+            lines.extend(["", "AFMfit Command", f"  {command_text}"])
+        if output_lines:
+            lines.extend([
+                "",
+                "AFMfit Log Tail",
+                *[f"  {line}" for line in output_lines[-40:]],
+            ])
+        lines.extend([
+            "",
+            "Scientific note",
+            "  AFMfit is run in a separately installed Python environment; "
+            "AFMfit itself is not distributed with pyNuD Simulator.",
+            "  pyNuD removes AFMfit's global rigid motion with Kabsch alignment "
+            "and retains the Estimate Pose orientation.",
+            "  The fitted PDB is accepted only if it passes pyNuD displacement "
+            "and new-heavy-atom-clash checks and improves the independent "
+            "full-resolution AFM score.",
+            "  This integration fits the current frame/ROI only. The selected "
+            "conformation is not proof of a unique three-dimensional state.",
+        ])
+        return "\n".join(lines) + "\n"
+
+    def _format_nolb_flexible_fit_report(self, result):
+        before = result.get("before", {}) or {}
+        after = result.get("after", {}) or {}
+        settings = result.get("settings", {}) or {}
+        before_rmsd = before.get("rmsd")
+        after_rmsd = after.get("rmsd")
+        improvement = None
+        if before_rmsd is not None and after_rmsd is not None:
+            improvement = float(before_rmsd) - float(after_rmsd)
+        command = result.get("nolb_command", []) or []
+        command_text = " ".join(str(value) for value in command)
+
+        lines = [
+            "AFM Simulator NOLB Flexible Fit Report",
+            f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Real AFM: {getattr(self, 'real_asd_path', '') or '(current frame)'}",
+            "Conformational engine: standalone NOLB nonlinear NMA",
+            f"NOLB executable: {settings.get('binary_path', '-')}",
+            f"Generated structures: {int(result.get('candidate_count', 0))}",
+            f"Structurally valid structures: "
+            f"{int(result.get('valid_candidate_count', 0))}",
+            f"Rejected for displacement: "
+            f"{int(result.get('rejected_displacement_count', 0))}",
+            f"Rejected for atomic clash: "
+            f"{int(result.get('rejected_clash_count', 0))}",
+            f"Maximum ensemble RMSD: {settings.get('max_rmsd_angstrom', '-')} Å",
+            f"PDB-safe RMSD limit: "
+            f"{bool(settings.get('auto_safe_rmsd', False))}",
+            f"Elastic-network cutoff: {settings.get('cutoff_angstrom', '-')} Å",
+            f"NOLB minimization (-m): {bool(settings.get('minimize', False))}",
+            f"NOLB runtime limit: {settings.get('timeout_seconds', '-')} s",
+            f"NOLB elapsed time: "
+            f"{float(result.get('nolb_elapsed_seconds', 0.0)):.3f} s",
+            f"Preview max resolution: {settings.get('preview_max_px', '-')} px",
+            f"Selected structural RMS displacement: "
+            f"{float(result.get('fitted_rms_displacement_nm', 0.0)):.6g} nm",
+            "",
+            "Metrics",
+            f"  Composite AFM score before: "
+            f"{before.get('pose_score', '-')}",
+            f"  Composite AFM score after : "
+            f"{after.get('pose_score', '-')}",
+            f"  RMSD before: {before_rmsd if before_rmsd is not None else '-'} nm",
+            f"  RMSD after : {after_rmsd if after_rmsd is not None else '-'} nm",
+            f"  ZNCC before: {before.get('zncc', '-')}",
+            f"  ZNCC after : {after.get('zncc', '-')}",
+        ]
+        if improvement is not None:
+            lines.append(f"  RMSD improvement: {improvement:.6g} nm")
+        if command_text:
+            lines.extend(["", "NOLB Command", f"  {command_text}"])
+        lines.extend([
+            "",
+            "Scientific note",
+            "  NOLB generates physically smoother nonlinear normal-mode "
+            "conformations; pyNuD ranks them using simulated AFM topography.",
+            "  Candidates with excessive RMS/peak displacement or a new "
+            "severe heavy-atom clash are rejected before AFM scoring.",
+            "  Final selection uses the composite AFM score, which already "
+            "combines correlation and normalized height error. Aligned RMSD "
+            "is reported as a diagnostic rather than applied as a duplicate "
+            "hard veto.",
+            "  Global rigid pose is removed from every NOLB candidate with "
+            "Kabsch alignment and remains fixed from Estimate Pose.",
+            "  The selected conformation is an AFM-supported candidate, not "
+            "proof of a unique three-dimensional molecular state.",
+            "  NOLB is separate academic software and is not distributed with "
+            "pyNuD Simulator.",
+        ])
+        return "\n".join(lines) + "\n"
+
+    def _format_nmff_flexible_fit_report(self, result):
+        before = result.get("before", {}) or {}
+        after = result.get("after", {}) or {}
+        settings = result.get("settings", {}) or {}
+        iterations = result.get("iterations", ()) or ()
+        before_rmsd = before.get("rmsd")
+        after_rmsd = after.get("rmsd")
+        improvement = None
+        if before_rmsd is not None and after_rmsd is not None:
+            improvement = float(before_rmsd) - float(after_rmsd)
+
+        lines = [
+            "AFM Simulator Iterative NMFF-AFM Fit Report",
+            f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Real AFM: {getattr(self, 'real_asd_path', '') or '(current frame)'}",
+            "Implementation: independent built-in NMFF-AFM-compatible workflow",
+            f"NMA engine: {result.get('nma_method', '-')}",
+            f"Atom selection: {settings.get('atom_selection', '-')}",
+            f"Elastic-network cutoff: {settings.get('cutoff_angstrom', '-')} Å",
+            f"Mode range: {settings.get('first_mode', '-')} through "
+            f"{int(settings.get('first_mode', 1)) + int(settings.get('n_modes', 0)) - 1}",
+            f"Step amplitude Q: {settings.get('step_amplitude_nm', '-')} nm RMS",
+            f"Accepted iterations: {len(iterations)}",
+            f"AFM evaluations: {int(result.get('eval_count', 0))}",
+            f"Clash-rejected candidates: "
+            f"{int(result.get('rejected_clash_candidate_count', 0))}",
+            f"Stop reason: {result.get('stop_reason', '-')}",
+            f"RMS structural displacement: "
+            f"{float(result.get('fitted_rms_displacement_nm', 0.0)):.6g} nm",
+            f"Configured RMS limit: {result.get('max_total_rms_nm', '-')} nm",
+            f"Preview ZNCC: {result.get('preview_initial_zncc', '-')} -> "
+            f"{result.get('preview_final_zncc', '-')}",
+            "",
+            "Full-resolution metrics",
+            f"  RMSD before: {before_rmsd if before_rmsd is not None else '-'} nm",
+            f"  RMSD after : {after_rmsd if after_rmsd is not None else '-'} nm",
+            f"  ZNCC before: {before.get('zncc', '-')}",
+            f"  ZNCC after : {after.get('zncc', '-')}",
+        ]
+        if improvement is not None:
+            lines.append(f"  RMSD improvement: {improvement:.6g} nm")
+
+        lines.extend(["", "Accepted Mode Steps"])
+        for step in iterations:
+            lines.append(
+                f"  Iteration {int(step.iteration)}: "
+                f"mode={int(step.mode_number)}, "
+                f"amplitude={float(step.amplitude_nm):.6g} nm RMS, "
+                f"slope={float(step.slope):.6g}, "
+                f"ZNCC={float(step.correlation_before):.6g} -> "
+                f"{float(step.correlation_after):.6g}, "
+                f"total_RMS={float(step.total_rms_nm):.6g} nm, "
+                f"eigenvalue={float(step.eigenvalue):.6g}, "
+                f"engine={step.nma_method}"
+            )
+
+        lines.extend([
+            "",
+            "Scientific note",
+            "  At every iteration, ANM modes are recalculated from the current "
+            "conformation.",
+            "  Each mode is sampled at -Q, -Q/2, 0, +Q/2, and +Q; the mode and "
+            "direction with the largest Pearson-correlation slope are applied.",
+            "  A candidate that introduces a new severe heavy-atom clash is "
+            "discarded before AFM scoring, so the last accepted conformation "
+            "remains structurally safe.",
+            "  Convergence uses the published 3% exponential-decay concept, "
+            "with configurable patience.",
+            "  Unlike the official implementation, pyNuD uses ANM rather than "
+            "RTB and leaves the six rigid-body modes to Estimate Pose.",
+            "  The fitted conformation is an AFM-supported candidate and is not "
+            "proof of a unique three-dimensional molecular state.",
+        ])
+        return "\n".join(lines) + "\n"
+
+    def _format_nma_flexible_fit_report(self, result):
+        before = result.get("before", {}) or {}
+        after = result.get("after", {}) or {}
+        settings = result.get("settings", {}) or {}
+        amplitudes = np.asarray(
+            result.get("mode_amplitudes_nm", []), dtype=float
+        )
+        eigenvalues = np.asarray(
+            result.get("mode_eigenvalues", []), dtype=float
+        )
+        fitted_mode_numbers = np.asarray(
+            result.get("fitted_mode_numbers", []), dtype=int
+        )
+        before_rmsd = before.get("rmsd")
+        after_rmsd = after.get("rmsd")
+        improvement = None
+        if before_rmsd is not None and after_rmsd is not None:
+            improvement = float(before_rmsd) - float(after_rmsd)
+        fitted_rms = float(result.get("fitted_rms_displacement_nm", 0.0))
+        warning = ""
+        if improvement is not None and improvement < max(
+            0.02, 0.003 * len(amplitudes)
+        ):
+            warning = (
+                "Warning: RMSD improvement is small relative to the fitted "
+                "mode count; inspect for overfitting."
+            )
+
+        lines = [
+            "AFM Simulator NMA Flexible Fit Report",
+            f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Real AFM: {getattr(self, 'real_asd_path', '') or '(current frame)'}",
+            f"Profile: {result.get('profile', '-')}",
+            f"NMA engine: {result.get('nma_method', '-')}",
+            f"Atom selection: {settings.get('atom_selection', '-')}",
+            f"PDB-safe automatic settings: "
+            f"{bool(settings.get('auto_estimate', False))}",
+            f"Cutoff distance: {settings.get('cutoff_angstrom', '-')} Å",
+            f"First fitted mode: {settings.get('first_mode', '-')}",
+            f"Fitted modes: {len(amplitudes)}",
+            f"Fitted DOF: {len(amplitudes)} (global pose fixed after Estimate Pose)",
+            f"Max amplitude per mode: {settings.get('max_amplitude_nm', '-')} nm RMS",
+            f"PDB geometry amplitude estimate: "
+            f"{settings.get('pdb_estimated_max_amplitude_nm', '-')} nm RMS",
+            f"Mode-specific safety clamp applied: "
+            f"{bool(settings.get('mode_specific_safety_clamped', False))}",
+            f"RMS structural displacement: {fitted_rms:.6g} nm",
+            f"Configured RMS limit: {result.get('max_total_rms_nm', '-')} nm",
+            f"Preview max resolution: {settings.get('preview_max_px', '-')} px",
+            f"Penalty weights (energy/strain/clash): "
+            f"{settings.get('mode_energy_weight', '-')} / "
+            f"{settings.get('backbone_strain_weight', '-')} / "
+            f"{settings.get('clash_weight', '-')}",
+            f"Evaluations: {int(result.get('eval_count', 0))}",
+            "",
+            "Metrics",
+            f"  RMSD before: {before_rmsd if before_rmsd is not None else '-'} nm",
+            f"  RMSD after : {after_rmsd if after_rmsd is not None else '-'} nm",
+            f"  ZNCC before: {before.get('zncc', '-')}",
+            f"  ZNCC after : {after.get('zncc', '-')}",
+        ]
+        if improvement is not None:
+            lines.append(f"  RMSD improvement: {improvement:.6g} nm")
+        if warning:
+            lines.extend(["", warning])
+        lines.extend(["", "Normal Mode Amplitudes"])
+        for position, amplitude in enumerate(amplitudes):
+            mode_number = (
+                int(fitted_mode_numbers[position])
+                if position < fitted_mode_numbers.size
+                else position + 1
+            )
+            eigenvalue = (
+                float(eigenvalues[position])
+                if position < eigenvalues.size else float("nan")
+            )
+            lines.append(
+                f"  Mode {mode_number}: "
+                f"amplitude={float(amplitude):.6g} nm RMS, "
+                f"eigenvalue={eigenvalue:.6g}"
+            )
+        lines.extend([
+            "",
+            "Scientific note",
+            "  Amplitudes multiply ANM eigenvectors normalized to 1 nm RMS "
+            "C-alpha/P displacement.",
+            "  Harmonic mode-energy, sequential-backbone strain, and total "
+            "displacement penalties constrain the fit.",
+            "  Candidates that introduce a new severe heavy-atom clash are "
+            "rejected during optimization.",
+            "  The fitted conformation is an AFM-supported model, not proof of "
+            "a unique molecular state.",
+        ])
+        return "\n".join(lines) + "\n"
+
+    def _write_current_structure_pdb(
+        self,
+        path,
+        apply_display_rotation=True,
+        coordinates=None,
+    ):
         if getattr(self, "atoms_data", None) is None:
             raise ValueError("No atom data loaded")
         required = ("x", "y", "z", "element", "atom_name", "residue_name", "chain_id", "residue_id")
         if not all(name in self.atoms_data for name in required):
             raise ValueError("Atom data is incomplete")
         n_atoms = len(self.atoms_data["x"])
+        local_coords = (
+            self._current_atom_coords_array()
+            if coordinates is None
+            else np.asarray(coordinates, dtype=float)
+        )
+        if local_coords is None or local_coords.shape != (n_atoms, 3):
+            raise ValueError("Explicit PDB coordinates do not match atom data")
+        if apply_display_rotation:
+            output_coords = self._apply_current_rotation_to_coords(local_coords)
+            coordinate_error = "Failed to apply the current Estimate Pose rotation"
+        else:
+            output_coords = np.asarray(local_coords, dtype=float)
+            coordinate_error = "Failed to obtain the current local coordinates"
+        if output_coords is None or output_coords.shape != (n_atoms, 3):
+            raise ValueError(coordinate_error)
         with open(path, "w", encoding="ascii") as f:
             for i in range(n_atoms):
                 serial = (i % 99999) + 1
@@ -8673,9 +15665,9 @@ class pyNuD_simulator(QMainWindow):
                         b_factor = float(self.atoms_data["b_factor"][i])
                     except Exception:
                         pass
-                x = float(self.atoms_data["x"][i]) * 10.0
-                y = float(self.atoms_data["y"][i]) * 10.0
-                z = float(self.atoms_data["z"][i]) * 10.0
+                x = float(output_coords[i, 0]) * 10.0
+                y = float(output_coords[i, 1]) * 10.0
+                z = float(output_coords[i, 2]) * 10.0
                 f.write(
                     f"ATOM  {serial:5d} {atom_name} {res_name:>3} {chain:1}"
                     f"{residue_id:4d}{icode:1}   "
@@ -8684,9 +15676,281 @@ class pyNuD_simulator(QMainWindow):
                 )
             f.write("END\n")
 
+    def _create_structure_comparison_actors(
+        self,
+        coords,
+        color,
+        opacity,
+    ):
+        """Create C-alpha trace and point actors for a comparison overlay."""
+        arr = np.asarray(coords, dtype=float)
+        n_atoms = len(self.atoms_data["x"])
+        if arr.shape != (n_atoms, 3):
+            raise ValueError("Comparison coordinates do not match atom data.")
+
+        atom_names = np.asarray(
+            self.atoms_data.get("atom_name", [""] * n_atoms)
+        ).astype(str)
+        selected = np.where(np.char.strip(atom_names) == "CA")[0]
+        if selected.size < 2:
+            selected = np.arange(n_atoms, dtype=int)
+
+        points = vtk.vtkPoints()
+        for atom_index in selected:
+            points.InsertNextPoint(*arr[int(atom_index)].tolist())
+
+        polydata = vtk.vtkPolyData()
+        polydata.SetPoints(points)
+        lines = vtk.vtkCellArray()
+        chains = np.asarray(
+            self.atoms_data.get("chain_id", [""] * n_atoms)
+        ).astype(str)
+        residue_ids = np.asarray(
+            self.atoms_data.get("residue_id", np.arange(n_atoms))
+        )
+        for local_index in range(selected.size - 1):
+            left = int(selected[local_index])
+            right = int(selected[local_index + 1])
+            same_chain = str(chains[left]).strip() == str(chains[right]).strip()
+            try:
+                sequential = int(residue_ids[right]) - int(residue_ids[left]) == 1
+            except (TypeError, ValueError):
+                sequential = False
+            if not same_chain or not sequential:
+                continue
+            line = vtk.vtkLine()
+            line.GetPointIds().SetId(0, local_index)
+            line.GetPointIds().SetId(1, local_index + 1)
+            lines.InsertNextCell(line)
+        polydata.SetLines(lines)
+
+        tube = vtk.vtkTubeFilter()
+        tube.SetInputData(polydata)
+        tube.SetRadius(0.035)
+        tube.SetNumberOfSides(10)
+        tube.CappingOn()
+        tube.Update()
+        tube_mapper = vtk.vtkPolyDataMapper()
+        tube_mapper.SetInputConnection(tube.GetOutputPort())
+        tube_mapper.ScalarVisibilityOff()
+        trace_actor = vtk.vtkActor()
+        trace_actor.SetMapper(tube_mapper)
+        trace_actor.GetProperty().SetColor(*color)
+        trace_actor.GetProperty().SetOpacity(float(opacity))
+
+        sphere = vtk.vtkSphereSource()
+        sphere.SetRadius(0.075)
+        sphere.SetPhiResolution(10)
+        sphere.SetThetaResolution(10)
+        glyph = vtk.vtkGlyph3D()
+        glyph.SetInputData(polydata)
+        glyph.SetSourceConnection(sphere.GetOutputPort())
+        glyph.SetScaleModeToDataScalingOff()
+        glyph.Update()
+        point_mapper = vtk.vtkPolyDataMapper()
+        point_mapper.SetInputConnection(glyph.GetOutputPort())
+        point_mapper.ScalarVisibilityOff()
+        point_actor = vtk.vtkActor()
+        point_actor.SetMapper(point_mapper)
+        point_actor.GetProperty().SetColor(*color)
+        point_actor.GetProperty().SetOpacity(float(opacity))
+
+        pipelines = [
+            points,
+            polydata,
+            lines,
+            tube,
+            tube_mapper,
+            sphere,
+            glyph,
+            point_mapper,
+        ]
+        return [trace_actor, point_actor], pipelines
+
+    def show_flexible_fit_structure_comparison(self):
+        """Overlay the loaded Original and accepted best-fit structures."""
+        result = getattr(self, "flexible_fit_result", None) or {}
+        expected_shape = (
+            len(self.atoms_data["x"]),
+            3,
+        ) if getattr(self, "atoms_data", None) is not None else None
+        if expected_shape is None:
+            QMessageBox.information(
+                self,
+                "Compare Structures",
+                "Run and accept a Flexible Fit before comparing structures.",
+            )
+            return
+        try:
+            original = select_flexible_fit_coordinates(
+                result,
+                "original",
+                expected_shape[0],
+            )
+            fitted = select_flexible_fit_coordinates(
+                result,
+                "best_fit",
+                expected_shape[0],
+            )
+        except FlexibleFitBackendError:
+            QMessageBox.information(
+                self,
+                "Compare Structures",
+                "Run and accept a Flexible Fit before comparing structures.",
+            )
+            return
+        session_original = self._session_original_structure_coords(
+            expected_atom_count=expected_shape[0]
+        )
+        if session_original is not None:
+            original = session_original
+
+        original_display = self._apply_current_rotation_to_coords(original)
+        fitted_display = self._apply_current_rotation_to_coords(fitted)
+        if original_display is None or fitted_display is None:
+            QMessageBox.warning(
+                self,
+                "Compare Structures",
+                "Failed to apply the current display orientation.",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Original (loaded) vs Best-fit Structure")
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.resize(960, 720)
+        outer = QVBoxLayout(dialog)
+
+        displacement = fitted - original
+        all_atom_rmsd = float(
+            np.sqrt(np.mean(np.sum(displacement ** 2, axis=1)))
+        )
+        atom_names = np.asarray(
+            self.atoms_data.get("atom_name", [""] * expected_shape[0])
+        ).astype(str)
+        ca_mask = np.char.strip(atom_names) == "CA"
+        ca_rmsd = (
+            float(np.sqrt(np.mean(np.sum(displacement[ca_mask] ** 2, axis=1))))
+            if np.any(ca_mask)
+            else all_atom_rmsd
+        )
+        method_names = {
+            "rigid_domains": "Rigid Domains",
+            "nma": "Linear ANM",
+            "nmff": "Iterative NMFF-AFM",
+            "nolb": "Nonlinear NMA (NOLB)",
+            "afmfit": "Official AFMfit (external)",
+        }
+        method = method_names.get(
+            str(result.get("fit_model", "")),
+            str(result.get("fit_model", "Flexible Fit")),
+        )
+        summary = QLabel(
+            f"Method: {method}    "
+            f"All-atom RMS displacement: {all_atom_rmsd:.4f} nm    "
+            f"Cα RMS displacement: {ca_rmsd:.4f} nm",
+            dialog,
+        )
+        summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        outer.addWidget(summary)
+
+        legend = QHBoxLayout()
+        original_check = QCheckBox("Original (loaded)", dialog)
+        original_check.setChecked(True)
+        original_check.setStyleSheet(
+            "QCheckBox { color: rgb(145, 145, 145); font-weight: bold; }"
+        )
+        fitted_check = QCheckBox("Best-fit structure", dialog)
+        fitted_check.setChecked(True)
+        fitted_check.setStyleSheet(
+            "QCheckBox { color: rgb(20, 205, 235); font-weight: bold; }"
+        )
+        legend.addWidget(original_check)
+        legend.addWidget(fitted_check)
+        legend.addStretch(1)
+        outer.addLayout(legend)
+
+        vtk_widget = QVTKRenderWindowInteractor(dialog)
+        render_window = vtk_widget.GetRenderWindow()
+        if render_window is None:
+            QMessageBox.warning(
+                self,
+                "Compare Structures",
+                "VTK Qt rendering is not available in this environment.",
+            )
+            dialog.deleteLater()
+            return
+        renderer = vtk.vtkRenderer()
+        renderer.SetBackground(0.06, 0.06, 0.09)
+        render_window.AddRenderer(renderer)
+        outer.addWidget(vtk_widget, 1)
+
+        original_actors, original_pipeline = (
+            self._create_structure_comparison_actors(
+                original_display,
+                (0.58, 0.58, 0.58),
+                0.48,
+            )
+        )
+        fitted_actors, fitted_pipeline = self._create_structure_comparison_actors(
+            fitted_display,
+            (0.08, 0.80, 0.92),
+            0.92,
+        )
+        for actor in original_actors + fitted_actors:
+            renderer.AddActor(actor)
+
+        controls = QHBoxLayout()
+        reset_button = QPushButton("Reset View", dialog)
+        close_button = QPushButton("Close", dialog)
+        controls.addStretch(1)
+        controls.addWidget(reset_button)
+        controls.addWidget(close_button)
+        outer.addLayout(controls)
+
+        def set_visibility(actors, visible):
+            for actor in actors:
+                actor.SetVisibility(bool(visible))
+            render_window.Render()
+
+        original_check.toggled.connect(
+            lambda visible: set_visibility(original_actors, visible)
+        )
+        fitted_check.toggled.connect(
+            lambda visible: set_visibility(fitted_actors, visible)
+        )
+        reset_button.clicked.connect(
+            lambda: (renderer.ResetCamera(), render_window.Render())
+        )
+        close_button.clicked.connect(dialog.close)
+
+        interactor = render_window.GetInteractor()
+        if interactor is not None:
+            interactor.SetInteractorStyle(vtk.vtkInteractorStyleTrackballCamera())
+        renderer.ResetCamera()
+        vtk_widget.Initialize()
+        render_window.Render()
+
+        dialog._vtk_widget = vtk_widget
+        dialog._vtk_renderer = renderer
+        dialog._vtk_actors = original_actors + fitted_actors
+        dialog._vtk_pipelines = original_pipeline + fitted_pipeline
+        self.structure_comparison_windows.append(dialog)
+
+        def remove_window_reference():
+            try:
+                self.structure_comparison_windows.remove(dialog)
+            except ValueError:
+                pass
+
+        dialog.destroyed.connect(remove_window_reference)
+        dialog.show()
+
     def save_flexible_fit_outputs(self):
         if not getattr(self, "flexible_fit_result", None):
-            QMessageBox.information(self, "Save Fit", "Run Flexible Fit first.")
+            QMessageBox.information(
+                self, "Save Fit", "Run a Flexible Fit method first."
+            )
             return
         default_id = self.get_active_dataset_id() if hasattr(self, "get_active_dataset_id") else "afm_fit"
         directory = self.last_import_dir if getattr(self, "last_import_dir", "") and os.path.isdir(self.last_import_dir) else ""
@@ -8704,7 +15968,15 @@ class pyNuD_simulator(QMainWindow):
             save_path += ".pdb"
         report_path = str(Path(save_path).with_name(Path(save_path).stem + "_report.txt"))
         try:
-            self._write_current_structure_pdb(save_path)
+            fitted_coordinates = select_flexible_fit_coordinates(
+                self.flexible_fit_result,
+                "best_fit",
+                len(self.atoms_data["x"]),
+            )
+            self._write_current_structure_pdb(
+                save_path,
+                coordinates=fitted_coordinates,
+            )
             with open(report_path, "w", encoding="utf-8") as f:
                 f.write(self.flexible_fit_report_text or self._format_flexible_fit_report(self.flexible_fit_result))
             QMessageBox.information(
@@ -8714,6 +15986,567 @@ class pyNuD_simulator(QMainWindow):
             )
         except Exception as e:
             QMessageBox.critical(self, "Save Fit", f"Failed to save fit outputs:\n{e}")
+
+    def _pose_fit_is_poor(
+        self,
+        rmsd_nm=None,
+        zncc=None,
+        foreground_score=None,
+    ):
+        """Return whether stored pose metrics justify a fresh global search."""
+        try:
+            if foreground_score is not None and float(foreground_score) < 0.30:
+                return True
+        except Exception:
+            pass
+        try:
+            if zncc is not None and float(zncc) < 0.60:
+                return True
+        except Exception:
+            pass
+        try:
+            real = np.asarray(self.real_afm_nm, dtype=float)
+            valid = np.isfinite(real) & (real > -1e8)
+            values = real[valid]
+            if values.size >= 4 and rmsd_nm is not None:
+                dynamic_range = float(
+                    np.percentile(values, 99.0)
+                    - np.percentile(values, 1.0)
+                )
+                return (
+                    dynamic_range > 1e-9
+                    and float(rmsd_nm) > 0.35 * dynamic_range
+                )
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _select_distinct_support_planes(
+        candidates,
+        max_count,
+        min_separation_deg=20.0,
+    ):
+        """Return high-ranking support normals after angular non-max suppression."""
+        ranked = sorted(
+            (candidate for candidate in candidates if isinstance(candidate, dict)),
+            key=lambda candidate: (
+                float(candidate.get(
+                    "support_score_A2",
+                    candidate.get(
+                        "score_geo",
+                        candidate.get("contact_area_A2", 0.0),
+                    ),
+                )),
+                float(candidate.get("contact_area_A2", 0.0)),
+                float(candidate.get("tie_score", 0.0)),
+                float(candidate.get("S_contact", 0.0)),
+                -float(candidate.get("height_norm", np.inf)),
+            ),
+            reverse=True,
+        )
+        selected = []
+        cosine_limit = float(np.cos(np.deg2rad(min_separation_deg)))
+        for candidate in ranked:
+            try:
+                normal = np.asarray(candidate["n"], dtype=float).reshape(3)
+                normal /= max(float(np.linalg.norm(normal)), 1e-12)
+            except Exception:
+                continue
+            if any(
+                float(np.dot(normal, old["n"])) > cosine_limit
+                for old in selected
+            ):
+                continue
+            copied = dict(candidate)
+            copied["n"] = normal
+            selected.append(copied)
+            if len(selected) >= max(1, int(max_count)):
+                break
+        return selected
+
+    @staticmethod
+    def _filter_physically_supported_faces(
+        faces,
+        maximum_height_ratio=1.35,
+        minimum_height_slack_A=5.0,
+    ):
+        """Exclude ranked faces that leave the rigid model markedly lifted."""
+        valid_faces = []
+        for face in faces:
+            if not isinstance(face, dict):
+                continue
+            try:
+                height_A = float(face["height_A"])
+            except Exception:
+                continue
+            if not np.isfinite(height_A) or height_A <= 0.0:
+                continue
+            copied = dict(face)
+            copied["height_A"] = height_A
+            valid_faces.append(copied)
+        if not valid_faces:
+            return []
+
+        minimum_height_A = min(face["height_A"] for face in valid_faces)
+        maximum_height_A = max(
+            minimum_height_A * float(maximum_height_ratio),
+            minimum_height_A + float(minimum_height_slack_A),
+        )
+        physically_supported = [
+            face
+            for face in valid_faces
+            if face["height_A"] <= maximum_height_A + 1e-9
+        ]
+        if physically_supported:
+            return physically_supported
+        return [
+            min(valid_faces, key=lambda face: face["height_A"])
+        ]
+
+    def _rotation_matrix_align_support_normal(self, normal):
+        """Return a rotation that maps one substrate normal onto lab -Z."""
+        normal = np.asarray(normal, dtype=float).reshape(3)
+        normal /= max(float(np.linalg.norm(normal)), 1e-12)
+        target = np.array([0.0, 0.0, -1.0], dtype=float)
+        cross = np.cross(normal, target)
+        cosine = float(np.clip(np.dot(normal, target), -1.0, 1.0))
+        sine = float(np.linalg.norm(cross))
+        if sine < 1e-8:
+            if cosine > 0.0:
+                return np.eye(3, dtype=float)
+            axis = self._make_perp_unit(normal)
+            axis /= max(float(np.linalg.norm(axis)), 1e-12)
+            x, y, z = axis
+            return np.array([
+                [-1.0 + 2.0 * x * x, 2.0 * x * y, 2.0 * x * z],
+                [2.0 * x * y, -1.0 + 2.0 * y * y, 2.0 * y * z],
+                [2.0 * x * z, 2.0 * y * z, -1.0 + 2.0 * z * z],
+            ], dtype=float)
+        vx = np.array([
+            [0.0, -cross[2], cross[1]],
+            [cross[2], 0.0, -cross[0]],
+            [-cross[1], cross[0], 0.0],
+        ], dtype=float)
+        return np.eye(3) + vx + (vx @ vx) * (
+            (1.0 - cosine) / (sine * sine)
+        )
+
+    @staticmethod
+    def _vtk_xyz_euler_from_matrix(rotation_matrix):
+        """Convert a 3x3 matrix to the RotateX/Y/Z convention used by VTK."""
+        from scipy.spatial.transform import Rotation as ScipyRotation
+
+        matrix = np.asarray(rotation_matrix, dtype=float).reshape(3, 3)
+        with np.errstate(all="ignore"):
+            euler = ScipyRotation.from_matrix(matrix).as_euler(
+                "xyz",
+                degrees=True,
+            )
+        return tuple(
+            float((value + 180.0) % 360.0 - 180.0)
+            for value in euler
+        )
+
+    def _ensure_substrate_support_planes_for_estimate_pose(self):
+        """Run Find Initial Plane when Estimate Pose has no contact ranking yet.
+
+        Contact-area ranking is a strong prior for Estimate Pose. If the user
+        has not run Find Initial Plane, do it once here so ranked faces and the
+        substrate-contact objective are available before pose search starts.
+        """
+        if self._prepare_estimate_pose_support_context() is not None:
+            return True
+        if getattr(self, "atoms_data", None) is None:
+            return False
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            QApplication.processEvents()
+            self.handle_find_initial_plane()
+            QApplication.processEvents()
+        finally:
+            QApplication.restoreOverrideCursor()
+        return self._prepare_estimate_pose_support_context() is not None
+
+    def _prepare_estimate_pose_support_context(self):
+        """Build substrate-contact data shared by all Estimate Pose candidates."""
+        if not bool(getattr(self, "pose_support_constraint_active", False)):
+            return None
+        initial = getattr(self, "last_initial_plane_result", None)
+        if not isinstance(initial, dict):
+            return None
+        support_faces = initial.get("support_pose_candidates", None)
+        if not isinstance(support_faces, list) or not support_faces:
+            return None
+
+        atoms = getattr(self, "atoms_data", None)
+        if not isinstance(atoms, dict):
+            return None
+        try:
+            coords_nm = np.column_stack([
+                atoms["x"],
+                atoms["y"],
+                atoms["z"],
+            ]).astype(float)
+        except Exception:
+            return None
+        if coords_nm.ndim != 2 or coords_nm.shape[0] == 0:
+            return None
+
+        surface_indices = np.asarray(
+            initial.get("surface_indices", []),
+            dtype=int,
+        ).reshape(-1)
+        surface_indices = surface_indices[
+            (surface_indices >= 0) & (surface_indices < coords_nm.shape[0])
+        ]
+        if surface_indices.size == 0:
+            return None
+
+        elements = atoms.get("element", None)
+        if elements is None or len(elements) != coords_nm.shape[0]:
+            elements = np.array(["C"] * coords_nm.shape[0])
+        radii_all_A = np.array(
+            [self._vdw_radius_angstrom(element) for element in elements],
+            dtype=float,
+        )
+
+        prepared_faces = []
+        for index, face in enumerate(support_faces):
+            if not isinstance(face, dict):
+                continue
+            try:
+                rotation_matrix = np.asarray(
+                    face["rotation_matrix"],
+                    dtype=float,
+                ).reshape(3, 3)
+                contact_area_A2 = float(face["contact_area_A2"])
+                reference_height_A = float(face["height_A"])
+            except Exception:
+                continue
+            if (
+                not np.all(np.isfinite(rotation_matrix))
+                or not np.isfinite(contact_area_A2)
+                or contact_area_A2 <= 1e-9
+            ):
+                continue
+            prepared_faces.append({
+                "rank": int(face.get("rank", index + 1)),
+                "normal": np.asarray(face.get("normal"), dtype=float),
+                "rotation_matrix": rotation_matrix,
+                "contact_area_A2": contact_area_A2,
+                "height_A": max(reference_height_A, 1e-6),
+                "support_score_A2": float(
+                    face.get("support_score_A2", contact_area_A2)
+                ),
+            })
+        if not prepared_faces:
+            return None
+        ranked_face_count = len(prepared_faces)
+        prepared_faces = self._filter_physically_supported_faces(
+            prepared_faces,
+            maximum_height_ratio=1.35,
+            minimum_height_slack_A=5.0,
+        )
+        if not prepared_faces:
+            return None
+
+        base_matrix = np.eye(3, dtype=float)
+        try:
+            vtk_matrix = self.base_transform.GetMatrix()
+            base_matrix = np.array([
+                [
+                    float(vtk_matrix.GetElement(row, column))
+                    for column in range(3)
+                ]
+                for row in range(3)
+            ], dtype=float)
+        except Exception:
+            pass
+
+        return {
+            "faces": prepared_faces,
+            "ranked_face_count": ranked_face_count,
+            "physically_supported_face_count": len(prepared_faces),
+            "surface_indices": surface_indices,
+            "radii_A": radii_all_A[surface_indices],
+            "delta_contact_A": max(
+                float(initial.get("delta_contact_A", 1.5)),
+                1e-6,
+            ),
+            "projection_grid_A": max(
+                float(initial.get("projection_grid_A", 0.75)),
+                0.1,
+            ),
+            "maximum_contact_area_A2": max(
+                face["contact_area_A2"] for face in prepared_faces
+            ),
+            "maximum_support_score_A2": max(
+                face["support_score_A2"] for face in prepared_faces
+            ),
+            "base_rotation_matrix": base_matrix,
+            "active_face_rank": int(
+                getattr(
+                    self,
+                    "pose_support_active_face_rank",
+                    initial.get("applied_face_rank", 1),
+                )
+            ),
+        }
+
+    def _estimate_pose_support_metrics(
+        self,
+        rotated_coords_nm,
+        support_context,
+        support_face,
+    ):
+        """Measure contact retained relative to one ranked support face."""
+        if not isinstance(support_context, dict) or not isinstance(support_face, dict):
+            return None
+        coords_nm = np.asarray(rotated_coords_nm, dtype=float)
+        indices = np.asarray(
+            support_context.get("surface_indices", []),
+            dtype=int,
+        ).reshape(-1)
+        radii_A = np.asarray(
+            support_context.get("radii_A", []),
+            dtype=float,
+        ).reshape(-1)
+        if (
+            coords_nm.ndim != 2
+            or coords_nm.shape[1] != 3
+            or indices.size == 0
+            or radii_A.size != indices.size
+            or np.any(indices < 0)
+            or np.any(indices >= coords_nm.shape[0])
+        ):
+            return None
+
+        result = self._eval_geo(
+            coords_nm[indices] * 10.0,
+            radii_A,
+            np.array([0.0, 0.0, -1.0], dtype=float),
+            float(support_context["delta_contact_A"]),
+            0.0,
+            float(support_context["projection_grid_A"]),
+        )
+        if not isinstance(result, dict):
+            return None
+        contact_area_A2 = max(
+            0.0,
+            float(result.get("contact_area_A2", 0.0)),
+        )
+        reference_area_A2 = max(
+            float(support_face.get("contact_area_A2", 0.0)),
+            1e-9,
+        )
+        face_support_score_A2 = max(
+            float(support_face.get(
+                "support_score_A2",
+                reference_area_A2,
+            )),
+            1e-9,
+        )
+        maximum_support_score_A2 = max(
+            float(support_context.get(
+                "maximum_support_score_A2",
+                face_support_score_A2,
+            )),
+            1e-9,
+        )
+        height_A = max(float(result.get("height_A", 0.0)), 0.0)
+        reference_height_A = max(
+            float(support_face.get("height_A", height_A)),
+            1e-6,
+        )
+        return {
+            "contact_area_A2": contact_area_A2,
+            "support_ratio": contact_area_A2 / reference_area_A2,
+            "face_quality_ratio": (
+                face_support_score_A2 / maximum_support_score_A2
+            ),
+            "height_A": height_A,
+            "height_ratio": height_A / reference_height_A,
+            "contact_atoms": int(result.get("Nc", 0) or 0),
+        }
+
+    @staticmethod
+    def _substrate_constrained_pose_score(
+        image_score,
+        support_ratio,
+        face_quality_ratio,
+        height_ratio=1.0,
+        *,
+        minimum_support_ratio=0.80,
+        maximum_height_ratio=1.15,
+    ):
+        """Combine image agreement with a strong within-face contact prior.
+
+        Contact retention is treated as a hard-ish constraint: large contact
+        loss or height growth is rejected, and milder losses still outweigh
+        typical image-score gains so the molecule stays flat on the substrate.
+        """
+        try:
+            image_score = float(image_score)
+            support_ratio = float(support_ratio)
+            face_quality_ratio = float(face_quality_ratio)
+            height_ratio = float(height_ratio)
+        except Exception:
+            return -1e9
+        if (
+            not np.isfinite(image_score)
+            or not np.isfinite(support_ratio)
+            or not np.isfinite(face_quality_ratio)
+            or not np.isfinite(height_ratio)
+            or support_ratio < float(minimum_support_ratio)
+            or height_ratio > float(maximum_height_ratio)
+        ):
+            return -1e9
+        retained_contact_penalty = 1.50 * max(0.0, 0.95 - support_ratio)
+        face_rank_penalty = 0.10 * max(0.0, 1.0 - face_quality_ratio)
+        lift_penalty = 1.00 * max(0.0, height_ratio - 1.0)
+        return (
+            image_score
+            - retained_contact_penalty
+            - face_rank_penalty
+            - lift_penalty
+        )
+
+    def _select_estimate_pose_precision(self):
+        """Compact precision dialog for Estimate Pose.
+
+        Returns (selected_level, refine_current, search_mode, refine_kind) or
+        None when canceled. refine_kind is one of:
+          - "preserve_plane": after Find Initial Plane / current rotation only
+          - "local_pose": after a successful Estimate Pose
+          - "global": full coarse seeding
+        """
+        prior_pose = getattr(self, "pose", None)
+        from_initial_plane = bool(
+            getattr(self, "pose_seed_from_initial_plane", False)
+        )
+        has_ranked_support_planes = bool(
+            getattr(self, "pose_support_constraint_active", False)
+            and isinstance(
+                getattr(self, "last_initial_plane_result", None),
+                dict,
+            )
+            and getattr(
+                self,
+                "last_initial_plane_result",
+                {},
+            ).get("support_pose_candidates")
+        )
+        has_prior_pose = (
+            (not from_initial_plane)
+            and isinstance(prior_pose, dict)
+            and prior_pose.get("score") is not None
+            and all(
+                key in prior_pose
+                for key in ("rot_x_deg", "rot_y_deg", "rot_z_deg")
+            )
+        )
+        prior_pose_is_poor = False
+        if has_prior_pose:
+            prior_pose_is_poor = self._pose_fit_is_poor(
+                rmsd_nm=prior_pose.get("rmsd_nm"),
+                zncc=prior_pose.get("zncc"),
+                foreground_score=prior_pose.get("foreground_score"),
+            )
+        if has_prior_pose:
+            refine_label = "Refine current pose"
+            refine_kind_default = "local_pose"
+            refine_hint = (
+                "Fine-tune only in-plane Z rotation and tip XY around the "
+                "current pose. X/Y tilt stays fixed."
+            )
+        elif from_initial_plane:
+            refine_label = "Refine current rotation"
+            refine_kind_default = "preserve_plane"
+            refine_hint = (
+                "Compare the ranked Find Initial Plane contact faces, then "
+                "refine mainly the in-plane angle of the best match."
+            )
+        else:
+            refine_label = "Refine current rotation"
+            refine_kind_default = "preserve_plane"
+            refine_hint = (
+                "Start from the current Rotation XYZ. X/Y stay near the "
+                "current tilt; Z is searched more freely."
+            )
+
+        precision_levels = [
+            f"Medium ({refine_label})",
+            f"High ({refine_label})",
+            "Low (Global search)",
+            "Medium (Global search)",
+            "High (Global search)",
+        ]
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Estimate Pose")
+        dialog.setFixedWidth(420)
+        outer = QVBoxLayout(dialog)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(8)
+
+        title = QLabel("Precision")
+        title.setStyleSheet("font-weight: bold;")
+        outer.addWidget(title)
+
+        hint = QLabel(
+            f"{refine_label}: {refine_hint}\n"
+            + (
+                "Global search: compare the top-ranked substrate-contact "
+                "faces, including an opposite face when it ranks highly.\n"
+                if has_ranked_support_planes
+                else "Global search: explore many seed orientations.\n"
+            )
+            + (
+                "Recommended: Medium Global search is preselected because "
+                "there is no reliable previous pose."
+                if (
+                    (not has_prior_pose and not from_initial_plane)
+                    or prior_pose_is_poor
+                )
+                else "Recommended: refine the current pose/orientation."
+            )
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #444;")
+        outer.addWidget(hint)
+
+        combo = QComboBox(dialog)
+        combo.addItems(precision_levels)
+        use_global_default = (
+            (not has_prior_pose and not from_initial_plane)
+            or prior_pose_is_poor
+        )
+        combo.setCurrentIndex(3 if use_global_default else 0)
+        outer.addWidget(combo)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        outer.addWidget(buttons)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return None
+
+        selected_choice = str(combo.currentText())
+        selected_level = selected_choice.split(" ", 1)[0]
+        refine_current = "(Refine current" in selected_choice
+        if refine_current:
+            search_mode = refine_label
+            refine_kind = refine_kind_default
+        else:
+            search_mode = "Global search"
+            refine_kind = "global"
+        return selected_level, refine_current, search_mode, refine_kind
 
     def estimate_pose_from_real(self):
         """Estimate Rotation XYZ by iteratively re-simulating AFM and maximizing similarity."""
@@ -8734,6 +16567,23 @@ class pyNuD_simulator(QMainWindow):
             if self.is_worker_running(getattr(self, 'sim_worker_silent', None), attr_name='sim_worker_silent'):
                 QMessageBox.information(self, "Pose", "Another simulation is running. Please wait.")
                 return
+
+        # Contact-area ranking is required for a strong substrate prior.
+        # Run Find Initial Plane automatically when it has not been done yet.
+        # Tip Z is display-only; keep it fixed across Find Initial Plane and
+        # the whole Estimate Pose search (XY tip / Rotation may still change).
+        orig_tz = self._get_tip_z_nm()
+        if self._prepare_estimate_pose_support_context() is None:
+            if not self._ensure_substrate_support_planes_for_estimate_pose():
+                self._set_tip_z_nm(orig_tz, update=True)
+                QMessageBox.warning(
+                    self,
+                    "Pose",
+                    "Find Initial Plane could not build substrate-contact "
+                    "faces.\nEstimate Pose needs contact-area ranking first.",
+                )
+                return
+        self._set_tip_z_nm(orig_tz, update=False)
 
         try:
             orig_rx = float(self.rotation_widgets['X']['spin'].value())
@@ -8762,65 +16612,294 @@ class pyNuD_simulator(QMainWindow):
         scan_x_nm, scan_y_nm, nx, ny = meta
         pixel_x_nm = float(scan_x_nm) / max(float(nx), 1.0)
         pixel_y_nm = float(scan_y_nm) / max(float(ny), 1.0)
+        self._ensure_tip_xy_range_for_scan(scan_x_nm, scan_y_nm)
+        self._set_tip_z_nm(orig_tz, update=False)
 
-        # Ask precision level before running iterative search.
-        precision_levels = ["Medium", "Low", "High"]
-        selected_level, ok = QInputDialog.getItem(
-            self,
-            "Estimate Pose",
-            "Precision:",
-            precision_levels,
-            0,
-            False,
-        )
-        if not ok:
+        selected = self._select_estimate_pose_precision()
+        if selected is None:
             return
+        selected_level, refine_current, search_mode, refine_kind = selected
 
         profiles = {
             "Low": {
                 "seed_offsets": [(0.0, 0.0), (30.0, 0.0), (0.0, 30.0)],
                 "z_step": 45.0,
+                "refine_start_count": 2,
                 "refine_steps": (20.0, 10.0, 5.0, 2.0),
                 "xy_refine_steps_px": (8.0, 4.0, 2.0, 1.0),
                 "max_refine_iter": 8,
+                "preserve_plane_z_step": 30.0,
+                "max_tilt_dev_deg": 12.0,
+                "max_pose_dev_deg": 15.0,
+                "max_local_rotation_dev_deg": 4.0,
+                "max_local_shift_px": 2.0,
+                "support_face_count": 3,
+                "preserve_tilt_steps": (6.0, 3.0, 1.5, 0.75),
+                "final_z_steps_deg": (4.0, 2.0, 1.0),
+                "max_final_z_change_deg": 10.0,
             },
             "Medium": {
-                "seed_offsets": [(0.0, 0.0), (45.0, 0.0), (-45.0, 0.0), (0.0, 45.0), (0.0, -45.0)],
+                "seed_offsets": [
+                    (0.0, 0.0),
+                    (45.0, 0.0), (-45.0, 0.0), (90.0, 0.0),
+                    (0.0, 45.0), (0.0, -45.0), (0.0, 90.0),
+                    (45.0, 45.0), (-45.0, 45.0),
+                    (45.0, -45.0), (-45.0, -45.0),
+                ],
                 "z_step": 30.0,
+                "refine_start_count": 4,
                 "refine_steps": (15.0, 8.0, 4.0, 2.0, 1.0),
                 "xy_refine_steps_px": (12.0, 6.0, 3.0, 1.5, 1.0),
                 "max_refine_iter": 16,
+                "preserve_plane_z_step": 20.0,
+                "max_tilt_dev_deg": 18.0,
+                "max_pose_dev_deg": 25.0,
+                "max_local_rotation_dev_deg": 6.0,
+                "max_local_shift_px": 3.0,
+                "support_face_count": 5,
+                "preserve_tilt_steps": (8.0, 4.0, 2.0, 1.0, 0.5),
+                "final_z_steps_deg": (6.0, 3.0, 1.5, 0.5),
+                "max_final_z_change_deg": 15.0,
             },
             "High": {
                 "seed_offsets": [
-                    (0.0, 0.0), (60.0, 0.0), (-60.0, 0.0),
-                    (0.0, 60.0), (0.0, -60.0),
-                    (30.0, 30.0), (-30.0, 30.0), (30.0, -30.0), (-30.0, -30.0),
+                    (0.0, 0.0),
+                    (30.0, 0.0), (-30.0, 0.0), (60.0, 0.0), (-60.0, 0.0),
+                    (90.0, 0.0), (-90.0, 0.0), (135.0, 0.0),
+                    (0.0, 30.0), (0.0, -30.0), (0.0, 60.0), (0.0, -60.0),
+                    (0.0, 90.0), (0.0, -90.0),
+                    (45.0, 45.0), (-45.0, 45.0),
+                    (45.0, -45.0), (-45.0, -45.0),
+                    (90.0, 45.0), (-90.0, 45.0),
+                    (90.0, -45.0), (-90.0, -45.0),
                 ],
                 "z_step": 20.0,
+                "refine_start_count": 8,
                 "refine_steps": (12.0, 6.0, 3.0, 1.5, 0.75, 0.4),
                 "xy_refine_steps_px": (16.0, 8.0, 4.0, 2.0, 1.0, 1.0),
                 "max_refine_iter": 20,
+                "preserve_plane_z_step": 15.0,
+                "max_tilt_dev_deg": 25.0,
+                "max_pose_dev_deg": 35.0,
+                "max_local_rotation_dev_deg": 8.0,
+                "max_local_shift_px": 4.0,
+                "support_face_count": 8,
+                "preserve_tilt_steps": (6.0, 3.0, 1.5, 0.75, 0.4),
+                "final_z_steps_deg": (8.0, 4.0, 2.0, 1.0, 0.4),
+                "max_final_z_change_deg": 20.0,
             },
         }
         cfg = profiles.get(str(selected_level), profiles["Medium"])
+        if refine_current and refine_kind == "local_pose":
+            # Keep the current substrate tilt; only nudge in-plane Z and tip XY.
+            cfg = dict(cfg)
+            cfg["refine_steps"] = (3.0, 1.5, 0.75, 0.4)
+            cfg["xy_refine_steps_px"] = (2.0, 1.0, 0.5, 0.25)
+            cfg["max_refine_iter"] = 10
+            cfg["max_local_rotation_dev_deg"] = 8.0
+            cfg["max_local_shift_px"] = 2.0
+            cfg["final_z_steps_deg"] = (2.0, 1.0, 0.5)
+            cfg["max_final_z_change_deg"] = 8.0
+        support_context = self._prepare_estimate_pose_support_context()
+        substrate_constrained = support_context is not None
+        compare_ranked_faces = bool(
+            substrate_constrained
+            and (
+                refine_kind != "local_pose"
+                or not refine_current
+            )
+        )
+        if substrate_constrained:
+            if compare_ranked_faces:
+                search_mode = (
+                    f"{search_mode} "
+                    f"({support_context['physically_supported_face_count']}/"
+                    f"{support_context['ranked_face_count']} physically "
+                    "supported faces)"
+                )
+            else:
+                search_mode = (
+                    f"{search_mode} (local active substrate face)"
+                )
+        if refine_current and refine_kind == "local_pose":
+            search_mode = (
+                f"{search_mode}; Z±"
+                f"{cfg['max_local_rotation_dev_deg']:.0f} deg / "
+                f"tip±{cfg['max_local_shift_px']:.0f} px "
+                "(X/Y tilt fixed)"
+            )
+        # local_pose must not inherit the preserve-plane full-circle Z coarse
+        # search just because a substrate face is active.
+        preserve_plane = (
+            refine_kind == "preserve_plane"
+            or (
+                substrate_constrained
+                and not (refine_current and refine_kind == "local_pose")
+            )
+        )
+        max_tilt_dev = float(
+            cfg["max_tilt_dev_deg"] if preserve_plane else cfg["max_pose_dev_deg"]
+        )
+        max_z_dev = None if preserve_plane else float(cfg["max_pose_dev_deg"])
+        active_refine_steps = (
+            tuple(cfg["preserve_tilt_steps"])
+            if preserve_plane
+            else tuple(cfg["refine_steps"])
+        )
+        if refine_current and refine_kind == "local_pose":
+            active_refine_steps = tuple(cfg["refine_steps"])
 
         eval_cache = {}
+        support_cache = {}
         eval_count = 0
         best = {
             'rx': orig_rx, 'ry': orig_ry, 'rz': orig_rz,
             'tx': orig_tx, 'ty': orig_ty,
             'score': -1e9, 'dx': 0.0, 'dy': 0.0, 'rmsd': None, 'zncc': None,
+            'foreground_zncc': None, 'foreground_dice': None,
+            'image_score': -1e9, 'support_ratio': None,
+            'face_quality_ratio': None, 'support_face_rank': None,
+            'support_contact_area_A2': None, 'support_height_ratio': None,
         }
         cancel_requested = False
         if allowed_axes.get('Z', True):
             z_coarse = np.arange(-180.0, 180.0 + 1e-9, float(cfg["z_step"]))
         else:
             z_coarse = np.array([orig_rz], dtype=float)
+        if preserve_plane and allowed_axes.get('Z', True):
+            preserve_z_coarse = np.arange(
+                -180.0,
+                180.0 + 1e-9,
+                float(cfg["preserve_plane_z_step"]),
+            )
+        else:
+            preserve_z_coarse = np.array([orig_rz], dtype=float)
+        support_faces = []
+        active_support_face = None
+        if substrate_constrained:
+            all_support_faces = list(support_context["faces"])
+            active_rank = int(support_context["active_face_rank"])
+            active_support_face = next(
+                (
+                    face for face in all_support_faces
+                    if int(face["rank"]) == active_rank
+                ),
+                all_support_faces[0],
+            )
+            if compare_ranked_faces:
+                support_faces = all_support_faces[
+                    :max(1, int(cfg["support_face_count"]))
+                ]
+                if all(
+                    int(face["rank"]) != int(active_support_face["rank"])
+                    for face in support_faces
+                ):
+                    support_faces.append(active_support_face)
+            else:
+                support_faces = [active_support_face]
+
+        from scipy.spatial.transform import Rotation as ScipyRotation
+
+        pose_base_rotation_matrix = np.eye(3, dtype=float)
+        if substrate_constrained:
+            pose_base_rotation_matrix = np.asarray(
+                support_context["base_rotation_matrix"],
+                dtype=float,
+            )
+        else:
+            try:
+                base_vtk_matrix = self.base_transform.GetMatrix()
+                pose_base_rotation_matrix = np.array([
+                    [
+                        float(base_vtk_matrix.GetElement(row, column))
+                        for column in range(3)
+                    ]
+                    for row in range(3)
+                ], dtype=float)
+            except Exception:
+                pass
+        original_local_rotation_matrix = ScipyRotation.from_euler(
+            "xyz",
+            [orig_rx, orig_ry, orig_rz],
+            degrees=True,
+        ).as_matrix()
+        original_absolute_rotation_matrix = (
+            original_local_rotation_matrix @ pose_base_rotation_matrix
+        )
+
+        def support_face_seed_euler(face, inplane_deg):
+            angle = np.deg2rad(float(inplane_deg))
+            cosine = float(np.cos(angle))
+            sine = float(np.sin(angle))
+            lab_z_rotation = np.array([
+                [cosine, -sine, 0.0],
+                [sine, cosine, 0.0],
+                [0.0, 0.0, 1.0],
+            ], dtype=float)
+            absolute_rotation = (
+                lab_z_rotation
+                @ np.asarray(face["rotation_matrix"], dtype=float)
+            )
+            # update_actor_transform composes local * base. Convert each
+            # absolute support orientation into the corresponding local matrix.
+            local_rotation = (
+                absolute_rotation
+                @ pose_base_rotation_matrix.T
+            )
+            return self._vtk_xyz_euler_from_matrix(local_rotation)
+
+        def substrate_lab_axis_candidate(center, axis, delta_deg):
+            """Rotate a support pose about a lab/substrate axis, not an Euler slot."""
+            current_local = ScipyRotation.from_euler(
+                "xyz",
+                [
+                    float(center["rx"]),
+                    float(center["ry"]),
+                    float(center["rz"]),
+                ],
+                degrees=True,
+            ).as_matrix()
+            base_rotation = pose_base_rotation_matrix
+            current_absolute = current_local @ base_rotation
+            axis_key = str(axis).upper()
+            axis_vector = {
+                "X": [1.0, 0.0, 0.0],
+                "Y": [0.0, 1.0, 0.0],
+                "Z": [0.0, 0.0, 1.0],
+            }[axis_key]
+            lab_delta = ScipyRotation.from_rotvec(
+                np.asarray(axis_vector, dtype=float)
+                * np.deg2rad(float(delta_deg))
+            ).as_matrix()
+            candidate_absolute = lab_delta @ current_absolute
+            candidate_local = candidate_absolute @ base_rotation.T
+            return self._vtk_xyz_euler_from_matrix(candidate_local)
+
+        ranked_face_coarse_count = (
+            len(support_faces) * len(preserve_z_coarse) * 2
+            if compare_ranked_faces
+            else 0
+        )
+        coarse_eval_est = (
+            2 + (
+                ranked_face_coarse_count
+                if compare_ranked_faces
+                else (len(preserve_z_coarse) * 2 if preserve_plane else 0)
+            )
+            if refine_current
+            else (
+                ranked_face_coarse_count + 2
+                if compare_ranked_faces
+                else len(cfg["seed_offsets"]) * len(z_coarse) * 2 + 2
+            )
+        )
         max_eval_est = max(
             1,
-            len(cfg["seed_offsets"]) * len(z_coarse) * 2
-            + len(cfg["refine_steps"]) * int(cfg["max_refine_iter"]) * (2 * len(refine_axes) + 4)
+            coarse_eval_est
+            + int(cfg.get("refine_start_count", 4))
+              * len(active_refine_steps)
+              * int(cfg["max_refine_iter"])
+              * (2 * len(refine_axes) + 4)
             + 2,
         )
         progress = QProgressDialog("Estimating pose...", "Cancel", 0, int(max_eval_est), self)
@@ -8856,9 +16935,37 @@ class pyNuD_simulator(QMainWindow):
                 # right/down; decreasing the scan center produces that explicit shift.
                 next_tx = tx - dx * pixel_x_nm
                 next_ty = ty - dy * pixel_y_nm
-                return evaluate(candidate['rx'], candidate['ry'], candidate['rz'], next_tx, next_ty)
+                if refine_current and refine_kind == "local_pose":
+                    max_shift_px = float(cfg["max_local_shift_px"])
+                    next_tx = float(np.clip(
+                        next_tx,
+                        orig_tx - max_shift_px * pixel_x_nm,
+                        orig_tx + max_shift_px * pixel_x_nm,
+                    ))
+                    next_ty = float(np.clip(
+                        next_ty,
+                        orig_ty - max_shift_px * pixel_y_nm,
+                        orig_ty + max_shift_px * pixel_y_nm,
+                    ))
+                return evaluate(
+                    candidate['rx'],
+                    candidate['ry'],
+                    candidate['rz'],
+                    next_tx,
+                    next_ty,
+                    support_face=candidate.get("_support_face"),
+                )
 
-            def evaluate(rx, ry, rz, tx_nm, ty_nm):
+            def evaluate(
+                rx,
+                ry,
+                rz,
+                tx_nm=None,
+                ty_nm=None,
+                *,
+                find_translation=False,
+                support_face=None,
+            ):
                 nonlocal eval_count, cancel_requested
                 if cancel_requested:
                     return None
@@ -8866,42 +16973,126 @@ class pyNuD_simulator(QMainWindow):
                 nrx = self.normalize_angle(rx)
                 nry = self.normalize_angle(ry)
                 nrz = self.normalize_angle(rz)
-                ntx, nty = self._clamp_tip_center_xy_nm(tx_nm, ty_nm)
-                ntx, nty = self._set_tip_center_xy_nm(ntx, nty, update=False)
-                key = (round(nrx, 3), round(nry, 3), round(nrz, 3), round(ntx, 3), round(nty, 3))
-                if key in eval_cache:
-                    return eval_cache[key]
-
+                if substrate_constrained and support_face is None:
+                    support_face = active_support_face
                 ok = self.set_rotation_controls_xyz(
                     nrx, nry, nrz,
                     apply_transform=True,
                     trigger_simulation=False,
                 )
+                rotated_coords = self.get_rotated_atom_coords()
+                if tx_nm is None or ty_nm is None:
+                    model_center = self._model_xy_centroid_nm(
+                        rotated_coords
+                    )
+                    if model_center is None:
+                        tx_nm, ty_nm = orig_tx, orig_ty
+                    else:
+                        tx_nm, ty_nm = model_center
+                ntx, nty = self._clamp_tip_center_xy_nm(tx_nm, ty_nm)
+                ntx, nty = self._set_tip_center_xy_nm(ntx, nty, update=False)
+                support_face_rank = (
+                    int(support_face["rank"])
+                    if isinstance(support_face, dict)
+                    else None
+                )
+                key = (
+                    round(nrx, 3),
+                    round(nry, 3),
+                    round(nrz, 3),
+                    round(ntx, 3),
+                    round(nty, 3),
+                    support_face_rank,
+                )
+                if key in eval_cache:
+                    return eval_cache[key]
+
                 if not ok:
                     result = {
                         'rx': nrx, 'ry': nry, 'rz': nrz, 'tx': ntx, 'ty': nty,
                         'score': -1e9, 'dx': 0.0, 'dy': 0.0, 'rmsd': None, 'zncc': None,
+                        'foreground_zncc': None, 'foreground_dice': None,
+                        'image_score': -1e9, 'support_ratio': None,
+                        'face_quality_ratio': None,
+                        'support_face_rank': support_face_rank,
+                        '_support_face': support_face,
                     }
                     eval_cache[key] = result
                     return result
 
+                support_metrics = None
+                if substrate_constrained:
+                    support_key = (
+                        round(nrx, 3),
+                        round(nry, 3),
+                        round(nrz, 3),
+                        support_face_rank,
+                    )
+                    support_metrics = support_cache.get(support_key)
+                    if support_metrics is None:
+                        support_metrics = self._estimate_pose_support_metrics(
+                            rotated_coords,
+                            support_context,
+                            support_face,
+                        )
+                        support_cache[support_key] = support_metrics
+
                 score_pack = self.simulate_and_score(
-                    self.get_rotated_atom_coords(),
+                    rotated_coords,
                     self.real_afm_nm,
                     meta=meta,
                     tip=None,
                     lowpass=None,
+                    foreground_pose=True,
+                    estimate_foreground_translation=find_translation,
                 )
                 if score_pack is None:
                     result = {
                         'rx': nrx, 'ry': nry, 'rz': nrz, 'tx': ntx, 'ty': nty,
                         'score': -1e9, 'dx': 0.0, 'dy': 0.0, 'rmsd': None, 'zncc': None,
+                        'foreground_zncc': None, 'foreground_dice': None,
+                        'image_score': -1e9,
+                        'support_ratio': (
+                            support_metrics.get("support_ratio")
+                            if isinstance(support_metrics, dict)
+                            else None
+                        ),
+                        'face_quality_ratio': (
+                            support_metrics.get("face_quality_ratio")
+                            if isinstance(support_metrics, dict)
+                            else None
+                        ),
+                        'support_face_rank': support_face_rank,
+                        'support_contact_area_A2': (
+                            support_metrics.get("contact_area_A2")
+                            if isinstance(support_metrics, dict)
+                            else None
+                        ),
+                        '_support_face': support_face,
                     }
                 else:
+                    image_score = score_pack.get(
+                        'pose_score',
+                        score_pack.get('score', -1e9),
+                    )
+                    objective_score = image_score
+                    if substrate_constrained:
+                        if isinstance(support_metrics, dict):
+                            objective_score = (
+                                self._substrate_constrained_pose_score(
+                                    image_score,
+                                    support_metrics.get("support_ratio"),
+                                    support_metrics.get("face_quality_ratio"),
+                                    support_metrics.get("height_ratio", 1.0),
+                                )
+                            )
+                        else:
+                            objective_score = -1e9
                     result = {
                         'rx': nrx, 'ry': nry, 'rz': nrz,
                         'tx': ntx, 'ty': nty,
-                        'score': score_pack.get('score', -1e9),
+                        'score': objective_score,
+                        'image_score': image_score,
                         'dx': score_pack.get('dx', 0.0),
                         'dy': score_pack.get('dy', 0.0),
                         'rmsd': score_pack.get('rmsd'),
@@ -8909,99 +17100,370 @@ class pyNuD_simulator(QMainWindow):
                         'residual_score': score_pack.get('residual_score', -1e9),
                         'residual_rmsd': score_pack.get('residual_rmsd'),
                         'residual_zncc': score_pack.get('residual_zncc'),
+                        'foreground_zncc': score_pack.get('foreground_zncc'),
+                        'foreground_dice': score_pack.get('foreground_dice'),
+                        'support_ratio': (
+                            support_metrics.get("support_ratio")
+                            if isinstance(support_metrics, dict)
+                            else None
+                        ),
+                        'face_quality_ratio': (
+                            support_metrics.get("face_quality_ratio")
+                            if isinstance(support_metrics, dict)
+                            else None
+                        ),
+                        'support_face_rank': support_face_rank,
+                        'support_contact_area_A2': (
+                            support_metrics.get("contact_area_A2")
+                            if isinstance(support_metrics, dict)
+                            else None
+                        ),
+                        'support_height_ratio': (
+                            support_metrics.get("height_ratio")
+                            if isinstance(support_metrics, dict)
+                            else None
+                        ),
+                        '_support_face': support_face,
                     }
                 eval_cache[key] = result
                 eval_count += 1
                 progress.setValue(min(eval_count, int(max_eval_est)))
                 rmsd_text = f"{best['rmsd']:.3f} nm" if best.get('rmsd') is not None else "-"
+                overlap_text = (
+                    f"{100.0 * best['foreground_dice']:.1f}%"
+                    if best.get('foreground_dice') is not None
+                    else "-"
+                )
+                support_text = (
+                    f"{100.0 * best['support_ratio']:.1f}% "
+                    f"(face #{best.get('support_face_rank', '-')})"
+                    if best.get("support_ratio") is not None
+                    else "-"
+                )
                 progress.setLabelText(
-                    f"Estimating pose ({selected_level})...\n"
+                    f"Estimating pose ({selected_level}, {search_mode})...\n"
                     f"Rotation axes: {axes_text}\n"
                     f"XY center: ({best.get('tx', orig_tx):.2f}, {best.get('ty', orig_ty):.2f}) nm\n"
                     f"Evaluations: {eval_count}\n"
-                    f"Best RMSD: {rmsd_text}    Score: {best['score']:.4f}"
+                    f"Best RMSD: {rmsd_text}    Foreground overlap: {overlap_text}\n"
+                    f"Substrate contact retained: {support_text}\n"
+                    f"Foreground pose score: {best['score']:.4f}"
                 )
                 QApplication.processEvents()
                 if progress.wasCanceled():
                     cancel_requested = True
                 return result
 
+            coarse_candidates = []
+
+            def remember_coarse(candidate):
+                if candidate is None:
+                    return
+                coarse_candidates.append(dict(candidate))
+                maybe_update_best(candidate)
+
+            # Global search starts every rotation candidate with the model XY
+            # centroid at the center of the Real AFM image. Translation is then
+            # introduced by molecular-foreground centroids and local XY search.
+            # Refine mode preserves the previously estimated/current placement.
+            if refine_current and not compare_ranked_faces:
+                start_tx, start_ty = orig_tx, orig_ty
+            else:
+                start_tx, start_ty = None, None
+
             # Baseline: current rotation (always evaluated first).
-            base = evaluate(orig_rx, orig_ry, orig_rz, orig_tx, orig_ty)
-            maybe_update_best(base)
-            maybe_update_best(residual_center_candidate(base))
+            base = evaluate(
+                orig_rx,
+                orig_ry,
+                orig_rz,
+                start_tx,
+                start_ty,
+                find_translation=True,
+                support_face=active_support_face,
+            )
+            remember_coarse(base)
+            remember_coarse(residual_center_candidate(base))
 
-            # Stage 1: coarse seeding (global Z scan from several X/Y starts).
-            for off_x, off_y in cfg["seed_offsets"]:
-                if cancel_requested:
-                    break
-                sx = self.normalize_angle(orig_rx + off_x) if allowed_axes.get('X', True) else orig_rx
-                sy = self.normalize_angle(orig_ry + off_y) if allowed_axes.get('Y', True) else orig_ry
-                for zc in z_coarse:
+            def angle_delta(a, b):
+                return abs(self.normalize_angle(float(a) - float(b)))
+
+            def within_refine_bounds(rx, ry, rz):
+                if angle_delta(rx, orig_rx) > max_tilt_dev + 1e-9:
+                    return False
+                if angle_delta(ry, orig_ry) > max_tilt_dev + 1e-9:
+                    return False
+                if max_z_dev is not None and angle_delta(rz, orig_rz) > max_z_dev + 1e-9:
+                    return False
+                return True
+
+            def within_start_tilt_bounds(rx, ry, start_pose):
+                """Limit out-of-plane drift from one ranked-face refine seed."""
+                if angle_delta(rx, start_pose["rx"]) > max_tilt_dev + 1e-9:
+                    return False
+                if angle_delta(ry, start_pose["ry"]) > max_tilt_dev + 1e-9:
+                    return False
+                return True
+
+            def within_local_pose_bounds(rx, ry, rz, tx, ty):
+                """Bound Refine current pose: fixed X/Y tilt, small Z + tip XY."""
+                try:
+                    if angle_delta(rx, orig_rx) > 1e-4:
+                        return False
+                    if angle_delta(ry, orig_ry) > 1e-4:
+                        return False
+                    if angle_delta(rz, orig_rz) > (
+                        float(cfg["max_local_rotation_dev_deg"]) + 1e-9
+                    ):
+                        return False
+                    max_shift_px = float(cfg["max_local_shift_px"])
+                    if abs(float(tx) - orig_tx) > (
+                        max_shift_px * pixel_x_nm + 1e-9
+                    ):
+                        return False
+                    if abs(float(ty) - orig_ty) > (
+                        max_shift_px * pixel_y_nm + 1e-9
+                    ):
+                        return False
+                    return True
+                except Exception:
+                    return False
+
+            # Stage 1:
+            # - Global search: coarse X/Y seeds + Z grid
+            # - Preserve-plane refine (Find Initial Plane): keep X/Y, coarse Z only
+            # - Local pose refine: skip coarse seeding (current pose only)
+            if compare_ranked_faces:
+                for support_face in support_faces:
                     if cancel_requested:
                         break
-                    cand = evaluate(sx, sy, zc, orig_tx, orig_ty)
-                    if cand is None:
-                        break
-                    maybe_update_best(cand)
-                    maybe_update_best(residual_center_candidate(cand))
-
-            # Stage 2: coordinate-descent refinement over Rotation XYZ + XY center.
-            xy_refine_steps = tuple(cfg.get("xy_refine_steps_px", (8.0, 4.0, 2.0, 1.0)))
-            for step_idx, step in enumerate(cfg["refine_steps"]):
-                if cancel_requested:
-                    break
-                xy_step_px = float(xy_refine_steps[min(step_idx, len(xy_refine_steps) - 1)])
-                tx_step_nm = max(0.2, pixel_x_nm * xy_step_px)
-                ty_step_nm = max(0.2, pixel_y_nm * xy_step_px)
-                for _ in range(int(cfg["max_refine_iter"])):
-                    if cancel_requested:
-                        break
-                    center = best
-                    candidates = []
-                    if allowed_axes.get('X', True):
-                        candidates.extend([
-                            (center['rx'] + step, center['ry'], center['rz'], center['tx'], center['ty']),
-                            (center['rx'] - step, center['ry'], center['rz'], center['tx'], center['ty']),
-                        ])
-                    if allowed_axes.get('Y', True):
-                        candidates.extend([
-                            (center['rx'], center['ry'] + step, center['rz'], center['tx'], center['ty']),
-                            (center['rx'], center['ry'] - step, center['rz'], center['tx'], center['ty']),
-                        ])
-                    if allowed_axes.get('Z', True):
-                        candidates.extend([
-                            (center['rx'], center['ry'], center['rz'] + step, center['tx'], center['ty']),
-                            (center['rx'], center['ry'], center['rz'] - step, center['tx'], center['ty']),
-                        ])
-                    candidates.extend([
-                        (center['rx'], center['ry'], center['rz'], center['tx'] + tx_step_nm, center['ty']),
-                        (center['rx'], center['ry'], center['rz'], center['tx'] - tx_step_nm, center['ty']),
-                        (center['rx'], center['ry'], center['rz'], center['tx'], center['ty'] + ty_step_nm),
-                        (center['rx'], center['ry'], center['rz'], center['tx'], center['ty'] - ty_step_nm),
-                    ])
-                    improved = False
-                    for crx, cry, crz, ctx, cty in candidates:
+                    for inplane_angle in preserve_z_coarse:
                         if cancel_requested:
                             break
-                        cand = evaluate(crx, cry, crz, ctx, cty)
+                        seed_rx, seed_ry, seed_rz = (
+                            support_face_seed_euler(
+                                support_face,
+                                inplane_angle,
+                            )
+                        )
+                        if not allowed_axes.get('X', True):
+                            seed_rx = orig_rx
+                        if not allowed_axes.get('Y', True):
+                            seed_ry = orig_ry
+                        if not allowed_axes.get('Z', True):
+                            seed_rz = orig_rz
+                        cand = evaluate(
+                            seed_rx,
+                            seed_ry,
+                            seed_rz,
+                            start_tx,
+                            start_ty,
+                            find_translation=True,
+                            support_face=support_face,
+                        )
                         if cand is None:
                             break
-                        if cand['score'] > (best['score'] + 1e-6):
-                            best = dict(cand)
-                            improved = True
-                    if not improved:
+                        remember_coarse(cand)
+                        remember_coarse(residual_center_candidate(cand))
+            elif not refine_current:
+                for off_x, off_y in cfg["seed_offsets"]:
+                    if cancel_requested:
                         break
+                    sx = self.normalize_angle(orig_rx + off_x) if allowed_axes.get('X', True) else orig_rx
+                    sy = self.normalize_angle(orig_ry + off_y) if allowed_axes.get('Y', True) else orig_ry
+                    for zc in z_coarse:
+                        if cancel_requested:
+                            break
+                        cand = evaluate(
+                            sx,
+                            sy,
+                            zc,
+                            start_tx,
+                            start_ty,
+                            find_translation=True,
+                            support_face=active_support_face,
+                        )
+                        if cand is None:
+                            break
+                        remember_coarse(cand)
+                        remember_coarse(residual_center_candidate(cand))
+            elif (
+                preserve_plane
+                and not (refine_current and refine_kind == "local_pose")
+                and allowed_axes.get('Z', True)
+            ):
+                for zc in preserve_z_coarse:
+                    if cancel_requested:
+                        break
+                    cand = evaluate(
+                        orig_rx,
+                        orig_ry,
+                        float(zc),
+                        start_tx,
+                        start_ty,
+                        find_translation=True,
+                        support_face=active_support_face,
+                    )
+                    if cand is None:
+                        break
+                    remember_coarse(cand)
+                    remember_coarse(residual_center_candidate(cand))
+
+            # Stage 2: refine several distinct coarse solutions for a global
+            # search, or just the current/preserved-plane best for refinement.
+            if refine_current:
+                refine_starts = [dict(best)]
+            else:
+                coarse_candidates.sort(key=lambda item: item.get('score', -1e9), reverse=True)
+                refine_starts = []
+                for candidate in coarse_candidates:
+                    distinct = all(
+                        abs(self.normalize_angle(candidate['rx'] - old['rx'])) >= 8.0
+                        or abs(self.normalize_angle(candidate['ry'] - old['ry'])) >= 8.0
+                        or abs(self.normalize_angle(candidate['rz'] - old['rz'])) >= 8.0
+                        for old in refine_starts
+                    )
+                    if distinct:
+                        refine_starts.append(dict(candidate))
+                    if len(refine_starts) >= int(cfg.get("refine_start_count", 4)):
+                        break
+            if not refine_starts:
+                refine_starts = [dict(best)]
+
+            xy_refine_steps = tuple(cfg.get("xy_refine_steps_px", (8.0, 4.0, 2.0, 1.0)))
+            for start in refine_starts:
+                local_best = dict(start)
+                for step_idx, step in enumerate(active_refine_steps):
+                    if cancel_requested:
+                        break
+                    xy_step_px = float(xy_refine_steps[min(step_idx, len(xy_refine_steps) - 1)])
+                    tx_step_nm = max(0.2, pixel_x_nm * xy_step_px)
+                    ty_step_nm = max(0.2, pixel_y_nm * xy_step_px)
+                    # Preserve-plane refine: keep X/Y steps small relative to Z.
+                    tilt_step = float(step)
+                    z_step_local = (
+                        # Coarse Z spacing must not remain a permanent lower
+                        # bound: Medium previously stopped at 10 degrees and
+                        # could not correct an obviously visible in-plane error.
+                        max(float(step) * 2.0, 0.5)
+                        if preserve_plane else float(step)
+                    )
+                    for _ in range(int(cfg["max_refine_iter"])):
+                        if cancel_requested:
+                            break
+                        center = local_best
+                        candidates = []
+                        def append_rotation_candidate(axis, delta):
+                            # local_pose: keep X/Y Euler fixed and nudge Z only.
+                            use_substrate_lab = (
+                                substrate_constrained
+                                and not (
+                                    refine_current
+                                    and refine_kind == "local_pose"
+                                )
+                            )
+                            if use_substrate_lab:
+                                candidate_rx, candidate_ry, candidate_rz = (
+                                    substrate_lab_axis_candidate(
+                                        center,
+                                        axis,
+                                        delta,
+                                    )
+                                )
+                            else:
+                                candidate_rx = float(center['rx'])
+                                candidate_ry = float(center['ry'])
+                                candidate_rz = float(center['rz'])
+                                if axis == 'X':
+                                    candidate_rx += float(delta)
+                                elif axis == 'Y':
+                                    candidate_ry += float(delta)
+                                else:
+                                    candidate_rz += float(delta)
+                            candidates.append((
+                                candidate_rx,
+                                candidate_ry,
+                                candidate_rz,
+                                center['tx'],
+                                center['ty'],
+                                center.get('_support_face'),
+                            ))
+
+                        if allowed_axes.get('X', True) and not (
+                            refine_current and refine_kind == "local_pose"
+                        ):
+                            append_rotation_candidate('X', tilt_step)
+                            append_rotation_candidate('X', -tilt_step)
+                        if allowed_axes.get('Y', True) and not (
+                            refine_current and refine_kind == "local_pose"
+                        ):
+                            append_rotation_candidate('Y', tilt_step)
+                            append_rotation_candidate('Y', -tilt_step)
+                        if allowed_axes.get('Z', True):
+                            append_rotation_candidate('Z', z_step_local)
+                            append_rotation_candidate('Z', -z_step_local)
+                        candidates.extend([
+                            (center['rx'], center['ry'], center['rz'], center['tx'] + tx_step_nm, center['ty'], center.get('_support_face')),
+                            (center['rx'], center['ry'], center['rz'], center['tx'] - tx_step_nm, center['ty'], center.get('_support_face')),
+                            (center['rx'], center['ry'], center['rz'], center['tx'], center['ty'] + ty_step_nm, center.get('_support_face')),
+                            (center['rx'], center['ry'], center['rz'], center['tx'], center['ty'] - ty_step_nm, center.get('_support_face')),
+                        ])
+                        improved = False
+                        for crx, cry, crz, ctx, cty, candidate_face in candidates:
+                            if cancel_requested:
+                                break
+                            if refine_current and refine_kind == "local_pose":
+                                if not within_local_pose_bounds(
+                                    crx,
+                                    cry,
+                                    crz,
+                                    ctx,
+                                    cty,
+                                ):
+                                    continue
+                            elif substrate_constrained:
+                                # Ranked-face seeds differ from the original
+                                # Euler angles, so bound tilt to each refine
+                                # start instead of disabling the limit.
+                                if not within_start_tilt_bounds(
+                                    crx,
+                                    cry,
+                                    start,
+                                ):
+                                    continue
+                            elif (
+                                refine_current
+                                and not within_refine_bounds(crx, cry, crz)
+                            ):
+                                continue
+                            cand = evaluate(
+                                crx,
+                                cry,
+                                crz,
+                                ctx,
+                                cty,
+                                support_face=candidate_face,
+                            )
+                            if cand is None:
+                                break
+                            if cand['score'] > (local_best['score'] + 1e-6):
+                                local_best = dict(cand)
+                                improved = True
+                            maybe_update_best(cand)
+                        if not improved:
+                            break
+                maybe_update_best(local_best)
 
             if cancel_requested:
                 self.set_rotation_controls_xyz(orig_rx, orig_ry, orig_rz, apply_transform=True, trigger_simulation=False)
-                self._set_tip_center_xy_nm(orig_tx, orig_ty, update=True)
+                self._set_tip_center_xy_nm(orig_tx, orig_ty, update=False)
+                self._set_tip_z_nm(orig_tz, update=True)
                 QMessageBox.information(self, "Pose", "Pose estimation canceled.")
                 return
 
             if best['score'] <= -1e8:
                 self.set_rotation_controls_xyz(orig_rx, orig_ry, orig_rz, apply_transform=True, trigger_simulation=False)
-                self._set_tip_center_xy_nm(orig_tx, orig_ty, update=True)
+                self._set_tip_center_xy_nm(orig_tx, orig_ty, update=False)
+                self._set_tip_z_nm(orig_tz, update=True)
                 QMessageBox.warning(self, "Pose", "Pose estimation failed.")
                 return
 
@@ -9010,7 +17472,9 @@ class pyNuD_simulator(QMainWindow):
                 apply_transform=True,
                 trigger_simulation=False,
             )
-            best_tx, best_ty = self._set_tip_center_xy_nm(best['tx'], best['ty'], update=True)
+            self._ensure_tip_xy_range_for_scan(scan_x_nm, scan_y_nm)
+            best_tx, best_ty = self._set_tip_center_xy_nm(best['tx'], best['ty'], update=False)
+            self._set_tip_z_nm(orig_tz, update=True)
             final_pack = self._simulate_xy_for_real_afm(
                 update_panels=True,
                 store_results=True,
@@ -9019,7 +17483,8 @@ class pyNuD_simulator(QMainWindow):
             )
             if final_pack is None:
                 self.set_rotation_controls_xyz(orig_rx, orig_ry, orig_rz, apply_transform=True, trigger_simulation=False)
-                self._set_tip_center_xy_nm(orig_tx, orig_ty, update=True)
+                self._set_tip_center_xy_nm(orig_tx, orig_ty, update=False)
+                self._set_tip_z_nm(orig_tz, update=True)
                 QMessageBox.warning(self, "Pose", "Failed to generate final simulated image.")
                 return
 
@@ -9031,13 +17496,415 @@ class pyNuD_simulator(QMainWindow):
                 final_meta.get("nx"),
                 final_meta.get("ny"),
             )
-            final_metrics = self._compute_comparison_metrics(self.real_afm_nm, final_sim_for_pose)
-            final_explicit_metrics = self._compute_comparison_metrics(self.real_afm_nm, final_sim_for_pose, dx=0.0, dy=0.0)
+            # Keep substrate-contact scoring and the rotation search exactly as
+            # selected above. Only after the winning physical pose is fixed,
+            # maximize non-wrapping image correlation to remove the remaining
+            # XY translation.
+            final_image_alignment = (
+                self._final_pose_image_correlation_alignment(
+                    self.real_afm_nm,
+                    final_sim_for_pose,
+                )
+            )
+            correlation_applied_dx_px = 0.0
+            correlation_applied_dy_px = 0.0
+            before_image_correlation = -1e9
+            after_image_correlation = -1e9
+            if isinstance(final_image_alignment, dict):
+                correlation_dx_px = float(
+                    final_image_alignment.get("dx_px", 0.0)
+                )
+                correlation_dy_px = float(
+                    final_image_alignment.get("dy_px", 0.0)
+                )
+                before_image_correlation = float(
+                    final_image_alignment.get(
+                        "zero_shift_correlation",
+                        -1e9,
+                    )
+                )
+                after_image_correlation = before_image_correlation
+                if (
+                    abs(correlation_dx_px) >= 0.25
+                    or abs(correlation_dy_px) >= 0.25
+                ):
+                    candidate_tx, candidate_ty = (
+                        self._set_tip_center_xy_nm(
+                            best_tx - correlation_dx_px * pixel_x_nm,
+                            best_ty - correlation_dy_px * pixel_y_nm,
+                            update=True,
+                        )
+                    )
+                    candidate_pack = self._simulate_xy_for_real_afm(
+                        update_panels=False,
+                        store_results=False,
+                        check_busy=False,
+                        show_messages=False,
+                    )
+                    candidate_sim_for_pose = None
+                    candidate_image_alignment = None
+                    if candidate_pack is not None:
+                        candidate_meta = candidate_pack.get("meta") or {}
+                        candidate_sim_for_pose = (
+                            self._sim_map_for_pose_scoring(
+                                candidate_pack.get("raw"),
+                                candidate_meta.get("scan_x_nm"),
+                                candidate_meta.get("scan_y_nm"),
+                                candidate_meta.get("nx"),
+                                candidate_meta.get("ny"),
+                            )
+                        )
+                        candidate_image_alignment = (
+                            self._final_pose_image_correlation_alignment(
+                                self.real_afm_nm,
+                                candidate_sim_for_pose,
+                            )
+                        )
+                    after_image_correlation = (
+                        float(candidate_image_alignment.get(
+                            "zero_shift_correlation",
+                        ))
+                        if isinstance(candidate_image_alignment, dict)
+                        else -1e9
+                    )
+                    if (
+                        candidate_sim_for_pose is not None
+                        and np.isfinite(after_image_correlation)
+                        and after_image_correlation
+                        > before_image_correlation + 1e-4
+                    ):
+                        best_tx = float(candidate_tx)
+                        best_ty = float(candidate_ty)
+                        correlation_applied_dx_px = correlation_dx_px
+                        correlation_applied_dy_px = correlation_dy_px
+                        final_pack = candidate_pack
+                        final_sim_for_pose = candidate_sim_for_pose
+                        stored_final_pack = self._simulate_xy_for_real_afm(
+                            update_panels=True,
+                            store_results=True,
+                            check_busy=False,
+                            show_messages=False,
+                        )
+                        if stored_final_pack is not None:
+                            final_pack = stored_final_pack
+                            final_meta = final_pack.get("meta") or {}
+                            final_sim_for_pose = (
+                                self._sim_map_for_pose_scoring(
+                                    final_pack.get("raw"),
+                                    final_meta.get("scan_x_nm"),
+                                    final_meta.get("scan_y_nm"),
+                                    final_meta.get("nx"),
+                                    final_meta.get("ny"),
+                                )
+                            )
+                    else:
+                        self._set_tip_center_xy_nm(
+                            best_tx,
+                            best_ty,
+                            update=True,
+                        )
+                        after_image_correlation = before_image_correlation
+
+            # Once XY is aligned, refine only the in-plane rotation. For a
+            # substrate-constrained pose this is a laboratory-Z rotation, so
+            # the selected support face and its contact geometry are preserved.
+            final_z_delta_deg = 0.0
+            final_z_correlation_before = after_image_correlation
+            final_z_correlation_after = after_image_correlation
+            if allowed_axes.get("Z", True):
+                z_start = {
+                    "rx": float(best["rx"]),
+                    "ry": float(best["ry"]),
+                    "rz": float(best["rz"]),
+                    "lab_z_delta": 0.0,
+                    "correlation": -1e9,
+                    "alignment": None,
+                }
+                current_z_alignment = (
+                    self._final_pose_image_correlation_alignment(
+                        self.real_afm_nm,
+                        final_sim_for_pose,
+                    )
+                )
+                if isinstance(current_z_alignment, dict):
+                    z_start["correlation"] = float(
+                        current_z_alignment.get("correlation", -1e9)
+                    )
+                    z_start["alignment"] = current_z_alignment
+                    final_z_correlation_before = float(
+                        current_z_alignment.get(
+                            "zero_shift_correlation",
+                            after_image_correlation,
+                        )
+                    )
+                    final_z_correlation_after = (
+                        final_z_correlation_before
+                    )
+
+                def evaluate_final_z_only(center, delta_deg):
+                    cumulative_delta = (
+                        float(center["lab_z_delta"])
+                        + float(delta_deg)
+                    )
+                    if abs(cumulative_delta) > (
+                        float(cfg["max_final_z_change_deg"]) + 1e-9
+                    ):
+                        return None
+                    # local_pose keeps X/Y Euler fixed; lab-Z about the
+                    # substrate can tilt those axes, so use plain Euler Z.
+                    use_substrate_lab = (
+                        substrate_constrained
+                        and not (
+                            refine_current
+                            and refine_kind == "local_pose"
+                        )
+                    )
+                    if use_substrate_lab:
+                        crx, cry, crz = substrate_lab_axis_candidate(
+                            center,
+                            "Z",
+                            delta_deg,
+                        )
+                    else:
+                        crx = float(center["rx"])
+                        cry = float(center["ry"])
+                        crz = self.normalize_angle(
+                            float(center["rz"]) + float(delta_deg)
+                        )
+                    if (
+                        refine_current
+                        and refine_kind == "local_pose"
+                        and not within_local_pose_bounds(
+                            crx,
+                            cry,
+                            crz,
+                            best_tx,
+                            best_ty,
+                        )
+                    ):
+                        return None
+                    self.set_rotation_controls_xyz(
+                        crx,
+                        cry,
+                        crz,
+                        apply_transform=True,
+                        trigger_simulation=False,
+                    )
+                    self._set_tip_center_xy_nm(
+                        best_tx,
+                        best_ty,
+                        update=True,
+                    )
+                    candidate_pack = self._simulate_xy_for_real_afm(
+                        update_panels=False,
+                        store_results=False,
+                        check_busy=False,
+                        show_messages=False,
+                    )
+                    if candidate_pack is None:
+                        return None
+                    candidate_meta = candidate_pack.get("meta") or {}
+                    candidate_sim = self._sim_map_for_pose_scoring(
+                        candidate_pack.get("raw"),
+                        candidate_meta.get("scan_x_nm"),
+                        candidate_meta.get("scan_y_nm"),
+                        candidate_meta.get("nx"),
+                        candidate_meta.get("ny"),
+                    )
+                    candidate_alignment = (
+                        self._final_pose_image_correlation_alignment(
+                            self.real_afm_nm,
+                            candidate_sim,
+                        )
+                    )
+                    if not isinstance(candidate_alignment, dict):
+                        return None
+                    correlation = float(
+                        candidate_alignment.get("correlation", -1e9)
+                    )
+                    if not np.isfinite(correlation):
+                        return None
+                    return {
+                        "rx": float(crx),
+                        "ry": float(cry),
+                        "rz": float(crz),
+                        "lab_z_delta": float(cumulative_delta),
+                        "correlation": correlation,
+                        "alignment": candidate_alignment,
+                    }
+
+                z_best = dict(z_start)
+                if np.isfinite(float(z_best["correlation"])):
+                    for z_step_deg in cfg["final_z_steps_deg"]:
+                        for _ in range(2):
+                            z_candidates = [
+                                evaluate_final_z_only(
+                                    z_best,
+                                    float(z_step_deg),
+                                ),
+                                evaluate_final_z_only(
+                                    z_best,
+                                    -float(z_step_deg),
+                                ),
+                            ]
+                            z_candidates = [
+                                candidate
+                                for candidate in z_candidates
+                                if isinstance(candidate, dict)
+                            ]
+                            if not z_candidates:
+                                break
+                            z_candidate = max(
+                                z_candidates,
+                                key=lambda candidate: float(
+                                    candidate["correlation"]
+                                ),
+                            )
+                            if float(z_candidate["correlation"]) <= (
+                                float(z_best["correlation"]) + 1e-4
+                            ):
+                                break
+                            z_best = dict(z_candidate)
+
+                # Candidate evaluation leaves the controls at the last trial.
+                # Restore the selected Z state before applying its final XY
+                # correlation shift.
+                self.set_rotation_controls_xyz(
+                    z_best["rx"],
+                    z_best["ry"],
+                    z_best["rz"],
+                    apply_transform=True,
+                    trigger_simulation=False,
+                )
+                self._set_tip_center_xy_nm(
+                    best_tx,
+                    best_ty,
+                    update=True,
+                )
+                if (
+                    abs(float(z_best["lab_z_delta"])) >= 0.05
+                    and isinstance(z_best.get("alignment"), dict)
+                ):
+                    z_dx_px = float(
+                        z_best["alignment"].get("dx_px", 0.0)
+                    )
+                    z_dy_px = float(
+                        z_best["alignment"].get("dy_px", 0.0)
+                    )
+                    candidate_tx, candidate_ty = (
+                        self._set_tip_center_xy_nm(
+                            best_tx - z_dx_px * pixel_x_nm,
+                            best_ty - z_dy_px * pixel_y_nm,
+                            update=True,
+                        )
+                    )
+                    z_final_pack = self._simulate_xy_for_real_afm(
+                        update_panels=False,
+                        store_results=False,
+                        check_busy=False,
+                        show_messages=False,
+                    )
+                    z_final_sim = None
+                    z_final_alignment = None
+                    if z_final_pack is not None:
+                        z_final_meta = z_final_pack.get("meta") or {}
+                        z_final_sim = self._sim_map_for_pose_scoring(
+                            z_final_pack.get("raw"),
+                            z_final_meta.get("scan_x_nm"),
+                            z_final_meta.get("scan_y_nm"),
+                            z_final_meta.get("nx"),
+                            z_final_meta.get("ny"),
+                        )
+                        z_final_alignment = (
+                            self._final_pose_image_correlation_alignment(
+                                self.real_afm_nm,
+                                z_final_sim,
+                            )
+                        )
+                    z_zero_shift_correlation = (
+                        float(z_final_alignment.get(
+                            "zero_shift_correlation",
+                            -1e9,
+                        ))
+                        if isinstance(z_final_alignment, dict)
+                        else -1e9
+                    )
+                    if (
+                        z_final_sim is not None
+                        and np.isfinite(z_zero_shift_correlation)
+                        and z_zero_shift_correlation
+                        > final_z_correlation_before + 1e-4
+                    ):
+                        best["rx"] = float(z_best["rx"])
+                        best["ry"] = float(z_best["ry"])
+                        best["rz"] = float(z_best["rz"])
+                        best_tx = float(candidate_tx)
+                        best_ty = float(candidate_ty)
+                        final_z_delta_deg = float(
+                            z_best["lab_z_delta"]
+                        )
+                        final_z_correlation_after = (
+                            z_zero_shift_correlation
+                        )
+                        correlation_applied_dx_px += z_dx_px
+                        correlation_applied_dy_px += z_dy_px
+                        after_image_correlation = (
+                            z_zero_shift_correlation
+                        )
+                        final_pack = z_final_pack
+                        final_sim_for_pose = z_final_sim
+                        stored_final_pack = self._simulate_xy_for_real_afm(
+                            update_panels=True,
+                            store_results=True,
+                            check_busy=False,
+                            show_messages=False,
+                        )
+                        if stored_final_pack is not None:
+                            final_pack = stored_final_pack
+                            final_meta = final_pack.get("meta") or {}
+                            final_sim_for_pose = (
+                                self._sim_map_for_pose_scoring(
+                                    final_pack.get("raw"),
+                                    final_meta.get("scan_x_nm"),
+                                    final_meta.get("scan_y_nm"),
+                                    final_meta.get("nx"),
+                                    final_meta.get("ny"),
+                                )
+                            )
+                    else:
+                        self.set_rotation_controls_xyz(
+                            best["rx"],
+                            best["ry"],
+                            best["rz"],
+                            apply_transform=True,
+                            trigger_simulation=False,
+                        )
+                        self._set_tip_center_xy_nm(
+                            best_tx,
+                            best_ty,
+                            update=True,
+                        )
+
+            final_metrics = self._compute_comparison_metrics(
+                self.real_afm_nm, final_sim_for_pose, dx=0.0, dy=0.0
+            )
+            final_explicit_metrics = dict(final_metrics)
+            final_foreground_metrics = {}
+            try:
+                final_foreground_metrics = self._score_pose_foreground_on_real_grid(
+                    self.real_afm_nm,
+                    final_sim_for_pose,
+                )
+            except Exception:
+                pass
             self.pose = {
                 'theta_deg': 0.0,
-                'dx_px': float(final_metrics['dx']),
-                'dy_px': float(final_metrics['dy']),
+                # XY placement is represented once, by the scan center. Keeping
+                # a second display-only residual made Sim/overlay positions diverge.
+                'dx_px': 0.0,
+                'dy_px': 0.0,
                 'score': float(final_metrics['score']),
+                'estimated': True,
                 'rmsd_nm': final_metrics.get('rmsd'),
                 'zncc': final_metrics.get('zncc'),
                 'mirror_mode': 'none',
@@ -9048,33 +17915,121 @@ class pyNuD_simulator(QMainWindow):
                 'center_y_nm': float(best_ty),
                 'shift_x_nm': float(best_tx - orig_tx),
                 'shift_y_nm': float(best_ty - orig_ty),
+                'final_correlation_dx_px': float(
+                    correlation_applied_dx_px
+                ),
+                'final_correlation_dy_px': float(
+                    correlation_applied_dy_px
+                ),
+                'final_correlation_before': float(
+                    before_image_correlation
+                ),
+                'final_correlation_after': float(
+                    after_image_correlation
+                ),
+                'final_z_delta_deg': float(final_z_delta_deg),
+                'final_z_correlation_before': float(
+                    final_z_correlation_before
+                ),
+                'final_z_correlation_after': float(
+                    final_z_correlation_after
+                ),
                 'explicit_rmsd_nm': final_explicit_metrics.get('rmsd'),
                 'explicit_zncc': final_explicit_metrics.get('zncc'),
+                'foreground_score': final_foreground_metrics.get('score'),
+                'foreground_zncc': final_foreground_metrics.get(
+                    'foreground_zncc'
+                ),
+                'foreground_dice': final_foreground_metrics.get(
+                    'foreground_dice'
+                ),
+                'centroid_distance_fraction': final_foreground_metrics.get(
+                    'centroid_distance_fraction'
+                ),
                 'rotation_axes': dict(allowed_axes),
+                'search_mode': search_mode,
+                'precision': selected_level,
+                'refine_kind': refine_kind,
+                'objective_score': float(best.get('score', -1e9)),
+                'image_pose_score': best.get('image_score'),
+                'support_face_rank': best.get('support_face_rank'),
+                'support_ratio': best.get('support_ratio'),
+                'support_face_quality_ratio': best.get(
+                    'face_quality_ratio'
+                ),
+                'support_contact_area_A2': best.get(
+                    'support_contact_area_A2'
+                ),
+                'support_height_ratio': best.get('support_height_ratio'),
             }
+            self.pose_seed_from_initial_plane = False
+            if best.get('support_face_rank') is not None:
+                self.pose_support_active_face_rank = int(
+                    best['support_face_rank']
+                )
+            self._store_pose_for_active_structure(self.pose)
 
-            # Pose residual is now known: refresh the difference panel so it reflects
-            # the estimated dx/dy alignment.
+            # The final explicit pose is now known. Redraw both consumers so
+            # Sim Aligned and Difference cannot show different pose generations.
+            try:
+                self._refresh_sim_aligned_panel()
+            except Exception:
+                pass
             try:
                 self._update_difference_panel()
             except Exception:
                 pass
 
+            self._enable_impose_model_after_pose()
+            try:
+                self._ensure_tip_xy_range_for_scan(scan_x_nm, scan_y_nm)
+            except Exception:
+                pass
+            # Estimate Pose only searches Rotation XYZ + tip XY. Tip Z is a
+            # 3D display parameter and must remain at the pre-estimate value.
+            self._set_tip_z_nm(orig_tz, update=True)
+
             final_rmsd = final_metrics.get('rmsd')
             final_zncc = final_metrics.get('zncc')
             rmsd_line = f"RMSD: {final_rmsd:.3f} nm\n" if final_rmsd is not None else ""
             zncc_line = f"ZNCC: {final_zncc:.3f}\n" if final_zncc is not None else ""
+            foreground_dice = final_foreground_metrics.get('foreground_dice')
+            foreground_line = (
+                f"Foreground overlap: {100.0 * foreground_dice:.1f}%\n"
+                if foreground_dice is not None
+                else ""
+            )
+            correlation_line = (
+                "Final image-correlation shift: "
+                f"({correlation_applied_dx_px:+.2f}, "
+                f"{correlation_applied_dy_px:+.2f}) px\n"
+                f"Image correlation: {before_image_correlation:.3f}"
+                f" -> {after_image_correlation:.3f}\n"
+                if before_image_correlation > -1e8
+                else ""
+            )
+            final_z_line = (
+                "Final substrate-Z refinement: "
+                f"{final_z_delta_deg:+.2f} deg\n"
+                f"Z-refinement correlation: "
+                f"{final_z_correlation_before:.3f}"
+                f" -> {final_z_correlation_after:.3f}\n"
+                if final_z_correlation_before > -1e8
+                else ""
+            )
+            support_ratio = best.get('support_ratio')
+            support_line = (
+                f"Substrate face: #{best.get('support_face_rank')}\n"
+                f"Contact retained: {100.0 * support_ratio:.1f}%\n"
+                if support_ratio is not None
+                else ""
+            )
 
-            poor_fit = False
-            try:
-                real_valid = np.isfinite(self.real_afm_nm) & (self.real_afm_nm > -1e8)
-                vals = self.real_afm_nm[real_valid]
-                if vals.size >= 4 and final_rmsd is not None:
-                    dyn = float(np.percentile(vals, 99.0) - np.percentile(vals, 1.0))
-                    if dyn > 1e-9 and final_rmsd > 0.35 * dyn:
-                        poor_fit = True
-            except Exception:
-                pass
+            poor_fit = self._pose_fit_is_poor(
+                rmsd_nm=final_rmsd,
+                zncc=final_zncc,
+                foreground_score=final_foreground_metrics.get('score'),
+            )
 
             QMessageBox.information(
                 self, "Pose Estimated",
@@ -9089,11 +18044,17 @@ class pyNuD_simulator(QMainWindow):
                 f"Residual Dy: {final_metrics['dy']:.2f} px\n"
                 f"{rmsd_line}"
                 f"{zncc_line}"
+                f"{foreground_line}"
+                f"{correlation_line}"
+                f"{final_z_line}"
+                f"{support_line}"
                 f"Evaluations: {eval_count}\n"
                 f"Rotation axes: {axes_text}\n"
-                f"Precision: {selected_level}"
-                + ("\n\nNote: RMSD is still large — try Auto-fit AFM Appearance, "
-                   "limit Pose axes (e.g. Z only), or adjust the initial orientation."
+                f"Precision: {selected_level}\n"
+                f"Search mode: {search_mode}"
+                + ("\n\nNote: the fit is still weak. Left-drag the Real AFM panel "
+                   "to select a tight ROI around one molecule, rerun Medium "
+                   "(Global search), then try Auto-fit Tip Radius + Angle."
                    if poor_fit else "")
             )
         finally:
@@ -9145,16 +18106,11 @@ class pyNuD_simulator(QMainWindow):
         return dict(self.pose_rotation_axes)
 
     def _on_impose_model_toggled(self, checked):
-        """Toggle the model overlay on the Real AFM image."""
+        """Toggle the model overlay without changing pose or scan placement."""
         self.impose_model_enabled = bool(checked)
         if checked:
             if self.atoms_data is None:
                 QMessageBox.information(self, "Impose model", "PDB/structure is not loaded.")
-            else:
-                try:
-                    self.sync_sim_params_to_real()
-                except Exception:
-                    pass
             self._ensure_real_afm_window(show=False)
         timer = getattr(self, '_model_overlay_update_timer', None)
         if timer is not None:
@@ -9163,6 +18119,23 @@ class pyNuD_simulator(QMainWindow):
             except Exception:
                 pass
         self._update_model_overlay(force=True)
+
+    def _enable_impose_model_after_pose(self):
+        """Turn on Impose model after a successful Estimate Pose."""
+        self._ensure_real_afm_window(show=False)
+        check = getattr(self, "impose_model_check", None)
+        if check is not None:
+            try:
+                if not check.isChecked():
+                    check.setChecked(True)
+                    return
+            except RuntimeError:
+                self.impose_model_check = None
+        self.impose_model_enabled = True
+        try:
+            self._update_model_overlay(force=True)
+        except Exception:
+            pass
 
     def _on_impose_opacity_changed(self, value):
         """Update overlay opacity from the slider (10-100 -> 0.1-1.0)."""
@@ -9529,8 +18502,7 @@ class pyNuD_simulator(QMainWindow):
             return None
         if disp_w <= 0 or disp_h <= 0 or scan_x_nm <= 0 or scan_y_nm <= 0:
             return None
-        center_x = self.tip_x_slider.value() / 5.0
-        center_y = self.tip_y_slider.value() / 5.0
+        center_x, center_y = self._get_tip_center_xy_nm()
         return {
             'scan_x_nm': float(scan_x_nm),
             'scan_y_nm': float(scan_y_nm),
@@ -9902,13 +18874,6 @@ class pyNuD_simulator(QMainWindow):
             print("[WARNING] Impose model: scan window metadata is incomplete")
             return None
 
-        self._auto_center_tip_for_impose_if_needed(
-            win['scan_x_nm'], win['scan_y_nm'], win['disp_w'], win['disp_h'],
-        )
-        win = self._impose_scan_window_nm()
-        if win is None:
-            return None
-
         render_w, render_h = self._overlay_render_pixel_size(win)
         center_x = win['center_x']
         center_y = win['center_y']
@@ -9979,7 +18944,9 @@ class pyNuD_simulator(QMainWindow):
         shifted = QImage(w, h, QImage.Format_ARGB32)
         shifted.fill(0)
         p = QPainter(shifted)
-        p.drawImage(int(round(dx)), int(round(dy)), img)
+        # Pixmaps are display-oriented (already flipud'd). Qt +y is down, while
+        # pose dy is defined in pre-flip array space, so invert Y here.
+        p.drawImage(int(round(dx)), int(round(-dy)), img)
         p.end()
         out = QPixmap.fromImage(shifted)
         if out.isNull():
@@ -10040,9 +19007,7 @@ class pyNuD_simulator(QMainWindow):
         if disp_w <= 0 or disp_h <= 0 or scan_x_nm <= 0 or scan_y_nm <= 0:
             return None
 
-        self._auto_center_tip_for_impose_if_needed(scan_x_nm, scan_y_nm, nx, ny)
-        center_x = self.tip_x_slider.value() / 5.0
-        center_y = self.tip_y_slider.value() / 5.0
+        center_x, center_y = self._get_tip_center_xy_nm()
         x_start = center_x - float(scan_x_nm) / 2.0
         y_start = center_y - float(scan_y_nm) / 2.0
 
@@ -10185,9 +19150,15 @@ class pyNuD_simulator(QMainWindow):
             if abs(dx) > 1e-6 or abs(dy) > 1e-6:
                 before = int(np.count_nonzero(rgba[:, :, 3]))
                 shifted = rgba.copy()
+                # rgba is already flipud'd for display. Negate dy so the residual
+                # matches Difference-panel shifting performed before flipud.
                 for ch in range(4):
                     shifted[:, :, ch] = scipy.ndimage.shift(
-                        shifted[:, :, ch], shift=(dy, dx), order=0, mode='constant', cval=0.0,
+                        shifted[:, :, ch],
+                        shift=(-dy, dx),
+                        order=0,
+                        mode='constant',
+                        cval=0.0,
                     )
                 after = int(np.count_nonzero(shifted[:, :, 3]))
                 if after > 0 or before == 0:
@@ -10493,36 +19464,6 @@ class pyNuD_simulator(QMainWindow):
                     except Exception:
                         pass
 
-    def _auto_center_tip_for_impose_if_needed(self, scan_x_nm, scan_y_nm, nx, ny):
-        """Move the scan window onto the molecule when no atoms fall inside it."""
-        rotated = self.get_rotated_atom_coords()
-        if rotated is None or len(rotated) == 0:
-            return
-        try:
-            center_x = self.tip_x_slider.value() / 5.0
-            center_y = self.tip_y_slider.value() / 5.0
-            pixel_x = float(scan_x_nm) / float(max(nx, 1))
-            pixel_y = float(scan_y_nm) / float(max(ny, 1))
-            if pixel_x <= 0 or pixel_y <= 0:
-                return
-            x_start = center_x - float(scan_x_nm) / 2.0
-            y_start = center_y - float(scan_y_nm) / 2.0
-            x = np.asarray(rotated[:, 0], dtype=np.float64)
-            y = np.asarray(rotated[:, 1], dtype=np.float64)
-            ix = np.floor((x - x_start) / pixel_x).astype(np.int32)
-            iy = np.floor((y - y_start) / pixel_y).astype(np.int32)
-            inside = (ix >= 0) & (ix < int(nx)) & (iy >= 0) & (iy < int(ny))
-            if np.any(inside):
-                return
-            cx = float(np.median(x[np.isfinite(x)]))
-            cy = float(np.median(y[np.isfinite(y)]))
-            if hasattr(self, 'tip_x_slider'):
-                self.tip_x_slider.setValue(int(round(cx * 5.0)))
-            if hasattr(self, 'tip_y_slider'):
-                self.tip_y_slider.setValue(int(round(cy * 5.0)))
-        except Exception:
-            pass
-
     def _build_model_overlay_pixmap(self):
         """Build a transparent PNG overlay aligned 1:1 with the Real AFM image pixels."""
         return self._build_model_overlay_png_pixmap()
@@ -10572,8 +19513,7 @@ class pyNuD_simulator(QMainWindow):
                     chain_ids = chain_ids[ca_mask]
                     b_factors = b_factors[ca_mask]
 
-        center_x = self.tip_x_slider.value() / 5.0
-        center_y = self.tip_y_slider.value() / 5.0
+        center_x, center_y = self._get_tip_center_xy_nm()
         pixel_x = scan_x_nm / float(nx)
         pixel_y = scan_y_nm / float(ny)
         if pixel_x <= 0 or pixel_y <= 0:
@@ -10589,28 +19529,6 @@ class pyNuD_simulator(QMainWindow):
             & (ix_sim >= 0) & (ix_sim < nx)
             & (iy_sim >= 0) & (iy_sim < ny)
         )
-        if not np.any(in_sim):
-            # Retry once after centering the scan window on the molecule.
-            try:
-                cx = float(np.median(x[np.isfinite(x)]))
-                cy = float(np.median(y[np.isfinite(y)]))
-                if hasattr(self, 'tip_x_slider'):
-                    self.tip_x_slider.setValue(int(round(cx * 5.0)))
-                if hasattr(self, 'tip_y_slider'):
-                    self.tip_y_slider.setValue(int(round(cy * 5.0)))
-                center_x = cx
-                center_y = cy
-                x_start = center_x - scan_x_nm / 2.0
-                y_start = center_y - scan_y_nm / 2.0
-                ix_sim = np.floor((x - x_start) / pixel_x).astype(np.int32)
-                iy_sim = np.floor((y - y_start) / pixel_y).astype(np.int32)
-                in_sim = (
-                    np.isfinite(z)
-                    & (ix_sim >= 0) & (ix_sim < nx)
-                    & (iy_sim >= 0) & (iy_sim < ny)
-                )
-            except Exception:
-                pass
         if not np.any(in_sim):
             print("[WARNING] Impose model: no atoms inside the AFM scan window")
             return None
@@ -10817,7 +19735,13 @@ class pyNuD_simulator(QMainWindow):
             if abs(dx) > 1e-6 or abs(dy) > 1e-6:
                 try:
                     sim_f = scipy.ndimage.shift(sim_f, shift=(dy, dx), order=1, mode='nearest')
-                    sim_mask = scipy.ndimage.shift(sim_mask, shift=(dy, dx), order=1, mode='nearest')
+                    sim_mask = scipy.ndimage.shift(
+                        sim_mask,
+                        shift=(dy, dx),
+                        order=1,
+                        mode='constant',
+                        cval=0.0,
+                    )
                 except Exception:
                     pass
 
@@ -11011,63 +19935,129 @@ class pyNuD_simulator(QMainWindow):
         win = QWidget(None)
         win.setAttribute(Qt.WA_DeleteOnClose, True)
         win.setWindowTitle("Real AFM (ASD) / Sim Aligned / Difference")
+        win.setMinimumSize(320, 240)
         win.resize(1320, 520)
 
-        outer = QVBoxLayout(win)
+        window_layout = QVBoxLayout(win)
+        window_layout.setContentsMargins(0, 0, 0, 0)
+        window_layout.setSpacing(0)
+
+        scroll_area = QScrollArea(win)
+        scroll_area.setObjectName("REAL_AFM_WindowScrollArea")
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll_area.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        content = QWidget(scroll_area)
+        content.setObjectName("REAL_AFM_WindowContent")
+        content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        outer = QVBoxLayout(content)
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(6)
+        scroll_area.setWidget(content)
+        window_layout.addWidget(scroll_area, 1)
 
         # Optional action row
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
-        label = QLabel("Real AFM and alignment preview")
-        label.setStyleSheet("font-weight: bold; color: #333;")
-        row.addWidget(label)
-        row.addStretch(1)
+        row.setSpacing(6)
         btn_get_sim = QPushButton("Get Simulated image")
         btn_get_sim.clicked.connect(self.get_simulated_image_for_real_afm)
         row.addWidget(btn_get_sim)
-        pose_axis_label = QLabel("Pose axes:")
+
+        pose_axis_controls = QWidget(content)
+        pose_axis_controls.setObjectName("POSE_AxisControls")
+        pose_axis_controls.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        pose_axis_layout = QHBoxLayout(pose_axis_controls)
+        pose_axis_layout.setContentsMargins(0, 0, 0, 0)
+        pose_axis_layout.setSpacing(6)
+        pose_axis_label = QLabel("Pose axes:", pose_axis_controls)
         pose_axis_label.setToolTip("Select structure rotation axes used by Estimate Pose.")
-        row.addWidget(pose_axis_label)
+        pose_axis_layout.addWidget(pose_axis_label)
         self.pose_axis_checks = {}
         axes_state = getattr(self, 'pose_rotation_axes', {'X': True, 'Y': True, 'Z': True})
         for axis in ("X", "Y", "Z"):
-            axis_check = QCheckBox(axis)
+            axis_check = QCheckBox(axis, pose_axis_controls)
+            axis_check.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             axis_check.setChecked(bool(axes_state.get(axis, True)))
             axis_check.setToolTip(f"Allow Estimate Pose to rotate the structure around the {axis} axis.")
             axis_check.toggled.connect(lambda checked, ax=axis: self._set_pose_rotation_axis(ax, checked))
             self.pose_axis_checks[axis] = axis_check
-            row.addWidget(axis_check)
+            pose_axis_layout.addWidget(axis_check)
+        row.addWidget(pose_axis_controls)
         btn_pose = QPushButton("🧭 Estimate Pose")
         btn_pose.clicked.connect(self.estimate_pose_from_real)
         row.addWidget(btn_pose)
-        btn_auto_fit = QPushButton("Auto-fit AFM Appearance")
-        btn_auto_fit.setToolTip("Two-stage fit: probe/low-pass first, then noise/artifacts.")
-        btn_auto_fit.clicked.connect(self.auto_fit_appearance)
+        btn_auto_fit = QPushButton("Auto-fit Tip Radius + Angle")
+        btn_auto_fit.setToolTip(
+            "Fit tip radius and angle after the model pose has been aligned. "
+            "For Paraboloid tips, only radius is fitted because angle does not affect the shape. "
+            "Low-pass and noise settings are not changed."
+        )
+        btn_auto_fit.clicked.connect(self._run_auto_fit_appearance_safely)
         row.addWidget(btn_auto_fit)
 
         # Impose model: overlay the rotated structure on the Real AFM image
         self.impose_model_check = QCheckBox("Impose model")
         self.impose_model_check.setToolTip(
             "Overlay the molecular model (same style/colors as the main 3D view) on the Real AFM image.\n"
-            "メイン画面のモデル構造表示（Style / Color / Size / Opacity）と同じものをReal AFM像の上に重ねます。"
+            "This display-only toggle does not change the pose or scan center.\n"
+            "メイン画面と同じモデルをReal AFM像へ重ねる表示専用機能です。"
+            "モデルの位置・方向・scan centerは変更しません。"
         )
         self.impose_model_check.setChecked(bool(getattr(self, 'impose_model_enabled', False)))
         self.impose_model_check.toggled.connect(self._on_impose_model_toggled)
-        row.addWidget(self.impose_model_check)
 
-        opacity_label = QLabel("Opacity:")
+        overlay_controls = QWidget(content)
+        overlay_controls.setObjectName("REAL_AFM_OverlayControls")
+        overlay_controls.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        overlay_layout = QHBoxLayout(overlay_controls)
+        overlay_layout.setContentsMargins(0, 0, 0, 0)
+        overlay_layout.setSpacing(8)
+        overlay_layout.addWidget(self.impose_model_check)
+        overlay_layout.addSpacing(18)
+
+        opacity_label = QLabel("Opacity:", overlay_controls)
+        opacity_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         opacity_label.setToolTip("Adjust overlay opacity / オーバーレイの不透明度")
-        row.addWidget(opacity_label)
+        overlay_layout.addWidget(opacity_label)
         self.impose_opacity_slider = QSlider(Qt.Horizontal)
         self.impose_opacity_slider.setRange(10, 100)
         self.impose_opacity_slider.setValue(int(getattr(self, 'impose_model_opacity', 0.6) * 100))
         self.impose_opacity_slider.setFixedWidth(90)
         self.impose_opacity_slider.setToolTip("Adjust overlay opacity / オーバーレイの不透明度")
         self.impose_opacity_slider.valueChanged.connect(self._on_impose_opacity_changed)
-        row.addWidget(self.impose_opacity_slider)
+        overlay_layout.addWidget(self.impose_opacity_slider)
+        row.addWidget(overlay_controls)
+        row.addStretch(1)
         outer.addLayout(row)
+
+        roi_row = QHBoxLayout()
+        roi_row.setContentsMargins(0, 0, 0, 0)
+        roi_row.setSpacing(6)
+        roi_title = QLabel("Estimate Pose target:")
+        roi_title.setStyleSheet("font-weight: bold; color: #444;")
+        roi_row.addWidget(roi_title)
+        self.pose_roi_status_label = QLabel()
+        self.pose_roi_status_label.setToolTip(
+            "Estimate Pose target area. Left-drag the Real AFM image to select an ROI."
+        )
+        roi_row.addWidget(self.pose_roi_status_label)
+        self.use_full_image_btn = QPushButton("Use Full Image")
+        self.use_full_image_btn.setToolTip(
+            "Clear the selected ROI and use the complete Real AFM image for "
+            "Estimate Pose and subsequent fitting."
+        )
+        self.use_full_image_btn.clicked.connect(self.clear_real_afm_roi)
+        roi_row.addWidget(self.use_full_image_btn)
+        roi_hint = QLabel("Left-drag image: select ROI   /   Right-click: reset")
+        roi_hint.setStyleSheet("color: #666;")
+        roi_row.addWidget(roi_hint)
+        roi_row.addStretch(1)
+        outer.addLayout(roi_row)
 
         fit_row = QHBoxLayout()
         fit_row.setContentsMargins(0, 0, 0, 0)
@@ -11077,7 +20067,8 @@ class pyNuD_simulator(QMainWindow):
         fit_row.addWidget(fit_label)
         self.detect_domains_btn = QPushButton("Detect Domains")
         self.detect_domains_btn.setToolTip(
-            "Detect ENM domains for Flexible Fit. Run after loading PDB/CIF; use after Estimate Pose for fitting."
+            "Detect hybrid domains from Chain/residue metadata, contact maps, "
+            "geometry, and ENM modes. Inspect Domain colors before Flexible Fit."
         )
         self.detect_domains_btn.clicked.connect(self.detect_domains_from_ui)
         fit_row.addWidget(self.detect_domains_btn)
@@ -11089,43 +20080,200 @@ class pyNuD_simulator(QMainWindow):
         self.domain_auto_check.toggled.connect(self._on_domain_auto_toggled)
         fit_row.addWidget(self.domain_auto_check)
         self.domain_count_slider = QSlider(Qt.Horizontal)
-        self.domain_count_slider.setRange(1, 12)
+        self.domain_count_slider.setRange(1, int(MAX_FLEXIBLE_FIT_DOMAINS))
         self.domain_count_slider.setValue(2)
         self.domain_count_slider.setTracking(False)
         self.domain_count_slider.setFixedWidth(110)
         self.domain_count_spin = QSpinBox()
-        self.domain_count_spin.setRange(1, 12)
+        self.domain_count_spin.setRange(1, int(MAX_FLEXIBLE_FIT_DOMAINS))
         self.domain_count_spin.setValue(2)
-        self.domain_count_spin.setFixedWidth(48)
+        self.domain_count_spin.setFixedWidth(52)
+        self.domain_count_spin.setToolTip(
+            f"Manual domain count (1–{int(MAX_FLEXIBLE_FIT_DOMAINS)}). "
+            "Auto still searches a smaller range for stability."
+        )
         self.domain_count_slider.valueChanged.connect(self.domain_count_spin.setValue)
         self.domain_count_spin.valueChanged.connect(self.domain_count_slider.setValue)
         self.domain_count_spin.valueChanged.connect(self._on_domain_count_changed)
         fit_row.addWidget(self.domain_count_slider)
         fit_row.addWidget(self.domain_count_spin)
+
+        self.domain_split_mode_combo = QComboBox()
+        self.domain_split_mode_combo.addItem("Total", "total")
+        self.domain_split_mode_combo.addItem("N × D/chain", "oligomer")
+        self.domain_split_mode_combo.setFixedWidth(110)
+        self.domain_split_mode_combo.setToolTip(
+            "Total: choose the overall domain count.\n"
+            "N × D/chain: split each monomer/chain into D domains "
+            "(e.g. cadherin trimer 3 × 5 EC domains)."
+        )
+        self.domain_split_mode_combo.currentIndexChanged.connect(
+            self._on_domain_split_mode_changed
+        )
+        fit_row.addWidget(self.domain_split_mode_combo)
+
+        self.domain_use_pdb_chains_check = QCheckBox("PDB chains")
+        self.domain_use_pdb_chains_check.setChecked(True)
+        self.domain_use_pdb_chains_check.setToolTip(
+            "When checked, monomer count N follows polymer Chain IDs in the "
+            "loaded PDB/CIF. Uncheck to set N manually (single-chain models "
+            "can be split into contiguous sequence blocks)."
+        )
+        self.domain_use_pdb_chains_check.toggled.connect(
+            self._on_domain_use_pdb_chains_toggled
+        )
+        fit_row.addWidget(self.domain_use_pdb_chains_check)
+
+        self.domain_oligomer_spin = QSpinBox()
+        self.domain_oligomer_spin.setRange(1, int(MAX_FLEXIBLE_FIT_DOMAINS))
+        self.domain_oligomer_spin.setValue(1)
+        self.domain_oligomer_spin.setFixedWidth(44)
+        self.domain_oligomer_spin.setToolTip(
+            "Number of monomers / chains (N)."
+        )
+        self.domain_times_label = QLabel("×")
+        self.domain_per_monomer_spin = QSpinBox()
+        self.domain_per_monomer_spin.setRange(1, 12)
+        self.domain_per_monomer_spin.setValue(5)
+        self.domain_per_monomer_spin.setFixedWidth(44)
+        self.domain_per_monomer_spin.setToolTip(
+            "Domains per monomer/chain (D), e.g. 5 for classical cadherin EC1–EC5."
+        )
+        self.domain_oligomer_total_label = QLabel("= 5")
+        self.domain_oligomer_total_label.setMinimumWidth(40)
+        self.domain_oligomer_spin.valueChanged.connect(
+            self._on_oligomer_domain_params_changed
+        )
+        self.domain_per_monomer_spin.valueChanged.connect(
+            self._on_oligomer_domain_params_changed
+        )
+        fit_row.addWidget(self.domain_oligomer_spin)
+        fit_row.addWidget(self.domain_times_label)
+        fit_row.addWidget(self.domain_per_monomer_spin)
+        fit_row.addWidget(self.domain_oligomer_total_label)
+        self._sync_oligomer_domain_product(update_total_spin=False)
         self._update_domain_controls_enabled()
-
-        self.domain_preview_check = QCheckBox("Domain colors")
-        self.domain_preview_check.setToolTip("Preview detected ENM domains using Display Settings > Color: By Domain.")
-        self.domain_preview_check.toggled.connect(self._on_domain_preview_toggled)
-        fit_row.addWidget(self.domain_preview_check)
-
-        self.flex_fit_btn = QPushButton("Run Flexible Fit")
-        self.flex_fit_btn.setToolTip("Refine detected domains against the current Real AFM frame after Estimate Pose.")
-        self.flex_fit_btn.clicked.connect(self.run_flexible_fit)
-        fit_row.addWidget(self.flex_fit_btn)
-
-        self.save_flex_fit_btn = QPushButton("Save Fit")
-        self.save_flex_fit_btn.setEnabled(False)
-        self.save_flex_fit_btn.clicked.connect(self.save_flexible_fit_outputs)
-        fit_row.addWidget(self.save_flex_fit_btn)
-        self.domain_status_label = QLabel("Domains: Auto (not detected)")
-        self.domain_status_label.setStyleSheet("color: #555;")
-        self.domain_status_label.setMinimumWidth(180)
-        fit_row.addWidget(self.domain_status_label)
         fit_row.addStretch(1)
         outer.addLayout(fit_row)
 
-        splitter = QSplitter(Qt.Horizontal, win)
+        method_row = QHBoxLayout()
+        method_row.setContentsMargins(0, 0, 0, 0)
+        method_row.setSpacing(6)
+        self.domain_preview_check = QCheckBox("Domain colors")
+        self.domain_preview_check.setToolTip("Preview detected ENM domains using Display Settings > Color: By Domain.")
+        self.domain_preview_check.toggled.connect(self._on_domain_preview_toggled)
+        method_row.addWidget(self.domain_preview_check)
+
+        method_row.addWidget(QLabel("Method:"))
+        self.flex_fit_backend_combo = QComboBox()
+        self.flex_fit_backend_combo.addItem("Rigid Domains (built-in)", "rigid_domains")
+        self.flex_fit_backend_combo.addItem("Linear ANM (built-in)", "nma")
+        self.flex_fit_backend_combo.addItem("Iterative NMFF-AFM (built-in)", "nmff")
+        self.flex_fit_backend_combo.addItem("Nonlinear NMA (NOLB)", "nolb")
+        self.flex_fit_backend_combo.addItem(
+            "Official AFMfit (external)",
+            "afmfit",
+        )
+        self.flex_fit_backend_combo.setFixedWidth(240)
+        self.flex_fit_backend_combo.setToolTip(
+            "Choose the conformational sampling backend. Iterative NMFF-AFM "
+            "recalculates ANM modes after every accepted step; NOLB requires "
+            "the separately downloaded academic executable; Official AFMfit "
+            "runs from a separately installed Python environment."
+        )
+        method_row.addWidget(self.flex_fit_backend_combo)
+
+        self.flex_fit_btn = QPushButton("Run Flexible Fit")
+        self.flex_fit_btn.setToolTip(
+            "Run the selected flexible-fitting backend against the current "
+            "Real AFM frame. Align the model first by Estimate Pose or manually."
+        )
+        self.flex_fit_btn.clicked.connect(self.run_selected_flexible_fit)
+        method_row.addWidget(self.flex_fit_btn)
+        self.nma_flex_fit_btn = None
+
+        self.flex_fit_live_preview_check = QCheckBox(
+            "Live preview best candidate"
+        )
+        self.flex_fit_live_preview_check.setChecked(False)
+        self.flex_fit_live_preview_check.setToolTip(
+            "When enabled, update the 3D model and Sim Aligned whenever the "
+            "current best Flexible Fit candidate improves (preview resolution; "
+            "not the final accepted result). Cancel restores the pre-fit "
+            "structure. Official AFMfit does not support mid-run preview."
+        )
+        method_row.addWidget(self.flex_fit_live_preview_check)
+
+        method_row.addStretch(1)
+        outer.addLayout(method_row)
+
+        # Keep result/structure controls on a separate line. Besides being easier
+        # to scan, this prevents one very wide row from forcing the three image
+        # panels beyond the window viewport.
+        structure_row = QHBoxLayout()
+        structure_row.setContentsMargins(0, 0, 0, 0)
+        structure_row.setSpacing(6)
+        structure_row.addWidget(QLabel("Active structure:"))
+        self.active_fit_structure_combo = QComboBox()
+        self.active_fit_structure_combo.addItem(
+            "Original (loaded)",
+            "original",
+        )
+        self.active_fit_structure_combo.addItem(
+            "Best Fit",
+            "best_fit",
+        )
+        self.active_fit_structure_combo.setFixedWidth(145)
+        self.active_fit_structure_combo.setToolTip(
+            "Select the coordinates used by Estimate Pose, AFM simulation, "
+            "Impose model, and subsequent Flexible Fit runs. "
+            "Original is always the structure as first loaded (not the start "
+            "of the latest Flexible Fit). Manual Rotation XYZ / tip XY edits "
+            "are shared by both structures; each structure keeps its own last "
+            "Estimate Pose result."
+        )
+        self.active_fit_structure_combo.currentIndexChanged.connect(
+            self._on_active_fit_structure_changed
+        )
+        structure_row.addWidget(self.active_fit_structure_combo)
+        self._sync_active_fit_structure_selector()
+
+        self.save_flex_fit_btn = QPushButton("Save Fit")
+        self.save_flex_fit_btn.setEnabled(
+            bool(getattr(self, "flexible_fit_result", None))
+        )
+        self.save_flex_fit_btn.clicked.connect(self.save_flexible_fit_outputs)
+        structure_row.addWidget(self.save_flex_fit_btn)
+        self.compare_flex_fit_btn = QPushButton("Compare Structures")
+        self.compare_flex_fit_btn.setEnabled(
+            bool(getattr(self, "flexible_fit_result", None))
+        )
+        self.compare_flex_fit_btn.setToolTip(
+            "Open a new interactive VTK window overlaying the originally "
+            "loaded structure and the accepted best-fit structure."
+        )
+        self.compare_flex_fit_btn.clicked.connect(
+            self.show_flexible_fit_structure_comparison
+        )
+        structure_row.addWidget(self.compare_flex_fit_btn)
+        self.reset_flex_fit_btn = QPushButton("Reset Fit")
+        self.reset_flex_fit_btn.setEnabled(
+            self._flexible_fit_reset_available()
+        )
+        self.reset_flex_fit_btn.setToolTip(
+            "Restore molecular coordinates to the originally loaded PDB/CIF. "
+            "Rotation XYZ and tip XY are kept. Clears the accepted fit result."
+        )
+        self.reset_flex_fit_btn.clicked.connect(self.reset_flexible_fit)
+        structure_row.addWidget(self.reset_flex_fit_btn)
+        self.domain_status_label = QLabel("Domains: Auto (not detected)")
+        self.domain_status_label.setStyleSheet("color: #555;")
+        self.domain_status_label.setMinimumWidth(180)
+        structure_row.addWidget(self.domain_status_label)
+        structure_row.addStretch(1)
+        outer.addLayout(structure_row)
+
+        splitter = QSplitter(Qt.Horizontal, content)
         splitter.setHandleWidth(6)
 
         real_frame = self.create_afm_image_panel("Real AFM (ASD)")
@@ -11134,6 +20282,12 @@ class pyNuD_simulator(QMainWindow):
         aligned_frame.setObjectName("SIM_ALIGNED_Frame")
         diff_frame = self.create_afm_image_panel("Difference (Real − Sim)")
         diff_frame.setObjectName("DIFF_Frame")
+        for image_frame in (real_frame, aligned_frame, diff_frame):
+            # The pixmap viewer scales during paintEvent. Ignore child size hints
+            # here so the splitter, rather than the source image/control text,
+            # determines the size of all three image panels.
+            image_frame.setMinimumWidth(1)
+            image_frame.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
 
         # Frame slider (ASD can have multiple frames)
         control_row_height = 28
@@ -11247,20 +20401,14 @@ class pyNuD_simulator(QMainWindow):
         splitter.addWidget(real_frame)
         splitter.addWidget(aligned_frame)
         splitter.addWidget(diff_frame)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 1)
         splitter.setSizes([440, 440, 440])
         outer.addWidget(splitter, 1)
 
         def _on_destroyed(*_):
-            self.real_afm_window = None
-            self.real_afm_window_real_frame = None
-            self.real_afm_window_aligned_frame = None
-            self.real_afm_window_diff_frame = None
-            self.real_afm_window_view = None
-            self.real_afm_sim_info_label = None
-            self.real_afm_diff_info_label = None
-            self.pose_axis_checks = {}
-            self.impose_model_check = None
-            self.impose_opacity_slider = None
+            self._clear_real_afm_window_refs()
 
         try:
             win.destroyed.connect(_on_destroyed)
@@ -11268,6 +20416,8 @@ class pyNuD_simulator(QMainWindow):
             pass
 
         self.real_afm_window = win
+        self.real_afm_window_scroll_area = scroll_area
+        self.real_afm_window_content = content
         self.real_afm_window_real_frame = real_frame
         self.real_afm_window_aligned_frame = aligned_frame
         self.real_afm_window_diff_frame = diff_frame
@@ -11277,8 +20427,9 @@ class pyNuD_simulator(QMainWindow):
             self.display_afm_image(self.real_afm_nm, real_frame)
         else:
             self._clear_afm_panel(real_frame)
-        if getattr(self, 'sim_aligned_nm', None) is not None:
-            self.display_afm_image(self.sim_aligned_nm, aligned_frame)
+        display_aligned = self._sim_aligned_display_image()
+        if display_aligned is not None:
+            self.display_afm_image(display_aligned, aligned_frame)
         else:
             self._clear_afm_panel(aligned_frame)
 
@@ -11286,6 +20437,7 @@ class pyNuD_simulator(QMainWindow):
             self._update_real_afm_frame_controls()
         except Exception:
             pass
+        self._update_real_afm_roi_controls()
         try:
             self._update_sim_aligned_info_label()
         except Exception:
@@ -11316,16 +20468,28 @@ class pyNuD_simulator(QMainWindow):
         sigma_line = params.get('line_sigma_nm', 0.0)
         if sigma_line > 0:
             ny = height.shape[0]
-            b = rng.normal(0.0, sigma_line, size=ny)
+            if str(params.get('line_noise_mode', 'offset')) == 'rw':
+                b = np.zeros(ny, dtype=float)
+                b[0] = rng.normal(0.0, sigma_line)
+                for y in range(1, ny):
+                    b[y] = b[y - 1] + rng.normal(0.0, sigma_line * 0.2)
+            else:
+                b = rng.normal(0.0, sigma_line, size=ny)
             height += b[:, None]
 
         drift_vx = params.get('drift_vx_nm_per_line', 0.0)
-        if drift_vx != 0.0:
+        drift_vy = params.get('drift_vy_nm_per_line', 0.0)
+        drift_jitter = params.get('drift_jitter_nm_per_line', 0.0)
+        if drift_vx != 0.0 or drift_vy != 0.0 or drift_jitter != 0.0:
             ny, nx = height.shape
             shifted = np.zeros_like(height)
             for y in range(ny):
-                dx_px = int(round((drift_vx * y) / max(pixel_x_nm, 1e-6)))
-                line = height[y]
+                dx_nm = drift_vx * y + rng.normal(0.0, drift_jitter)
+                dy_nm = drift_vy * y + rng.normal(0.0, drift_jitter)
+                dx_px = int(round(dx_nm / max(pixel_x_nm, 1e-6)))
+                dy_px = int(round(dy_nm / max(pixel_y_nm, 1e-6)))
+                source_y = min(max(y + dy_px, 0), ny - 1)
+                line = height[source_y]
                 if dx_px != 0:
                     line = np.roll(line, dx_px)
                 shifted[y] = line
@@ -11384,7 +20548,833 @@ class pyNuD_simulator(QMainWindow):
 
         return height
 
+    def _run_auto_fit_appearance_safely(self):
+        """Keep an Auto-fit error from escaping the Qt clicked callback."""
+        try:
+            self.auto_fit_appearance()
+        except Exception as exc:
+            traceback.print_exc()
+            try:
+                QApplication.restoreOverrideCursor()
+            except Exception:
+                pass
+            QMessageBox.critical(
+                self,
+                "Auto-fit Tip Radius + Angle",
+                "Auto-fit stopped safely. The Simulator can continue running.\n\n"
+                f"{type(exc).__name__}: {exc}",
+            )
+
     def auto_fit_appearance(self):
+        """Fit tip radius and, where relevant, cone angle in a bounded two-stage search."""
+        if self.real_afm_nm is None:
+            QMessageBox.information(self, "Auto-fit", "Real AFM is not loaded.")
+            return
+
+        if self.is_worker_running(getattr(self, "sim_worker", None), attr_name="sim_worker") or \
+           self.is_worker_running(getattr(self, "sim_worker_high_res", None), attr_name="sim_worker_high_res"):
+            QMessageBox.information(self, "Auto-fit", "Another simulation is running. Please wait.")
+            return
+        if self.is_worker_running(getattr(self, "sim_worker_silent", None), attr_name="sim_worker_silent"):
+            self.stop_worker(
+                self.sim_worker_silent, timeout_ms=300, allow_terminate=True,
+                worker_name="sim_worker_silent",
+            )
+            if self.is_worker_running(getattr(self, "sim_worker_silent", None), attr_name="sim_worker_silent"):
+                QMessageBox.information(self, "Auto-fit", "Another simulation is running. Please wait.")
+                return
+
+        meta = self._get_real_afm_simulation_meta()
+        if meta is None:
+            QMessageBox.warning(self, "Auto-fit", "Real AFM metadata is incomplete.")
+            return
+        scan_x, scan_y, nx, ny = meta
+        self._apply_real_afm_scan_to_controls(scan_x, scan_y, nx, ny)
+
+        coords, sim_mode = self.get_simulation_coords()
+        if coords is None:
+            QMessageBox.warning(self, "Auto-fit", "Failed to get simulation coordinates.")
+            return
+
+        def unique_candidates(values, minimum, maximum):
+            result = []
+            for value in values:
+                value = round(max(float(minimum), min(float(maximum), float(value))), 2)
+                if value not in result:
+                    result.append(value)
+            return result
+
+        current_radius = float(self.tip_radius_spin.value())
+        current_minitip = float(self.minitip_radius_spin.value())
+        current_angle = float(self.tip_angle_spin.value())
+        tip_shape = self.tip_shape_combo.currentText().lower()
+        fit_angle = tip_shape in ("cone", "sphere")
+
+        # Radius and cone angle are strongly degenerate in one AFM image. Search
+        # both, but constrain radius using the scan size and use a weak large-tip
+        # penalty below. This avoids the old tendency to select 45-60 nm simply
+        # because an oversized footprint improved normalized-mask overlap.
+        radius_search_max = min(
+            float(self.tip_radius_spin.maximum()),
+            max(12.0, 0.5 * min(float(scan_x), float(scan_y))),
+        )
+        coarse_radius_values = unique_candidates(
+            [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 24.0, current_radius],
+            self.tip_radius_spin.minimum(), radius_search_max,
+        )
+        if fit_angle:
+            coarse_angle_values = unique_candidates(
+                [2.0, 5.0, 10.0, 15.0, 22.0, 30.0, 35.0, current_angle],
+                self.tip_angle_spin.minimum(), self.tip_angle_spin.maximum(),
+            )
+        else:
+            coarse_angle_values = [current_angle]
+
+        # Search at a small preview resolution.  Tip fitting depends mainly on
+        # the molecular footprint, and running every candidate at the full ASD
+        # resolution makes the non-flat dilation prohibitively expensive.
+        fit_scale = min(1.0, 96.0 / max(float(nx), float(ny)))
+        fit_nx = max(24, int(round(float(nx) * fit_scale)))
+        fit_ny = max(24, int(round(float(ny) * fit_scale)))
+        fit_nx = min(int(nx), fit_nx)
+        fit_ny = min(int(ny), fit_ny)
+        real_for_fit = scipy.ndimage.zoom(
+            np.asarray(self.real_afm_nm, dtype=np.float64),
+            (fit_ny / float(ny), fit_nx / float(nx)),
+            order=1,
+        )
+        pose_for_fit = dict(pose)
+        pose_for_fit['dx_px'] = float(pose.get('dx_px', 0.0)) * fit_nx / float(nx)
+        pose_for_fit['dy_px'] = float(pose.get('dy_px', 0.0)) * fit_ny / float(ny)
+
+        def normalize_height(image):
+            arr = np.asarray(image, dtype=np.float64)
+            valid = np.isfinite(arr) & (arr > -1e8)
+            if np.count_nonzero(valid) < 8:
+                return None, None
+            vals = arr[valid]
+            low = float(np.percentile(vals, 2.0))
+            high = float(np.percentile(vals, 98.0))
+            if high <= low + 1e-12:
+                return None, None
+            norm = np.clip((arr - low) / (high - low), 0.0, 1.0)
+            return norm, valid
+
+        real_norm, real_valid = normalize_height(real_for_fit)
+        if real_norm is None:
+            QMessageBox.warning(self, "Auto-fit", "Real AFM has insufficient height contrast.")
+            return
+        real_fit_values = np.asarray(real_for_fit, dtype=np.float64)[real_valid]
+        real_height_span = max(
+            1e-6,
+            float(np.percentile(real_fit_values, 98.0) - np.percentile(real_fit_values, 2.0)),
+        )
+
+        # Exclude constant black padding rows/columns and other non-data bands.
+        row_span = np.nanmax(real_norm, axis=1) - np.nanmin(real_norm, axis=1)
+        col_span = np.nanmax(real_norm, axis=0) - np.nanmin(real_norm, axis=0)
+        active_rows = row_span > 0.02
+        active_cols = col_span > 0.02
+        active_mask = real_valid & active_rows[:, None] & active_cols[None, :]
+
+        radius_soft_scale = max(2.0, 0.25 * min(float(scan_x), float(scan_y)))
+
+        def tip_fit_score(candidate, radius, angle):
+            sim_norm, sim_valid = normalize_height(candidate)
+            if sim_norm is None:
+                return -1e9
+            mask = active_mask & sim_valid
+            if np.count_nonzero(mask) < 16:
+                return -1e9
+            shape_corr = self.score_zncc(
+                np.where(mask, real_norm, np.nan),
+                np.where(mask, sim_norm, np.nan),
+            )
+            ious = []
+            for threshold in (0.20, 0.35, 0.50, 0.65):
+                real_fg = (real_norm >= threshold) & mask
+                sim_fg = (sim_norm >= threshold) & mask
+                union = np.count_nonzero(real_fg | sim_fg)
+                if union:
+                    ious.append(np.count_nonzero(real_fg & sim_fg) / float(union))
+            footprint = float(np.mean(ious)) if ious else 0.0
+
+            # Retain physical height information. The previous fully normalized
+            # objective discarded it and could reward unrealistically broad tips.
+            real_height = np.asarray(real_for_fit, dtype=np.float64)[mask]
+            sim_height = np.asarray(candidate, dtype=np.float64)[mask]
+            real_height = real_height - float(np.mean(real_height))
+            sim_height = sim_height - float(np.mean(sim_height))
+            height_rmsd = float(np.sqrt(np.mean((real_height - sim_height) ** 2)))
+            height_score = math.exp(-height_rmsd / real_height_span)
+
+            radius_excess = max(0.0, (float(radius) - radius_soft_scale) / radius_soft_scale)
+            radius_penalty = min(0.20, 0.05 * radius_excess * radius_excess)
+            boundary_penalty = 0.0
+            if float(radius) >= radius_search_max - 1e-6:
+                boundary_penalty += 0.015
+            if fit_angle and (
+                float(angle) <= self.tip_angle_spin.minimum() + 1e-6
+                or float(angle) >= self.tip_angle_spin.maximum() - 1e-6
+            ):
+                boundary_penalty += 0.01
+            return (
+                0.30 * float(shape_corr)
+                + 0.35 * footprint
+                + 0.35 * height_score
+                - radius_penalty
+                - boundary_penalty
+            )
+
+        # The surface map does not depend on tip radius.  Build it once and only
+        # repeat the tip dilation for each candidate.
+        fit_params = {
+            'scan_x_nm': float(scan_x),
+            'scan_y_nm': float(scan_y),
+            'nx': int(fit_nx),
+            'ny': int(fit_ny),
+            'scan_size': float(scan_x),
+            'resolution': int(fit_nx),
+            'center_x': self._get_tip_center_xy_nm()[0],
+            'center_y': self._get_tip_center_xy_nm()[1],
+            'tip_radius': current_radius,
+            'minitip_radius': current_minitip,
+            'tip_angle': current_angle,
+            'tip_shape': tip_shape,
+            'use_vdw': self.use_vdw_check.isChecked(),
+        }
+        fit_worker = AFMSimulationWorker(
+            self, fit_params, [],
+            self.atoms_data['element'] if fit_params['use_vdw'] and self.atoms_data is not None else None,
+            self.vdw_radii if fit_params['use_vdw'] and hasattr(self, 'vdw_radii') else None,
+            silent_mode=True,
+        )
+        fit_worker.rotated_atom_coords = coords
+        if fit_params['use_vdw'] and fit_worker.element_symbols is not None:
+            sample_surface = fit_worker.create_vdw_surface()
+        else:
+            sample_surface = fit_worker.create_atom_center_surface()
+        dx_fit = float(scan_x) / float(fit_nx)
+        dy_fit = float(scan_y) / float(fit_ny)
+        z_coords = coords[:, 2]
+        mol_depth = float(np.max(z_coords) - np.min(z_coords)) if z_coords.size else 0.0
+
+        total_steps = max(1, len(coarse_radius_values) * len(coarse_angle_values) + 16)
+        progress = QProgressDialog("Fitting tip radius and angle...", "Cancel", 0, total_steps, self)
+        progress.setWindowTitle("Auto-fit Tip")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        # The preview search now takes only a few seconds.  Do not run a nested
+        # Qt event loop merely to support Cancel: on macOS that can deliver a
+        # pending drop event to the OpenGL widget and abort the process.
+        progress.setCancelButton(None)
+        progress.show()
+        progress.repaint()
+        best = {"score": -1e9, "radius": None, "angle": None}
+        step = 0
+
+        evaluated = set()
+
+        def evaluate_candidate(radius, angle):
+            nonlocal best, step
+            radius = float(radius)
+            angle = float(angle)
+            key = (round(radius, 3), round(angle, 3))
+            if key in evaluated:
+                return
+            evaluated.add(key)
+            fit_worker.sim_params['tip_radius'] = float(radius)
+            fit_worker.sim_params['tip_angle'] = float(angle)
+            tip_footprint = fit_worker.create_igor_style_tip(dx_fit, dy_fit, mol_depth)
+            raw_xy = scipy.ndimage.grey_dilation(
+                sample_surface,
+                structure=-tip_footprint,
+                mode='constant',
+                cval=-np.inf,
+            ).astype(np.float64, copy=False)
+            candidate = self.apply_pose_to_image(raw_xy, pose_for_fit)
+            score = tip_fit_score(candidate, radius, angle)
+            if score > best["score"]:
+                best = {
+                    "score": float(score),
+                    "radius": float(radius),
+                    "angle": float(angle),
+                }
+            step += 1
+            progress.setLabelText(
+                f"Fitting tip radius{' and angle' if fit_angle else ''}\n"
+                f"Now: R={radius:.2f} nm, Angle={angle:.2f} deg\n"
+                f"Best score: {best['score']:.4f}"
+            )
+            progress.setValue(step)
+            progress.repaint()
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            for radius in coarse_radius_values:
+                for angle in coarse_angle_values:
+                    evaluate_candidate(radius, angle)
+
+            if best["radius"] is None:
+                QMessageBox.information(self, "Auto-fit", "No valid tip candidates.")
+                return
+
+            # Refine a small radius × angle neighborhood around the best coarse
+            # candidate instead of running a dense, expensive full grid.
+            sorted_coarse = sorted(coarse_radius_values)
+            best_index = sorted_coarse.index(best["radius"])
+            lower = sorted_coarse[max(0, best_index - 1)]
+            upper = sorted_coarse[min(len(sorted_coarse) - 1, best_index + 1)]
+            local_values = unique_candidates(
+                [best["radius"] - (best["radius"] - lower) * 0.50,
+                 best["radius"] - (best["radius"] - lower) * 0.25,
+                 best["radius"] + (upper - best["radius"]) * 0.25,
+                 best["radius"] + (upper - best["radius"]) * 0.50],
+                self.tip_radius_spin.minimum(), radius_search_max,
+            )
+            if fit_angle:
+                sorted_angles = sorted(coarse_angle_values)
+                angle_index = sorted_angles.index(best["angle"])
+                lower_angle = sorted_angles[max(0, angle_index - 1)]
+                upper_angle = sorted_angles[min(len(sorted_angles) - 1, angle_index + 1)]
+                local_angle_values = unique_candidates(
+                    [
+                        best["angle"] - (best["angle"] - lower_angle) * 0.50,
+                        best["angle"] - (best["angle"] - lower_angle) * 0.25,
+                        best["angle"],
+                        best["angle"] + (upper_angle - best["angle"]) * 0.25,
+                        best["angle"] + (upper_angle - best["angle"]) * 0.50,
+                    ],
+                    self.tip_angle_spin.minimum(), self.tip_angle_spin.maximum(),
+                )
+            else:
+                local_angle_values = [current_angle]
+            progress.setMaximum(step + len(local_values) * len(local_angle_values))
+            for radius in local_values:
+                for angle in local_angle_values:
+                    evaluate_candidate(radius, angle)
+
+            for widget in (self.tip_radius_spin, self.minitip_radius_spin, self.tip_angle_spin):
+                widget.blockSignals(True)
+            try:
+                self.tip_radius_spin.setValue(best["radius"])
+                self.minitip_radius_spin.setValue(current_minitip)
+                self.tip_angle_spin.setValue(best["angle"])
+            finally:
+                for widget in (self.tip_radius_spin, self.minitip_radius_spin, self.tip_angle_spin):
+                    widget.blockSignals(False)
+
+            self._sync_appearance_sliders_from_spins()
+            self.create_tip()
+            self.update_tip_info()
+            self.afm_params.update({
+                "tip_radius": self.tip_radius_spin.value(),
+                "tip_shape": tip_shape,
+                "tip_angle": self.tip_angle_spin.value(),
+            })
+            self._simulate_xy_for_real_afm(
+                update_panels=True, store_results=True,
+                check_busy=False, show_messages=False,
+            )
+            result_message = (
+                "Applied best tip parameters:\n"
+                f"Radius: {best['radius']:.2f} nm\n"
+                f"Angle: {best['angle']:.2f} deg"
+                + ("" if fit_angle else " (not applicable to Paraboloid)")
+                + "\n"
+                f"Tip-fit score: {best['score']:.4f}\n\n"
+                f"Radius search range: {self.tip_radius_spin.minimum():.1f}"
+                f"-{radius_search_max:.1f} nm\n"
+                "Low-pass and noise/artifact settings were not changed."
+            )
+            warnings = []
+            if best["radius"] >= radius_search_max - 1e-6:
+                warnings.append(
+                    "The fitted radius reached the search upper bound; "
+                    "the radius/angle combination may not be uniquely determined."
+                )
+            if fit_angle and (
+                best["angle"] <= self.tip_angle_spin.minimum() + 1e-6
+                or best["angle"] >= self.tip_angle_spin.maximum() - 1e-6
+            ):
+                warnings.append(
+                    "The fitted angle reached its search boundary; verify the result manually."
+                )
+            if warnings:
+                result_message += "\n\nWarning:\n" + "\n".join(warnings)
+            if hasattr(self, "status_label"):
+                self.status_label.setText(
+                    f"Auto-fit Tip: R={best['radius']:.2f} nm, "
+                    f"Angle={best['angle']:.2f} deg, Score={best['score']:.4f}"
+                )
+        finally:
+            progress.close()
+            try:
+                fit_worker.deleteLater()
+            except Exception:
+                pass
+            QApplication.restoreOverrideCursor()
+
+        QMessageBox.information(self, "Auto-fit Tip Radius + Angle", result_message)
+
+    def _run_auto_fit_checked_appearance_safely(self):
+        """Keep an appearance-fit error from escaping the Qt clicked callback."""
+        try:
+            self.auto_fit_checked_appearance()
+        except Exception as exc:
+            traceback.print_exc()
+            try:
+                QApplication.restoreOverrideCursor()
+            except Exception:
+                pass
+            if hasattr(self, 'btnAutoFitCheckedAppearance'):
+                self.btnAutoFitCheckedAppearance.setEnabled(True)
+            QMessageBox.critical(
+                self,
+                "Auto-fit Checked Appearance",
+                "Auto-fit stopped safely. The Simulator can continue running.\n\n"
+                f"{type(exc).__name__}: {exc}",
+            )
+
+    def auto_fit_checked_appearance(self):
+        """Fit only enabled AFM Appearance parameters, keeping pose and tip fixed."""
+        if self.real_afm_nm is None:
+            QMessageBox.information(
+                self, "Auto-fit Checked Appearance", "Real AFM is not loaded."
+            )
+            return
+        pose = getattr(self, 'pose', None) or {}
+        if pose.get('score') is None:
+            QMessageBox.information(
+                self,
+                "Auto-fit Checked Appearance",
+                "Run Estimate Pose first.\n\n"
+                "Appearance fitting is a local refinement and requires a fixed "
+                "molecular orientation and XY alignment.",
+            )
+            return
+
+        fit_lowpass = self.apply_filter_check.isChecked()
+        noise_on = self.chkNoiseEnable.isChecked()
+        fit_height = noise_on and self.chkHeightNoise.isChecked()
+        fit_line = noise_on and self.chkLineNoise.isChecked()
+        fit_drift = noise_on and self.chkDrift.isChecked()
+        fit_feedback = noise_on and self.chkFeedbackLag.isChecked()
+        if not any((fit_lowpass, fit_height, fit_line, fit_drift, fit_feedback)):
+            QMessageBox.information(
+                self,
+                "Auto-fit Checked Appearance",
+                "No AFM Appearance item is enabled.\n\n"
+                "Check Low-pass Filter or one or more Physical Noise / Artifact items.",
+            )
+            return
+        if (
+            self.is_worker_running(getattr(self, 'sim_worker', None), attr_name='sim_worker')
+            or self.is_worker_running(
+                getattr(self, 'sim_worker_high_res', None),
+                attr_name='sim_worker_high_res',
+            )
+        ):
+            QMessageBox.information(
+                self, "Auto-fit Checked Appearance",
+                "Another simulation is running. Please wait.",
+            )
+            return
+
+        meta = self._get_real_afm_simulation_meta()
+        if meta is None:
+            QMessageBox.warning(
+                self, "Auto-fit Checked Appearance", "Real AFM metadata is incomplete."
+            )
+            return
+        scan_x, scan_y, nx, ny = meta
+        self._apply_real_afm_scan_to_controls(scan_x, scan_y, nx, ny)
+        coords, _sim_mode = self.get_simulation_coords()
+        if coords is None:
+            QMessageBox.warning(
+                self, "Auto-fit Checked Appearance",
+                "Failed to get simulation coordinates.",
+            )
+            return
+
+        fit_scale = min(1.0, 96.0 / max(float(nx), float(ny)))
+        fit_nx = min(int(nx), max(24, int(round(float(nx) * fit_scale))))
+        fit_ny = min(int(ny), max(24, int(round(float(ny) * fit_scale))))
+        real_for_fit = scipy.ndimage.zoom(
+            np.asarray(self.real_afm_nm, dtype=np.float64),
+            (fit_ny / float(ny), fit_nx / float(nx)),
+            order=1,
+        )
+        pose_for_fit = dict(pose)
+        pose_for_fit['dx_px'] = float(pose.get('dx_px', 0.0)) * fit_nx / float(nx)
+        pose_for_fit['dy_px'] = float(pose.get('dy_px', 0.0)) * fit_ny / float(ny)
+
+        fit_params = {
+            'scan_x_nm': float(scan_x),
+            'scan_y_nm': float(scan_y),
+            'nx': int(fit_nx),
+            'ny': int(fit_ny),
+            'scan_size': float(scan_x),
+            'resolution': int(fit_nx),
+            'center_x': self._get_tip_center_xy_nm()[0],
+            'center_y': self._get_tip_center_xy_nm()[1],
+            'tip_radius': float(self.tip_radius_spin.value()),
+            'minitip_radius': float(self.minitip_radius_spin.value()),
+            'tip_angle': float(self.tip_angle_spin.value()),
+            'tip_shape': self.tip_shape_combo.currentText().lower(),
+            'use_vdw': self.use_vdw_check.isChecked(),
+        }
+        fit_worker = AFMSimulationWorker(
+            self,
+            fit_params,
+            [],
+            self.atoms_data['element']
+            if fit_params['use_vdw'] and self.atoms_data is not None else None,
+            self.vdw_radii
+            if fit_params['use_vdw'] and hasattr(self, 'vdw_radii') else None,
+            silent_mode=True,
+        )
+        fit_worker.rotated_atom_coords = coords
+        if fit_params['use_vdw'] and fit_worker.element_symbols is not None:
+            sample_surface = fit_worker.create_vdw_surface()
+        else:
+            sample_surface = fit_worker.create_atom_center_surface()
+        pixel_x_nm = float(scan_x) / float(fit_nx)
+        pixel_y_nm = float(scan_y) / float(fit_ny)
+        z_coords = coords[:, 2]
+        molecule_depth = (
+            float(np.max(z_coords) - np.min(z_coords)) if z_coords.size else 0.0
+        )
+        tip_footprint = fit_worker.create_igor_style_tip(
+            pixel_x_nm, pixel_y_nm, molecule_depth
+        )
+        raw_xy = scipy.ndimage.grey_dilation(
+            sample_surface,
+            structure=-tip_footprint,
+            mode='constant',
+            cval=-np.inf,
+        ).astype(np.float64, copy=False)
+
+        def bounded_candidates(widget, values):
+            minimum = float(widget.minimum())
+            maximum = float(widget.maximum())
+            decimals = int(widget.decimals()) if hasattr(widget, 'decimals') else 3
+            candidates = []
+            for value in values:
+                value = round(max(minimum, min(maximum, float(value))), decimals)
+                if value not in candidates:
+                    candidates.append(value)
+            return candidates
+
+        current_cutoff = float(self.filter_cutoff_spin.value())
+        appearance_params = {
+            'seed': int(self.spinNoiseSeed.value())
+            if self.chkUseNoiseSeed.isChecked() else 0,
+            'height_sigma_nm': float(self.spinHeightNoiseSigmaNm.value())
+            if fit_height else 0.0,
+            'line_sigma_nm': float(self.spinLineNoiseSigmaNm.value())
+            if fit_line else 0.0,
+            'line_noise_mode': self.comboLineNoiseMode.currentText(),
+            'drift_vx_nm_per_line': float(self.spinDriftVxNmPerLine.value())
+            if fit_drift else 0.0,
+            'drift_vy_nm_per_line': float(self.spinDriftVyNmPerLine.value())
+            if fit_drift else 0.0,
+            'drift_jitter_nm_per_line': float(
+                self.spinDriftJitterNmPerLine.value()
+            ) if fit_drift else 0.0,
+            'feedback_mode': self.comboFeedbackMode.currentText()
+            if fit_feedback else 'none',
+            'scan_direction': self.comboScanDirection.currentData()
+            or self.comboScanDirection.currentText(),
+            'lag_tau_lines': float(self.spinLagTauLines.value()),
+            'tap_drop_threshold_nm': float(self.spinTapDropThresholdNm.value()),
+            'tap_tau_track_lines': float(self.spinTapTauTrackLines.value()),
+            'tap_tau_parachute_lines': float(
+                self.spinTapTauParachuteLines.value()
+            ),
+            'tap_release_threshold_nm': float(
+                self.spinTapReleaseThresholdNm.value()
+            ),
+        }
+
+        real_valid = np.isfinite(real_for_fit) & (real_for_fit > -1e8)
+        if np.count_nonzero(real_valid) < 32:
+            QMessageBox.warning(
+                self, "Auto-fit Checked Appearance",
+                "Real AFM has insufficient valid image data.",
+            )
+            return
+        real_values = real_for_fit[real_valid]
+        real_span = max(
+            1e-6,
+            float(np.percentile(real_values, 98.0) - np.percentile(real_values, 2.0)),
+        )
+
+        def image_statistics(image, valid):
+            arr = np.asarray(image, dtype=np.float64)
+            fill = float(np.median(arr[valid]))
+            clean = np.where(valid, arr, fill)
+            smooth = scipy.ndimage.gaussian_filter(clean, sigma=1.0)
+            row_means = np.mean(clean, axis=1)
+            return np.array(
+                [
+                    np.std(clean - smooth),
+                    np.std(row_means),
+                    np.std(np.diff(row_means)) if row_means.size > 1 else 0.0,
+                    np.std(np.diff(clean, axis=1)) if clean.shape[1] > 1 else 0.0,
+                    np.std(np.diff(clean, axis=0)) if clean.shape[0] > 1 else 0.0,
+                ],
+                dtype=np.float64,
+            )
+
+        real_statistics = image_statistics(real_for_fit, real_valid)
+
+        def render_candidate(cutoff, params):
+            candidate = np.asarray(raw_xy, dtype=np.float64)
+            if fit_lowpass:
+                candidate = apply_low_pass_filter(
+                    candidate, scan_x, scan_y, float(cutoff)
+                )
+            if noise_on:
+                candidate = self.apply_noise_artifacts_with_params(
+                    candidate, pixel_x_nm, pixel_y_nm, params
+                )
+            return self.apply_pose_to_image(candidate, pose_for_fit)
+
+        def appearance_score(candidate):
+            candidate = np.asarray(candidate, dtype=np.float64)
+            valid = real_valid & np.isfinite(candidate) & (candidate > -1e8)
+            if np.count_nonzero(valid) < 32:
+                return -1e9
+            real_centered = real_for_fit[valid] - float(np.mean(real_for_fit[valid]))
+            candidate_centered = candidate[valid] - float(
+                np.mean(candidate[valid])
+            )
+            denominator = float(
+                np.linalg.norm(real_centered) * np.linalg.norm(candidate_centered)
+            )
+            correlation = (
+                float(np.dot(real_centered, candidate_centered) / denominator)
+                if denominator > 1e-12 else -1.0
+            )
+            rmsd = float(
+                np.sqrt(np.mean((real_centered - candidate_centered) ** 2))
+            )
+            candidate_statistics = image_statistics(candidate, valid)
+            epsilon = max(real_span * 1e-4, 1e-8)
+            statistics_error = float(
+                np.mean(
+                    np.minimum(
+                        np.abs(np.log(
+                            (candidate_statistics + epsilon)
+                            / (real_statistics + epsilon)
+                        )),
+                        3.0,
+                    )
+                )
+            )
+            return (
+                0.50 * correlation
+                - 0.25 * min(rmsd / real_span, 4.0)
+                - 0.25 * statistics_error
+            )
+
+        parameter_specs = []
+        if fit_height:
+            current = appearance_params['height_sigma_nm']
+            parameter_specs.append((
+                'height_sigma_nm', self.spinHeightNoiseSigmaNm,
+                bounded_candidates(
+                    self.spinHeightNoiseSigmaNm,
+                    [0.0, 0.02, 0.05, 0.1, 0.2, 0.4, current * 0.5, current],
+                ),
+            ))
+        if fit_line:
+            current = appearance_params['line_sigma_nm']
+            parameter_specs.append((
+                'line_sigma_nm', self.spinLineNoiseSigmaNm,
+                bounded_candidates(
+                    self.spinLineNoiseSigmaNm,
+                    [0.0, 0.02, 0.05, 0.1, 0.2, 0.4, current * 0.5, current],
+                ),
+            ))
+        if fit_drift:
+            for key, widget in (
+                ('drift_vx_nm_per_line', self.spinDriftVxNmPerLine),
+                ('drift_vy_nm_per_line', self.spinDriftVyNmPerLine),
+            ):
+                parameter_specs.append((
+                    key, widget,
+                    bounded_candidates(
+                        widget,
+                        [-0.2, -0.1, -0.05, 0.0, 0.05, 0.1, 0.2,
+                         appearance_params[key]],
+                    ),
+                ))
+            parameter_specs.append((
+                'drift_jitter_nm_per_line', self.spinDriftJitterNmPerLine,
+                bounded_candidates(
+                    self.spinDriftJitterNmPerLine,
+                    [0.0, 0.01, 0.03, 0.05, 0.1, 0.2,
+                     appearance_params['drift_jitter_nm_per_line']],
+                ),
+            ))
+        if fit_feedback:
+            if self.comboFeedbackMode.currentText() == 'tapping_parachute':
+                feedback_specs = (
+                    ('tap_drop_threshold_nm', self.spinTapDropThresholdNm,
+                     [0.1, 0.3, 0.5, 1.0, 2.0, 4.0]),
+                    ('tap_tau_track_lines', self.spinTapTauTrackLines,
+                     [0.2, 0.5, 1.0, 2.0, 4.0, 8.0]),
+                    ('tap_tau_parachute_lines', self.spinTapTauParachuteLines,
+                     [1.0, 3.0, 5.0, 10.0, 15.0, 25.0, 40.0]),
+                    ('tap_release_threshold_nm', self.spinTapReleaseThresholdNm,
+                     [0.05, 0.1, 0.3, 0.5, 1.0, 2.0]),
+                )
+            else:
+                feedback_specs = ((
+                    'lag_tau_lines', self.spinLagTauLines,
+                    [0.1, 0.3, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0],
+                ),)
+            for key, widget, values in feedback_specs:
+                parameter_specs.append((
+                    key, widget,
+                    bounded_candidates(widget, list(values) + [appearance_params[key]]),
+                ))
+
+        cutoff_candidates = (
+            bounded_candidates(
+                self.filter_cutoff_spin,
+                [0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                 10.0, current_cutoff],
+            )
+            if fit_lowpass else [current_cutoff]
+        )
+        total_steps = len(cutoff_candidates) + 2 * sum(
+            len(values) for _key, _widget, values in parameter_specs
+        )
+        progress = QProgressDialog(
+            "Fitting checked AFM Appearance items...",
+            None,
+            0,
+            max(1, total_steps),
+            self,
+        )
+        progress.setWindowTitle("Auto-fit Checked Appearance")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setCancelButton(None)
+        progress.show()
+        progress.repaint()
+
+        initial_score = appearance_score(
+            render_candidate(current_cutoff, appearance_params)
+        )
+        best_score = initial_score
+        best_cutoff = current_cutoff
+        best_params = dict(appearance_params)
+        step = 0
+        result_message = ""
+        self.btnAutoFitCheckedAppearance.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            for cutoff in cutoff_candidates:
+                score = appearance_score(render_candidate(cutoff, best_params))
+                if score > best_score:
+                    best_score = score
+                    best_cutoff = float(cutoff)
+                step += 1
+                progress.setValue(step)
+                progress.setLabelText(
+                    f"Fitting Low-pass cutoff\nBest score: {best_score:.4f}"
+                )
+                progress.repaint()
+
+            for pass_index in range(2):
+                for key, _widget, values in parameter_specs:
+                    local_best_value = best_params[key]
+                    local_best_score = best_score
+                    for value in values:
+                        trial_params = dict(best_params)
+                        trial_params[key] = float(value)
+                        score = appearance_score(
+                            render_candidate(best_cutoff, trial_params)
+                        )
+                        if score > local_best_score:
+                            local_best_score = score
+                            local_best_value = float(value)
+                        step += 1
+                        progress.setValue(step)
+                        progress.setLabelText(
+                            f"Pass {pass_index + 1}/2: {key}\n"
+                            f"Best score: {max(best_score, local_best_score):.4f}"
+                        )
+                        progress.repaint()
+                    best_params[key] = local_best_value
+                    best_score = local_best_score
+
+            changed = best_score > initial_score + 1e-6
+            if changed:
+                widgets_to_apply = []
+                if fit_lowpass:
+                    widgets_to_apply.append((self.filter_cutoff_spin, best_cutoff))
+                widgets_to_apply.extend(
+                    (widget, best_params[key])
+                    for key, widget, _values in parameter_specs
+                )
+                for widget, _value in widgets_to_apply:
+                    widget.blockSignals(True)
+                try:
+                    for widget, value in widgets_to_apply:
+                        widget.setValue(value)
+                finally:
+                    for widget, _value in widgets_to_apply:
+                        widget.blockSignals(False)
+                self._sync_appearance_sliders_from_spins()
+                self.process_and_display_all_images()
+
+            fitted_names = []
+            if fit_lowpass:
+                fitted_names.append(f"Low-pass cutoff: {best_cutoff:.2f} nm")
+            if fit_height:
+                fitted_names.append(
+                    f"Height noise sigma: {best_params['height_sigma_nm']:.3f} nm"
+                )
+            if fit_line:
+                fitted_names.append(
+                    f"Line noise sigma: {best_params['line_sigma_nm']:.3f} nm"
+                )
+            if fit_drift:
+                fitted_names.append(
+                    "Drift vx/vy/jitter: "
+                    f"{best_params['drift_vx_nm_per_line']:.3f} / "
+                    f"{best_params['drift_vy_nm_per_line']:.3f} / "
+                    f"{best_params['drift_jitter_nm_per_line']:.3f} nm/line"
+                )
+            if fit_feedback:
+                fitted_names.append(f"Feedback mode: {best_params['feedback_mode']}")
+            result_message = (
+                ("Applied fitted parameters." if changed
+                 else "The current parameters were already the best candidates.")
+                + "\n\n"
+                + "\n".join(fitted_names)
+                + f"\n\nAppearance score: {initial_score:.4f} -> {best_score:.4f}"
+                + "\n\nPose and Tip Radius/Angle were not changed."
+            )
+        finally:
+            progress.close()
+            self.btnAutoFitCheckedAppearance.setEnabled(True)
+            try:
+                fit_worker.deleteLater()
+            except Exception:
+                pass
+            QApplication.restoreOverrideCursor()
+
+        QMessageBox.information(
+            self, "Auto-fit Checked Appearance", result_message
+        )
+
+    def _auto_fit_appearance_legacy(self):
         """Auto-fit AFM appearance in two stages: probe/low-pass, then noise."""
         if self.real_afm_nm is None:
             QMessageBox.information(self, "Auto-fit", "Real AFM is not loaded.")
@@ -11822,11 +21812,11 @@ class pyNuD_simulator(QMainWindow):
         """右側のVTK表示パネル作成（上下可変分割 + 下部3分割）"""
         panel = QWidget()
         panel.setMinimumSize(550, 600)
-
+        
         main_layout = QVBoxLayout(panel)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
-
+        
         # 上下のメインスプリッター
         self.afm_splitter = QSplitter(Qt.Vertical)
         self.afm_splitter.setHandleWidth(8)
@@ -11839,7 +21829,7 @@ class pyNuD_simulator(QMainWindow):
                 background-color: #bbb;
             }
         """)
-
+        
         # --- 上部：PDB構造表示エリア ---
         structure_frame = QFrame()
         structure_frame.setFrameStyle(QFrame.StyledPanel)
@@ -11853,7 +21843,7 @@ class pyNuD_simulator(QMainWindow):
         structure_layout.addWidget(self.sequence_panel)
 
         structure_layout.addWidget(self.progress_container)
-
+        
         # VTKウィンドウとコントロールパネルを配置するための垂直スプリッター
         self.view_control_splitter = QSplitter(Qt.Vertical)
         self.view_control_splitter.setHandleWidth(6)
@@ -11868,7 +21858,7 @@ class pyNuD_simulator(QMainWindow):
                 background-color: #cccccc;
             }
         """)
-
+        
         # 分子ビュー（プラグイン版は VTK のみ / スタンドアロンは PyMOL + VTK）
         self.pymol_view_container = None
         self.pymol_widget_container = None
@@ -11978,7 +21968,7 @@ class pyNuD_simulator(QMainWindow):
         controls_scroll.setWidget(rotation_controls)
         controls_scroll.setMinimumHeight(80)
         self.view_control_splitter.addWidget(controls_scroll)
-
+        
         self.view_control_splitter.setSizes([560, 120])
         self.view_control_splitter.setCollapsible(0, False)
         self.view_control_splitter.setCollapsible(1, True)
@@ -11995,11 +21985,11 @@ class pyNuD_simulator(QMainWindow):
         afm_layout = QVBoxLayout(afm_frame)
         afm_layout.setContentsMargins(2, 2, 2, 2)
         afm_layout.setSpacing(2)
-
+        
         afm_header_layout = QHBoxLayout()
         afm_header_layout.setContentsMargins(3, 3, 3, 3)
         afm_header_layout.setSpacing(0)
-
+        
         afm_label = QLabel("Simulated AFM Images")
         afm_label.setStyleSheet("""
             QLabel {
@@ -12014,20 +22004,20 @@ class pyNuD_simulator(QMainWindow):
         """)
         afm_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         afm_header_layout.addWidget(afm_label)
-
+        
         afm_header_layout.addSpacing(10)
 
-
-
-
+        
+    
+        
         self.afm_x_check = QCheckBox("XY")
         self.afm_y_check = QCheckBox("YZ")
         self.afm_z_check = QCheckBox("ZX")
-
+        
         self.afm_x_check.setChecked(True)
         self.afm_y_check.setChecked(False)
         self.afm_z_check.setChecked(False)
-
+        
         checkbox_style = """
             QCheckBox {
                 font-size: 10px; font-weight: bold; color: #555;
@@ -12038,11 +22028,11 @@ class pyNuD_simulator(QMainWindow):
             QCheckBox::indicator:unchecked { background-color: white; border: 2px solid #ccc; }
             QCheckBox::indicator:hover { border-color: #888; }
         """
-
+        
         self.afm_x_check.setStyleSheet(checkbox_style)
         self.afm_y_check.setStyleSheet(checkbox_style)
-        self.afm_z_check.setStyleSheet(checkbox_style)
-
+        self.afm_z_check.setStyleSheet(checkbox_style)        
+        
         self.afm_x_check.toggled.connect(self.update_afm_display)
         self.afm_y_check.toggled.connect(self.update_afm_display)
         self.afm_z_check.toggled.connect(self.update_afm_display)
@@ -12051,8 +22041,8 @@ class pyNuD_simulator(QMainWindow):
         self.afm_x_check.toggled.connect(self.run_simulation_on_view_change)
         self.afm_y_check.toggled.connect(self.run_simulation_on_view_change)
         self.afm_z_check.toggled.connect(self.run_simulation_on_view_change)
-
-
+ 
+        
         afm_header_layout.addWidget(self.afm_x_check)
         afm_header_layout.addSpacing(12)
         afm_header_layout.addWidget(self.afm_y_check)
@@ -12082,7 +22072,7 @@ class pyNuD_simulator(QMainWindow):
         self.save_image_button.clicked.connect(self.handle_save_image)
         self.save_image_button.setEnabled(False)
         afm_header_layout.addWidget(self.save_image_button)
-
+        
         afm_header_widget = QWidget()
         afm_header_widget.setLayout(afm_header_layout)
         afm_header_widget.setMaximumHeight(30)
@@ -12094,11 +22084,11 @@ class pyNuD_simulator(QMainWindow):
             }
         """)
         afm_layout.addWidget(afm_header_widget)
-
+        
         self.afm_images_layout = QHBoxLayout()
         self.afm_images_layout.setSpacing(3)
         self.afm_images_layout.setContentsMargins(0, 0, 0, 0)
-
+        
         # 画像パネルのタイトルを XY View, YZ View, ZX View に変更
         self.afm_x_frame = self.create_afm_image_panel("XY View")
         self.afm_x_frame.setObjectName("XY_Frame") # 追加
@@ -12106,23 +22096,23 @@ class pyNuD_simulator(QMainWindow):
         self.afm_y_frame.setObjectName("YZ_Frame") # 追加
         self.afm_z_frame = self.create_afm_image_panel("ZX View")
         self.afm_z_frame.setObjectName("ZX_Frame") # 追加
-
+        
         self.afm_images_layout.addWidget(self.afm_x_frame, 1)
         self.afm_images_layout.addWidget(self.afm_y_frame, 1)
         self.afm_images_layout.addWidget(self.afm_z_frame, 1)
-
+        
         afm_layout.addLayout(self.afm_images_layout)
-
+        
         # メインスプリッターにウィジェットを追加
         self.afm_splitter.addWidget(structure_frame)
         self.afm_splitter.addWidget(afm_frame)
-
+        
         self.afm_splitter.setSizes([560, 300])
         self.afm_splitter.setCollapsible(0, False)
         self.afm_splitter.setCollapsible(1, False)
         self.afm_splitter.setStretchFactor(0, 2)
         self.afm_splitter.setStretchFactor(1, 3)
-
+        
         main_layout.addWidget(self.afm_splitter)
 
         self.update_afm_display()
@@ -12136,21 +22126,67 @@ class pyNuD_simulator(QMainWindow):
                 )
         except Exception:
             pass
-
+        
         return panel
+    
 
+    def _create_model_rotation_group(self):
+        """Build Rotation XYZ controls for the left AFM control panel."""
+        group = QGroupBox("Model Rotation (simulation pose)")
+        group.setToolTip(
+            "Rotation XYZ applied to the structure for AFM simulation / "
+            "Estimate Pose / Impose model.\n"
+            "AFMシミュレーション・Estimate Pose・Impose model に使う構造の回転。"
+        )
+        layout = QGridLayout(group)
+        layout.setContentsMargins(6, 8, 6, 6)
+        layout.setHorizontalSpacing(4)
+        layout.setVerticalSpacing(2)
+
+        self.rotation_widgets = {}
+        for i, axis in enumerate(['X', 'Y', 'Z']):
+            label = QLabel(f"Rotation {axis}:")
+            spin_box = QDoubleSpinBox()
+            spin_box.setRange(-180.0, 180.0)
+            spin_box.setDecimals(1)
+            spin_box.setSingleStep(0.5)
+            spin_box.setSuffix(" °")
+            spin_box.setMinimumWidth(78)
+            spin_box.setKeyboardTracking(False)
+            spin_box.setToolTip(
+                f"Rotation {axis} angle in degrees\n{axis}軸の回転角度（度）"
+            )
+
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(-1800, 1800)
+            slider.setToolTip(
+                f"Rotation {axis} slider\n{axis}軸回転スライダー"
+            )
+
+            layout.addWidget(label, i, 0)
+            layout.addWidget(spin_box, i, 1)
+            layout.addWidget(slider, i, 2)
+            layout.setColumnStretch(2, 1)
+
+            self.rotation_widgets[axis] = {'spin': spin_box, 'slider': slider}
+            slider.valueChanged.connect(self.sync_rotation_widgets)
+            spin_box.valueChanged.connect(self.sync_rotation_widgets)
+            slider.sliderReleased.connect(self.apply_rotation_and_trigger_simulation)
+            spin_box.valueChanged.connect(self.start_rotation_update_timer)
+
+        return group
 
     def create_rotation_controls(self):
-        """PDB構造回転用コントロールと視点コントロールを作成"""
-        group = QGroupBox("Structure & View Control (Rotation XYZ sets the simulation pose)")
+        """Create Structure & View Control (stats, Find Initial Plane, views)."""
+        group = QGroupBox("Structure & View Control")
         group.setStyleSheet("QGroupBox { font-weight: bold; }")
-
+        
         # メインの水平レイアウト
         main_layout = QHBoxLayout(group)
         main_layout.setSpacing(10)
         main_layout.setContentsMargins(8, 12, 8, 8)
 
-        # --- 左側: Atom Stats + 回転コントロール ---
+        # --- 左側: Atom Stats ---
         left_widget = QWidget()
         left_container = QVBoxLayout(left_widget)
         left_container.setSpacing(6)
@@ -12165,54 +22201,30 @@ class pyNuD_simulator(QMainWindow):
             stats_layout.addWidget(label)
             self.stats_labels[atom_type] = label
         left_container.addWidget(stats_group)
+        pose_hint = QLabel(
+            "Model Rotation XYZ is in the left panel, under Tip Position Control."
+        )
+        pose_hint.setWordWrap(True)
+        pose_hint.setStyleSheet("color: #555; font-size: 10px;")
+        left_container.addWidget(pose_hint)
+        left_container.addStretch(1)
 
-        rotation_widget = QWidget()
-        left_layout = QGridLayout(rotation_widget)
-        left_layout.setSpacing(2)
-        left_layout.setContentsMargins(0, 6, 0, 0)
-
-        self.rotation_widgets = {}
-        for i, axis in enumerate(['X', 'Y', 'Z']):
-            label = QLabel(f"Rotation {axis}:")
-            spin_box = QDoubleSpinBox()
-            spin_box.setRange(-180.0, 180.0)
-            spin_box.setDecimals(1)
-            spin_box.setSingleStep(1.0)
-            spin_box.setSuffix(" °")
-            spin_box.setToolTip(f"Rotation {axis} angle in degrees\n{axis}軸の回転角度（度）")
-
-            slider = QSlider(Qt.Horizontal)
-            slider.setRange(-1800, 1800)
-            slider.setToolTip(f"Rotation {axis} slider\n{axis}軸回転スライダー")
-
-            left_layout.addWidget(label, i, 0)
-            left_layout.addWidget(spin_box, i, 1)
-            left_layout.addWidget(slider, i, 2)
-            left_layout.setColumnStretch(2, 1)
-
-            self.rotation_widgets[axis] = {'spin': spin_box, 'slider': slider}
-            # ★★★ ここからが修正箇所 ★★★
-            # 1. 値が「変化している最中」は、UIの同期のみを行う
-            slider.valueChanged.connect(self.sync_rotation_widgets)
-            spin_box.valueChanged.connect(self.sync_rotation_widgets)
-
-            # 2. 操作が「完了した時」にのみ、3Dモデルの回転とシミュレーションのトリガーを実行
-            slider.sliderReleased.connect(self.apply_rotation_and_trigger_simulation)
-            spin_box.valueChanged.connect(self.start_rotation_update_timer)
-            #spin_box.editingFinished.connect(self.apply_rotation_and_trigger_simulation)
-            # ★★★ 修正箇所ここまで ★★★
-
-        left_container.addWidget(rotation_widget)
+        if not getattr(self, "rotation_widgets", None):
+            # Left panel normally owns these controls; keep a hidden owner if
+            # Structure & View is constructed first in a test/harness path.
+            orphan = self._create_model_rotation_group()
+            orphan.hide()
+            orphan.setParent(group)
 
         # --- 右側: 視点コントロール ---
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         right_layout.setSpacing(5)
         right_layout.setContentsMargins(5, 0, 0, 0)
-
+        
          # 1. ボタンを格納する水平レイアウトを作成
         top_button_layout = QHBoxLayout()
-
+        
         reset_btn = QPushButton("Reset All")
         reset_btn.setToolTip("Reset molecule rotation, tip position, and camera view to initial state\n分子の回転、探針の位置、カメラの視点を初期状態に戻します")
         reset_btn.clicked.connect(self.handle_reset_button_clicked)
@@ -12220,9 +22232,12 @@ class pyNuD_simulator(QMainWindow):
 
         # 2. 新しい保存ボタンを作成
         save_view_btn = QPushButton("📷 Save 3D View...")
-        save_view_btn.setToolTip("Save the current 3D view as a PNG or TIFF image\n現在の3DビューをPNGまたはTIFF画像として保存")
+        save_view_btn.setToolTip(
+            "Save the current 3D view as a transparent PNG, PNG, or TIFF image\n"
+            "現在の3Dビューを背景透明PNG、通常PNG、またはTIFF画像として保存"
+        )
         save_view_btn.clicked.connect(self.handle_save_3d_view) # 新しいメソッドに接続
-        top_button_layout.addWidget(save_view_btn) # 水平レイアウトに追加
+        top_button_layout.addWidget(save_view_btn) # 水平レイアウトに追加   
 
         # Find Initial Plane（接触候補の基板射影面積最大）ボタン
         find_plane_btn = QPushButton("Find Initial Plane")
@@ -12628,7 +22643,7 @@ class pyNuD_simulator(QMainWindow):
         params_io_layout.addWidget(self.load_params_button)
 
         right_layout.addLayout(params_io_layout)
-
+        
         # 標準視点ボタンを水平に配置
         view_btn_layout = QHBoxLayout()
         xy_btn = QPushButton("XY")
@@ -12678,8 +22693,8 @@ class pyNuD_simulator(QMainWindow):
         #right_layout.addStretch() # ボタンを上部に寄せる
 
         # 左右のウィジェットをメインレイアウトに追加
-        main_layout.addWidget(left_widget, stretch=3) # 回転コントロールに多くのスペースを割り当てる
-        main_layout.addWidget(right_widget, stretch=1)
+        main_layout.addWidget(left_widget, stretch=1)
+        main_layout.addWidget(right_widget, stretch=3)
 
         return group
 
@@ -12753,7 +22768,9 @@ class pyNuD_simulator(QMainWindow):
         if hasattr(self, 'tip_x_slider'):
             self.tip_x_slider.setValue(0)
             self.tip_y_slider.setValue(0)
-            self.tip_z_slider.setValue(25) # UI定義時の初期値
+            self.tip_z_slider.setValue(10)  # UI定義時の初期値 (2.0 nm)
+            self._sync_tip_spins_from_sliders()
+            self.update_tip_position()
 
     def _set_current_standard_view(self, view_plane):
         """Track and highlight the active XY/YZ/ZX standard view button."""
@@ -12784,15 +22801,15 @@ class pyNuD_simulator(QMainWindow):
             return
 
         camera = self.renderer.GetActiveCamera()
-
+        
         # 現在のカメラの状態を保存
         current_position = camera.GetPosition()
         current_focal_point = camera.GetFocalPoint()
         current_view_up = camera.GetViewUp()
-
+        
         # 現在のカメラと焦点の距離を計算
         distance = np.sqrt(sum((current_position[i] - current_focal_point[i]) ** 2 for i in range(3)))
-
+        
         # 分子の中心を計算
         bbox = vtk.vtkBoundingBox()
         if self.sample_actor and self.show_molecule_check.isChecked():
@@ -12802,7 +22819,7 @@ class pyNuD_simulator(QMainWindow):
         # MRCサーフェス
         if hasattr(self, 'mrc_actor') and self.mrc_actor is not None:
             bbox.AddBounds(self.mrc_actor.GetBounds())
-
+        
         if not bbox.IsValid():
             # 分子が表示されていない場合は、現在の焦点を中心とする
             molecule_center = current_focal_point
@@ -12833,16 +22850,16 @@ class pyNuD_simulator(QMainWindow):
             camera.SetPosition(new_position[0], new_position[1], new_position[2])
             camera.SetFocalPoint(molecule_center)
             camera.SetViewUp(0, 0, 1)
-
+        
         # PDB分子の回転適用後、MRCアクターにも同じ回転を適用
         if hasattr(self, 'mrc_actor') and self.mrc_actor is not None:
             self.mrc_actor.SetUserTransform(self.molecule_transform)
-
+        
         # Tipの表示/透明度制御
         self._update_tip_visual_state(
             self.show_tip_check.isChecked() if hasattr(self, 'show_tip_check') else True
         )
-
+        
         self.request_render()
         if self._is_dual_mode():
             self._sync_pymol_view_from_vtk()
@@ -12928,6 +22945,8 @@ class pyNuD_simulator(QMainWindow):
                     pass
             elif color_scheme == "By Chain":
                 self._pymol_apply_chain_colors(selection)
+            elif color_scheme == "By Domain":
+                self._pymol_apply_domain_colors(selection)
             elif color_scheme == "Single Color":
                 name = "pynud_single_color"
                 self._pymol_set_visible_color(name, self.current_single_color)
@@ -12970,6 +22989,61 @@ class pyNuD_simulator(QMainWindow):
                 self.pymol_cmd.color(name, f"({selection}) and chain {chain_id}")
         except Exception:
             self.pymol_cmd.color("chainbow", selection)
+
+    def _pymol_apply_domain_colors(self, selection):
+        """Color PyMOL residues using the current detected-domain assignments."""
+        data = getattr(self, "atoms_data", None)
+        domain_ids = getattr(self, "domain_ids", None)
+        if (
+            data is None
+            or domain_ids is None
+            or "chain_id" not in data
+            or "residue_id" not in data
+            or len(domain_ids) != len(data.get("x", []))
+        ):
+            self.pymol_cmd.color("atomic", selection)
+            return
+
+        chain_ids = np.asarray(data["chain_id"])
+        residue_ids = np.asarray(data["residue_id"])
+        icodes = np.asarray(data.get("icode", [""] * len(domain_ids)))
+        assignments = {}
+        seen = set()
+        for atom_index, domain_id in enumerate(np.asarray(domain_ids, dtype=int)):
+            if domain_id < 0:
+                continue
+            chain_id = str(chain_ids[atom_index]).strip()
+            resi = (
+                f"{str(residue_ids[atom_index]).strip()}"
+                f"{str(icodes[atom_index]).strip()}"
+            )
+            key = (int(domain_id), chain_id, resi)
+            if key in seen:
+                continue
+            seen.add(key)
+            assignments.setdefault((int(domain_id), chain_id), []).append(resi)
+
+        if not assignments:
+            self.pymol_cmd.color("atomic", selection)
+            return
+
+        unassigned_name = "pynud_domain_unassigned"
+        self._pymol_set_visible_color(unassigned_name, (0.55, 0.55, 0.55))
+        self.pymol_cmd.color(unassigned_name, selection)
+
+        # Keep individual PyMOL selection expressions reasonably short for
+        # large structures while preserving insertion-code residue IDs.
+        chunk_size = 200
+        for (domain_id, chain_id), residues in assignments.items():
+            color_name = f"pynud_domain_{domain_id}"
+            color = self.chain_colors[domain_id % len(self.chain_colors)]
+            self._pymol_set_visible_color(color_name, color)
+            for start in range(0, len(residues), chunk_size):
+                residue_expr = "+".join(residues[start:start + chunk_size])
+                terms = [f"({selection})", f"resi {residue_expr}"]
+                if chain_id:
+                    terms.append(f"chain {chain_id}")
+                self.pymol_cmd.color(color_name, " and ".join(terms))
 
     def _clear_pymol_structure_temp_file(self):
         path = getattr(self, "pymol_structure_temp_path", None)
@@ -13051,6 +23125,22 @@ class pyNuD_simulator(QMainWindow):
             print(f"[WARNING] Failed to write edited PyMOL structure: {e}")
             return self.current_structure_path
 
+    def _capture_pymol_view_before_object_reload(self, object_name):
+        """Preserve the camera when an existing PyMOL object will be reloaded."""
+        if not self._is_pymol_active() or self.pymol_cmd is None:
+            return None
+        try:
+            object_names = self.pymol_cmd.get_names("objects")
+            object_exists = str(object_name) in set(object_names or ())
+        except Exception:
+            # Older PyMOL builds may not expose get_names consistently. The
+            # cached path remains a useful fallback, but it must not be the
+            # primary check because callers intentionally clear it to reload.
+            object_exists = bool(getattr(self, "pymol_loaded_path", None))
+        if not object_exists:
+            return None
+        return self._capture_pymol_view()
+
     def _display_molecule_pymol(self):
         """PyMOLで分子を表示"""
         if not self._is_pymol_active():
@@ -13059,11 +23149,16 @@ class pyNuD_simulator(QMainWindow):
             return
 
         obj = self.pymol_object_name
+        edited_source_dirty = bool(
+            self._pymol_needs_edited_structure_source()
+            and getattr(self, "pymol_structure_temp_dirty", False)
+        )
         source_path = self._pymol_structure_source_path()
         if not source_path:
             return
         try:
-            if self.pymol_loaded_path != source_path:
+            if self.pymol_loaded_path != source_path or edited_source_dirty:
+                saved_view = self._capture_pymol_view_before_object_reload(obj)
                 # 既存オブジェクトを削除して再ロード
                 try:
                     self.pymol_cmd.delete(obj)
@@ -13089,7 +23184,16 @@ class pyNuD_simulator(QMainWindow):
                     self.pymol_cmd.matrix_reset(obj)
                 except Exception:
                     pass
-                self.pymol_cmd.orient(obj)
+                # Auto-orienting an edited structure changes the camera, often by
+                # about 90 degrees, making Flexible Fit look like it rotated the
+                # whole molecule. Preserve the user's view on every reload.
+                if saved_view is not None:
+                    try:
+                        self.pymol_cmd.set_view(saved_view)
+                    except Exception:
+                        pass
+                else:
+                    self.pymol_cmd.orient(obj)
         except Exception as e:
             print(f"[WARNING] PyMOL load failed: {e}")
             try:
@@ -13308,7 +23412,7 @@ class pyNuD_simulator(QMainWindow):
             self.afm_x_check.blockSignals(False)
             self.afm_y_check.blockSignals(False)
         self.update_afm_display()
-
+    
     def sync_rotation_widgets(self):
         """スライダーとスピンボックスの値を同期させ、Interactive Updateが有効な場合はリアルタイム更新も実行"""
         sender = self.sender()
@@ -13334,16 +23438,16 @@ class pyNuD_simulator(QMainWindow):
             slider.blockSignals(True)
             slider.setValue(int(new_val * 10))
             slider.blockSignals(False)
-
+        
         # 構造回転を適用
         self.apply_structure_rotation()
-
+        
         # Interactive Updateが有効で、スライダーからの変更の場合はリアルタイム更新
-        if (hasattr(self, 'interactive_update_check') and
-            self.interactive_update_check.isChecked() and
+        if (hasattr(self, 'interactive_update_check') and 
+            self.interactive_update_check.isChecked() and 
             isinstance(sender, QSlider)):
             self.run_simulation_immediate_controlled()
-
+    
     def start_rotation_update_timer(self):
         """
         スピンボックスからの回転更新を遅延させるためのタイマーを開始/リセットする。
@@ -13354,7 +23458,7 @@ class pyNuD_simulator(QMainWindow):
             self.rotation_update_timer = QTimer(self)  # 親ウィンドウを設定
             self.rotation_update_timer.setSingleShot(True)
             self.rotation_update_timer.timeout.connect(self.apply_rotation_and_trigger_simulation)
-
+        
         # 500ミリ秒後に更新を実行するようにタイマーを開始（またはリセット）
         self.rotation_update_timer.start(500)
 
@@ -13362,7 +23466,7 @@ class pyNuD_simulator(QMainWindow):
         """UIの操作完了後に、3Dモデルの回転を適用し、シミュレーションをトリガーする"""
         #print("Rotation change finished. Applying transform and triggering simulation if interactive.")
         self.apply_structure_rotation()
-
+        
         # Interactive Updateが有効な場合は高解像度シミュレーションをスケジュール
         if hasattr(self, 'interactive_update_check') and self.interactive_update_check.isChecked():
             if hasattr(self, 'schedule_high_res_simulation'):
@@ -13378,7 +23482,7 @@ class pyNuD_simulator(QMainWindow):
             if sender is widgets['slider'] or sender is widgets['spin']:
                 changed_axis = axis
                 break
-
+        
         if not changed_axis:
             return
 
@@ -13408,7 +23512,7 @@ class pyNuD_simulator(QMainWindow):
         try:
             # 変換行列を安全に初期化
             self.combined_transform.Identity()
-
+            
             # 変換行列の妥当性をチェック
             if self.base_transform is not None:
                 base_matrix = self.base_transform.GetMatrix()
@@ -13416,20 +23520,20 @@ class pyNuD_simulator(QMainWindow):
                     self.combined_transform.Concatenate(self.base_transform)
                 else:
                     print("[WARNING] Invalid base_transform, using identity")
-
+            
             if self.local_transform is not None:
                 local_matrix = self.local_transform.GetMatrix()
                 if self._is_transform_matrix_valid(local_matrix):
                     self.combined_transform.Concatenate(self.local_transform)
                 else:
                     print("[WARNING] Invalid local_transform, using identity")
-
+            
             # 最終的な変換行列の妥当性をチェック
             final_matrix = self.combined_transform.GetMatrix()
             if not self._is_transform_matrix_valid(final_matrix):
                 print("[WARNING] Invalid combined_transform, resetting to identity")
                 self.combined_transform.Identity()
-
+            
             # Keep hidden VTK overlay actors in sync even in PyMOL-only mode.
             if self.sample_actor:
                 self.sample_actor.SetUserTransform(self.combined_transform)
@@ -13444,12 +23548,12 @@ class pyNuD_simulator(QMainWindow):
             if self._is_pymol_active():
                 self._mark_pymol_interaction()
                 self._sync_pymol_object_ttt_from_vtk()
-
+                
         except Exception as e:
             print(f"[WARNING] Error in update_actor_transform: {e}")
             # エラーが発生した場合は単位行列にリセット
             self.combined_transform.Identity()
-
+    
     def _is_transform_matrix_valid(self, vtk_matrix):
         """VTK変換行列が妥当かどうかをチェック"""
         try:
@@ -13466,14 +23570,10 @@ class pyNuD_simulator(QMainWindow):
         """スライダー（絶対角）→ 差分回転をlocal_transformに適用"""
         if not hasattr(self, 'rotation_widgets'):
             return
-
+        
         # PDBデータまたはMRCデータのどちらかが読み込まれているかチェック
-        if (getattr(self, 'atoms_data', None) is None and
+        if (getattr(self, 'atoms_data', None) is None and 
             not (hasattr(self, 'mrc_data') and self.mrc_data is not None)):
-            return
-
-        # 実行中ワーカーのガード（元コードと同様）
-        if self.is_worker_running(getattr(self, 'sim_worker_silent', None), attr_name='sim_worker_silent'):
             return
 
         rx = float(self.rotation_widgets['X']['spin'].value())
@@ -13495,8 +23595,11 @@ class pyNuD_simulator(QMainWindow):
             self._display_pymol_tip_overlay()
 
         self.prev_rot['x'], self.prev_rot['y'], self.prev_rot['z'] = rx, ry, rz
+        self._record_manual_pose_geometry()
+        # Keep Impose model locked to the current rigid pose even while a
+        # silent AFM worker is still running.
         if self._is_impose_model_active():
-            self._queue_impose_overlay_refresh(0)
+            self._queue_impose_overlay_refresh(80)
         if trigger_simulation:
             self.trigger_interactive_simulation()
 
@@ -13826,11 +23929,12 @@ class pyNuD_simulator(QMainWindow):
             return 0.0, occupied_area_A2, span_area_A2, 0.0
 
         density = occupied_area_A2 / span_area_A2
-        min_density = 0.05
-        if uv.shape[0] >= 6:
-            contact_area_A2 = min(span_area_A2, occupied_area_A2 / min_density)
-        else:
-            contact_area_A2 = occupied_area_A2
+        # Contact area is the union of actually occupied projected disk cells.
+        # The former occupied/min_density expansion promoted a few widely
+        # separated contact atoms to the full convex-hull span. That made an
+        # arched, mostly floating molecule look better supported than a broad
+        # continuous contact patch.
+        contact_area_A2 = occupied_area_A2
         return float(contact_area_A2), float(occupied_area_A2), float(span_area_A2), float(density)
 
     def _eval_geo(self, coordsA, radiiA, n, delta_contact_A, lambda_var, grid_spacing_A=None):
@@ -13857,6 +23961,7 @@ class pyNuD_simulator(QMainWindow):
                 "n": n,
                 "d": d,
                 "score_geo": -1e300,
+                "support_score_A2": -1e300,
                 "contact_area_A2": 0.0,
                 "tie_score": -1e300,
                 "S_contact": 0.0,
@@ -13874,6 +23979,7 @@ class pyNuD_simulator(QMainWindow):
                 "n": n,
                 "d": d,
                 "score_geo": -1e300,
+                "support_score_A2": -1e300,
                 "contact_area_A2": 0.0,
                 "tie_score": -1e300,
                 "S_contact": 0.0,
@@ -13902,17 +24008,38 @@ class pyNuD_simulator(QMainWindow):
             var_norm = var / geom_scale
         if grid_spacing_A is None:
             grid_spacing_A = max(0.35, min(1.5, float(delta_contact_A) * 0.5))
+        # An atom just inside the contact tolerance must not contribute its
+        # entire vdW disk. Scaling radius by sqrt(proximity) makes projected
+        # disk area approximately linear in actual contact proximity.
+        contact_proximity = np.clip(w / delta_safe, 0.0, 1.0)
+        effective_contact_radii_A = (
+            radiiA[mask] * np.sqrt(contact_proximity)
+        )
         contact_area_A2, occupied_area_A2, span_area_A2, contact_density = self._projected_contact_area_metrics_A2(
             np.column_stack([u, v]),
-            radiiA[mask],
+            effective_contact_radii_A,
             grid_spacing_A,
         )
+        # A large contact patch is not physically persuasive when most of an
+        # elongated molecule is lifted far above it. Normalize thickness by a
+        # structure-size scale so globular and elongated models are treated
+        # consistently, then rank by contact area discounted for lift.
+        geom_scale_A = float(np.sqrt(max(
+            float(getattr(self, "_geom_var_scale", 1.0)),
+            1e-6,
+        )))
+        flatness_factor = float(np.exp(
+            -2.0 * max(height_A, 0.0) / geom_scale_A
+        ))
+        support_score_A2 = float(contact_area_A2 * flatness_factor)
         tie_score = float(wsum + lambda_var * var_norm - height_weight * height_norm)
-        score_geo = float(contact_area_A2)
+        score_geo = support_score_A2
         return {
             "n": n,
             "d": d,
             "score_geo": score_geo,
+            "support_score_A2": support_score_A2,
+            "flatness_factor": flatness_factor,
             "contact_area_A2": contact_area_A2,
             "occupied_area_A2": occupied_area_A2,
             "span_area_A2": span_area_A2,
@@ -13993,6 +24120,34 @@ class pyNuD_simulator(QMainWindow):
         self.molecule_transform.Identity()
         self.molecule_transform.SetMatrix(M)
 
+        # Find Initial Plane bakes orientation into base_transform and resets
+        # Rotation XYZ to zero. Any previous Estimate Pose residual is stale.
+        self.pose_seed_from_initial_plane = True
+        ranked_faces = getattr(
+            self,
+            "last_initial_plane_result",
+            {},
+        )
+        self.pose_support_constraint_active = bool(
+            isinstance(ranked_faces, dict)
+            and ranked_faces.get("support_pose_candidates")
+        )
+        self.pose_support_active_face_rank = int(
+            ranked_faces.get("applied_face_rank", 1)
+            if isinstance(ranked_faces, dict)
+            else 1
+        )
+        pose = dict(getattr(self, "pose", None) or {})
+        pose = self._clear_estimated_pose_markers(pose)
+        pose.update({
+            "theta_deg": 0.0,
+            "dx_px": 0.0,
+            "dy_px": 0.0,
+            "mirror_mode": "none",
+        })
+        self.pose = pose
+        self.sim_aligned_nm = None
+
         self.update_actor_transform()
         if hasattr(self, 'set_standard_view'):
             self.set_standard_view('yz')
@@ -14009,7 +24164,7 @@ class pyNuD_simulator(QMainWindow):
         if getattr(self, 'atoms_data', None) is None and not (hasattr(self, 'mrc_data') and self.mrc_data is not None):
             QMessageBox.warning(self, "Warning", "PDBまたはMRCファイルが読み込まれていません。")
             return
-
+        
         # --- PDB: contact-patch based search ---
         if getattr(self, 'atoms_data', None) is not None:
             # parameters (Å) + electrostatics
@@ -14119,12 +24274,18 @@ class pyNuD_simulator(QMainWindow):
 
             directions = self._fibonacci_sphere_directions(N_dir)
             heap = []
+            directional_seed_pool = []
+            directional_seed_cosine = float(np.cos(np.deg2rad(18.0)))
             import heapq
             heap_counter = 0
 
             def _geo_key(res):
                 return (
-                    float(res.get("contact_area_A2", res.get("score_geo", 0.0))),
+                    float(res.get(
+                        "support_score_A2",
+                        res.get("score_geo", 0.0),
+                    )),
+                    float(res.get("contact_area_A2", 0.0)),
                     float(res.get("tie_score", 0.0)),
                     float(res.get("S_contact", 0.0)),
                     -float(res.get("height_norm", np.inf)),
@@ -14143,6 +24304,28 @@ class pyNuD_simulator(QMainWindow):
                 key_geo = _geo_key(res_geo)
                 if _geo_better(res_geo, best_geo):
                     best_geo = res_geo
+                # Keep the best seed in each broad normal-direction basin.
+                # A pure top-K heap is easily filled by near-duplicates of one
+                # large face and can otherwise discard the opposite face.
+                nearest_index = None
+                nearest_dot = -1.0
+                for pool_index, pool_candidate in enumerate(
+                    directional_seed_pool
+                ):
+                    dot = float(np.dot(n, pool_candidate["n"]))
+                    if dot > nearest_dot:
+                        nearest_dot = dot
+                        nearest_index = pool_index
+                if (
+                    nearest_index is None
+                    or nearest_dot < directional_seed_cosine
+                ):
+                    directional_seed_pool.append(res_geo)
+                elif _geo_better(
+                    res_geo,
+                    directional_seed_pool[nearest_index],
+                ):
+                    directional_seed_pool[nearest_index] = res_geo
                 if len(heap) < K_local:
                     heapq.heappush(heap, (key_geo, heap_counter, res_geo))
                     heap_counter += 1
@@ -14180,8 +24363,14 @@ class pyNuD_simulator(QMainWindow):
                                 n = best["n"]
                 return best
 
+            heap_results = [res for _, _, res in heap]
+            refinement_seeds = self._select_distinct_support_planes(
+                heap_results + directional_seed_pool,
+                K_local,
+                min_separation_deg=18.0,
+            )
             refined_results = []
-            for _, _, res in heap:
+            for res in refinement_seeds:
                 refined = refine_direction_geo(res["n"])
                 if refined is not None:
                     refined_results.append(refined)
@@ -14192,15 +24381,28 @@ class pyNuD_simulator(QMainWindow):
                 QMessageBox.warning(self, "Warning", "最適法線の探索に失敗しました。")
                 return
 
-            refined_results.sort(key=_geo_key, reverse=True)
             K_geom = min(K_geom, len(refined_results))
-            candidates = refined_results[:K_geom]
+            candidates = self._select_distinct_support_planes(
+                refined_results,
+                K_geom,
+                min_separation_deg=20.0,
+            )
+            if not candidates:
+                QMessageBox.warning(
+                    self,
+                    "Warning",
+                    "独立した支持面候補を選択できませんでした。",
+                )
+                return
             best_geo_candidate = candidates[0]
 
             # Stage 2: electrostatics re-ranking (optional)
             best_final = None
             best_final_key = None
-            best_contact_area = max(c.get("contact_area_A2", 0.0) for c in candidates) if candidates else 0.0
+            best_support_score = max(
+                c.get("support_score_A2", c.get("score_geo", 0.0))
+                for c in candidates
+            ) if candidates else 0.0
             for c in candidates:
                 c["Qshell"] = 0.0
                 c["S_elec"] = 0.0
@@ -14208,19 +24410,29 @@ class pyNuD_simulator(QMainWindow):
                 c["score_final"] = c["score_geo"]
                 final_key = _geo_key(c)
                 if use_elec:
-                    area = float(c.get("contact_area_A2", 0.0))
+                    support_score = float(
+                        c.get("support_score_A2", c.get("score_geo", 0.0))
+                    )
                     elec = self._eval_elec(coordsR, qR, c["n"], c["d"], delta_elec_A, lambdaD_A, A_sub, s_sub)
-                    near_best_area = best_contact_area > 0.0 and area >= 0.95 * best_contact_area
-                    if not near_best_area:
+                    near_best_support = (
+                        best_support_score > 0.0
+                        and support_score >= 0.95 * best_support_score
+                    )
+                    if not near_best_support:
                         elec = {"Qshell": 0.0, "S_elec": 0.0, "Nr": 0}
                     c["Qshell"] = elec["Qshell"]
                     c["S_elec"] = elec["S_elec"]
                     c["Nr"] = elec["Nr"]
                     c["score_final"] = c["score_geo"] + alpha_elec * c["S_elec"]
-                    area_rank = best_contact_area if near_best_area else area
+                    support_rank = (
+                        best_support_score
+                        if near_best_support
+                        else support_score
+                    )
                     final_key = (
-                        float(area_rank),
+                        float(support_rank),
                         float(c.get("score_final", 0.0)),
+                        float(c.get("contact_area_A2", 0.0)),
                         float(c.get("tie_score", 0.0)),
                         -float(c.get("height_norm", np.inf)),
                     )
@@ -14230,12 +24442,58 @@ class pyNuD_simulator(QMainWindow):
             if best_final is None:
                 best_final = best_geo_candidate
 
-            # store result for reference (final)
+            # Store several distinct high-contact faces. Estimate Pose will
+            # compare their AFM projections instead of locking the structure
+            # to only the single Find Initial Plane winner.
+            center_nm = coords_atom_ang.mean(axis=0) / 10.0
+            support_pose_candidates = []
+            applied_face_rank = 1
+            best_final_normal = np.asarray(best_final["n"], dtype=float)
+            best_final_normal /= max(
+                float(np.linalg.norm(best_final_normal)),
+                1e-12,
+            )
+            for face_rank, candidate in enumerate(candidates, start=1):
+                candidate_normal = np.asarray(
+                    candidate["n"],
+                    dtype=float,
+                )
+                candidate_normal /= max(
+                    float(np.linalg.norm(candidate_normal)),
+                    1e-12,
+                )
+                if float(np.dot(candidate_normal, best_final_normal)) > 0.999:
+                    applied_face_rank = face_rank
+                support_pose_candidates.append({
+                    "rank": face_rank,
+                    "normal": candidate_normal,
+                    "rotation_matrix": self._rotation_matrix_align_support_normal(
+                        candidate_normal
+                    ),
+                    "contact_area_A2": float(
+                        candidate.get("contact_area_A2", 0.0)
+                    ),
+                    "support_score_A2": float(
+                        candidate.get(
+                            "support_score_A2",
+                            candidate.get("score_geo", 0.0),
+                        )
+                    ),
+                    "S_contact": float(candidate.get("S_contact", 0.0)),
+                    "height_A": float(candidate.get("height_A", 0.0)),
+                    "contact_atoms": int(candidate.get("Nc", 0)),
+                })
+
+            # Store result for reference (final).
             patch_indices = index_map[np.where(best_final["mask"])[0]] if best_final.get("mask") is not None else np.array([], dtype=int)
             self.last_initial_plane_result = {
                 "n_best": best_final["n"],
                 "d_best": best_final["d"],
                 "score_geo": best_final["score_geo"],
+                "support_score_A2": best_final.get(
+                    "support_score_A2",
+                    best_final["score_geo"],
+                ),
                 "score_final": best_final["score_final"],
                 "contact_area_A2": best_final.get("contact_area_A2", 0.0),
                 "occupied_area_A2": best_final.get("occupied_area_A2", 0.0),
@@ -14252,6 +24510,11 @@ class pyNuD_simulator(QMainWindow):
                 "Qshell": best_final.get("Qshell", 0.0),
                 "Nr": best_final.get("Nr", 0),
                 "patch_indices": patch_indices,
+                "surface_indices": np.asarray(index_map, dtype=int),
+                "delta_contact_A": float(delta_contact),
+                "support_pose_candidates": support_pose_candidates,
+                "applied_face_rank": int(applied_face_rank),
+                "center_nm": np.asarray(center_nm, dtype=float),
             }
 
             def _qsign(val):
@@ -14295,33 +24558,9 @@ class pyNuD_simulator(QMainWindow):
                 "substrate:", substrate_type if use_elec else "(off)",
             )
 
-            # rotate so that n_best aligns with -Z (support side is -Z)
-            n_best = best_final["n"]
-            target = np.array([0.0, 0.0, -1.0], dtype=float)
-            v = np.cross(n_best, target)
-            c = float(np.dot(n_best, target))
-            s = float(np.linalg.norm(v))
-            if s < 1e-8:
-                if c > 0:
-                    R = np.eye(3)
-                else:
-                    axis = self._make_perp_unit(n_best)
-                    ax = axis / max(1e-12, float(np.linalg.norm(axis)))
-                    x, y, z = ax
-                    R = np.array([
-                        [-1 + 2*x*x, 2*x*y, 2*x*z],
-                        [2*x*y, -1 + 2*y*y, 2*y*z],
-                        [2*x*z, 2*y*z, -1 + 2*z*z],
-                    ], dtype=float)
-            else:
-                vx = np.array([
-                    [0.0, -v[2], v[1]],
-                    [v[2], 0.0, -v[0]],
-                    [-v[1], v[0], 0.0],
-                ], dtype=float)
-                R = np.eye(3) + vx + (vx @ vx) * ((1.0 - c) / (s * s))
-
-            center_nm = (coords_atom_ang.mean(axis=0) / 10.0) if coords_atom_ang is not None else np.array([0.0, 0.0, 0.0])
+            # Display the best Find Initial Plane face now. Estimate Pose can
+            # still try the other ranked faces stored above.
+            R = self._rotation_matrix_align_support_normal(best_final["n"])
             self._apply_initial_plane_rotation(R, center_nm)
             return
 
@@ -14361,42 +24600,42 @@ class pyNuD_simulator(QMainWindow):
                 # 入力データの妥当性チェック
                 if X is None or len(X) == 0:
                     return float('inf'), 0
-
+                
                 if Rr is None or len(Rr) == 0:
                     return float('inf'), 0
-
+                
                 # 数値の安全性を確保（より厳格な範囲制限）
                 X_safe = np.clip(X, -1000, 1000)  # より狭い範囲
                 Rr_safe = np.clip(Rr, -100, 100)  # 回転行列は小さい値
-
+                
                 # 行列の形状をチェック
                 if X_safe.shape[1] != Rr_safe.shape[0]:
                     return float('inf'), 0
-
+                
                 # ゼロ除算を防ぐためのチェック
                 if np.any(np.abs(Rr_safe) < 1e-10):
                     return float('inf'), 0
-
+                
                 # 行列積を安全に実行
                 try:
                     with np.errstate(all='ignore'):  # 警告を無視
                         z = (X_safe @ Rr_safe)[:, 2]
                 except (OverflowError, RuntimeWarning, ValueError):
                     return float('inf'), 0
-
+                
                 # NaNやInfをチェック
                 if not np.all(np.isfinite(z)):
                     return float('inf'), 0
-
+                
                 # 結果の妥当性チェック
                 zmin = z.min()
                 zmax = z.max()
                 h = zmax - zmin
-
+                
                 # 厚みが異常に大きい場合は無効
                 if h > 1000 or not np.isfinite(h) or h < 0:
                     return float('inf'), 0
-
+                
                 # 接触原子数の計算
                 try:
                     cnt = int(np.count_nonzero(z - zmin <= eps_nm))
@@ -14404,9 +24643,9 @@ class pyNuD_simulator(QMainWindow):
                         return float('inf'), 0
                 except (OverflowError, ValueError):
                     return float('inf'), 0
-
+                
                 return h, cnt
-
+                
             except Exception as e:
                 # 全ての例外をキャッチ
                 return float('inf'), 0
@@ -14453,7 +24692,7 @@ class pyNuD_simulator(QMainWindow):
                 y = np.degrees(np.arctan2(-R[2,0], sy))
                 x = np.degrees(np.arctan2(-R[1,2], R[1,1]))
             # -180〜180に正規化
-            def _wrap(a):
+            def _wrap(a): 
                 return (a + 180) % 360 - 180
             return _wrap(x), _wrap(y), _wrap(z)
 
@@ -14509,7 +24748,7 @@ class pyNuD_simulator(QMainWindow):
         self.molecule_transform.SetMatrix(M)
 
         self.update_actor_transform()
-
+        
         if hasattr(self, 'set_standard_view'):
             self.set_standard_view('yz')
         if hasattr(self, 'trigger_interactive_simulation'):
@@ -14517,13 +24756,13 @@ class pyNuD_simulator(QMainWindow):
 
     def on_mouse_press(self, event):
         """直接的なマウスプレスイベントハンドラー"""
-
+        
         if event.button() == Qt.LeftButton:
             # キーの状態をチェック
             modifiers = event.modifiers()
             ctrl_pressed = bool(modifiers & Qt.ControlModifier)
             shift_pressed = bool(modifiers & Qt.ShiftModifier)
-
+            
             if ctrl_pressed and not shift_pressed:
                 self.actor_rotating = True
                 self.drag_start_pos = event.pos()
@@ -14534,7 +24773,7 @@ class pyNuD_simulator(QMainWindow):
                 self.pan_start_pos = event.pos()
                 event.accept()
                 return
-
+        
         # 通常のマウスイベントをVTKウィジェットの元のハンドラーに渡す
         if hasattr(self, 'original_mouse_press'):
             self.original_mouse_press(event)
@@ -14545,10 +24784,10 @@ class pyNuD_simulator(QMainWindow):
             if hasattr(self, 'drag_start_pos'):
                 dx = event.pos().x() - self.drag_start_pos.x()
                 dy = event.pos().y() - self.drag_start_pos.y()
-
+                
                 # 視点に応じた回転軸マッピング
                 self.update_rotation_from_drag_view_dependent(dx, dy)
-
+                
                 self.drag_start_pos = event.pos()
             event.accept()
             return
@@ -14556,38 +24795,44 @@ class pyNuD_simulator(QMainWindow):
             # パニング処理は後で実装
             event.accept()
             return
-
+        
         # 通常のマウスイベントをVTKウィジェットの元のハンドラーに渡す
         if hasattr(self, 'original_mouse_move'):
             self.original_mouse_move(event)
 
     def on_mouse_release(self, event):
         """直接的なマウスリリースイベントハンドラー"""
-
+        
         if event.button() == Qt.LeftButton:
             if self.actor_rotating:
                 self.actor_rotating = False
-
+                
                 # ★★★ 追加：ドラッグ終了時の高解像度シミュレーション ★★★
                 if self.interactive_update_check.isChecked():
                     self.schedule_high_res_simulation()
-
+                
                 event.accept()
                 return
             elif self.panning:
                 self.panning = False
                 event.accept()
                 return
-
+        
         # 通常のマウスイベントをVTKウィジェットの元のハンドラーに渡す
         if hasattr(self, 'original_mouse_release'):
             self.original_mouse_release(event)
 
     def reset_structure_rotation(self):
         """分子の回転をリセット（PDB/MRC読み込み時の状態に戻す）"""
+        # Reset All / loading another structure invalidates support faces that
+        # were defined in the previous transformed coordinate frame.
+        self.pose_seed_from_initial_plane = False
+        self.pose_support_constraint_active = False
+        self.pose_support_active_face_rank = 1
+        self.last_initial_plane_result = None
         if not hasattr(self, 'rotation_widgets'):
             return
-
+        
         # 回転ウィジェットを0にリセット
         for axis in ['X', 'Y', 'Z']:
             self.rotation_widgets[axis]['spin'].blockSignals(True)
@@ -14596,7 +24841,7 @@ class pyNuD_simulator(QMainWindow):
             self.rotation_widgets[axis]['slider'].setValue(0)
             self.rotation_widgets[axis]['spin'].blockSignals(False)
             self.rotation_widgets[axis]['slider'].blockSignals(False)
-
+        
         # prev_rotをリセット
         self.prev_rot = {'x': 0.0, 'y': 0.0, 'z': 0.0}
 
@@ -14614,7 +24859,7 @@ class pyNuD_simulator(QMainWindow):
             # キャッシュが古いとidentity再同期がskipされ、PyMOL object側だけ
             # 以前のTTT姿勢を保持するため、Reset時は強制的に再適用する。
             self._pymol_last_ttt = None
-
+        
         # アクターの変換を更新
         self.update_actor_transform()
         if self._is_dual_mode() and self._is_pymol_active():
@@ -14626,11 +24871,11 @@ class pyNuD_simulator(QMainWindow):
         """現在のカメラの向きから視点方向を判定"""
         if not hasattr(self, 'renderer') or not self.renderer:
             return 'free'
-
+        
         camera = self.renderer.GetActiveCamera()
         pos = camera.GetPosition()
         focal = camera.GetFocalPoint()
-
+        
         # カメラから焦点への方向ベクトル
         view_dir = [focal[i] - pos[i] for i in range(3)]
         # 正規化
@@ -14638,7 +24883,7 @@ class pyNuD_simulator(QMainWindow):
         if length < 1e-10:
             return 'free'
         view_dir = [d/length for d in view_dir]
-
+        
         # 各軸方向との内積で判定（閾値0.8）
         if abs(view_dir[2]) > 0.8:  # Z方向
             return 'xy'  # XY面を見ている
@@ -14792,7 +25037,7 @@ class pyNuD_simulator(QMainWindow):
         raw_x = current_rot_x + angle_x_delta
         raw_y = current_rot_y + angle_y_delta
         raw_z = current_rot_z + angle_z_delta
-
+        
         # 角度を-180から+180の範囲に正規化する
         new_rot_x = (raw_x + 180) % 360 - 180
         new_rot_y = (raw_y + 180) % 360 - 180
@@ -14802,24 +25047,24 @@ class pyNuD_simulator(QMainWindow):
         for axis in ['X', 'Y', 'Z']:
             self.rotation_widgets[axis]['spin'].blockSignals(True)
             self.rotation_widgets[axis]['slider'].blockSignals(True)
-
+        
         self.rotation_widgets['X']['spin'].setValue(new_rot_x)
         self.rotation_widgets['Y']['spin'].setValue(new_rot_y)
         self.rotation_widgets['Z']['spin'].setValue(new_rot_z)
-
+        
         # スライダーも同期
         self.rotation_widgets['X']['slider'].setValue(int(new_rot_x * 10))
         self.rotation_widgets['Y']['slider'].setValue(int(new_rot_y * 10))
         self.rotation_widgets['Z']['slider'].setValue(int(new_rot_z * 10))
-
+        
         # シグナルを再有効化
         for axis in ['X', 'Y', 'Z']:
             self.rotation_widgets[axis]['spin'].blockSignals(False)
             self.rotation_widgets[axis]['slider'].blockSignals(False)
-
+        
         # スライダー値を変更した後、回転を適用
         self.apply_structure_rotation()
-
+        
         # ★★★ 修正: ドラッグ中の制御されたリアルタイム更新 ★★★
         if self.interactive_update_check.isChecked():
             # ドラッグ中は制御付きで更新（頻度制限あり）
@@ -14834,7 +25079,7 @@ class pyNuD_simulator(QMainWindow):
             self.afm_y_check.isChecked(),
             self.afm_z_check.isChecked()
         ])
-
+        
         # 最低1つはチェックされている必要がある
         if checked_count == 0:
             # どのチェックボックスが最後に変更されたかを確認して元に戻す
@@ -14843,11 +25088,11 @@ class pyNuD_simulator(QMainWindow):
                 sender.blockSignals(True)  # 再帰呼び出しを防ぐ
                 sender.setChecked(True)
                 sender.blockSignals(False)
-
-            QMessageBox.warning(self, "Warning",
+                
+            QMessageBox.warning(self, "Warning", 
                             "At least one AFM view must be selected!")
             return
-
+        
         # 各パネルの表示/非表示を設定
         self.afm_x_frame.setVisible(self.afm_x_check.isChecked())
         self.afm_y_frame.setVisible(self.afm_y_check.isChecked())
@@ -14858,7 +25103,7 @@ class pyNuD_simulator(QMainWindow):
         if hasattr(self, 'afm_real_frame'):
             has_real = getattr(self, 'real_afm_nm', None) is not None
             self.afm_real_frame.setVisible(bool(has_real))
-
+        
         # デバッグ情報
         visible_views = []
         if self.afm_x_check.isChecked():
@@ -14867,7 +25112,7 @@ class pyNuD_simulator(QMainWindow):
             visible_views.append("Y")
         if self.afm_z_check.isChecked():
             visible_views.append("Z")
-
+        
         #print(f"AFM views visible: {', '.join(visible_views)}")
 
     def create_afm_image_panel(self, title):
@@ -14882,11 +25127,11 @@ class pyNuD_simulator(QMainWindow):
                 border-radius: 3px;
             }
         """)
-
+        
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(1)
-
+        
         # タイトルラベル
         title_label = QLabel(title)
         title_label.setStyleSheet("""
@@ -14902,7 +25147,7 @@ class pyNuD_simulator(QMainWindow):
         title_label.setAlignment(Qt.AlignCenter)
         title_label.setMaximumHeight(18)
         layout.addWidget(title_label)
-
+        
         # 画像コンテナ
         image_container = QWidget()
         image_container.setObjectName("afm_image_container")
@@ -14937,9 +25182,9 @@ class pyNuD_simulator(QMainWindow):
         image_layout.setCurrentWidget(placeholder)
 
         layout.addWidget(image_container)
-
+        
         return frame
-
+    
     def reset_camera(self):
         """カメラのリセット（デフォルトでXY平面視点）"""
         if self._is_pymol_active():
@@ -14952,12 +25197,12 @@ class pyNuD_simulator(QMainWindow):
                 return
         self.renderer.ResetCamera()
         camera = self.renderer.GetActiveCamera()
-
+        
         # デフォルトでXY平面視点に設定
         camera.SetViewUp(0, 1, 0)  # Y軸が上方向
         camera.SetPosition(0, 0, 15)  # Z軸の正方向から見る
         camera.SetFocalPoint(0, 0, 0)  # 原点を焦点に
-
+        
         self.renderer.ResetCameraClippingRange()
         self.request_render()
         if self._is_dual_mode():
@@ -15051,7 +25296,7 @@ class pyNuD_simulator(QMainWindow):
                 cam.SetFocalPoint(center[0], center[1], center[2])
         except Exception:
             pass
-
+    
     def setup_lighting(self):
         """ライティング設定"""
         # メインライト
@@ -15060,14 +25305,14 @@ class pyNuD_simulator(QMainWindow):
         light1.SetIntensity(0.8)
         light1.SetColor(1.0, 1.0, 1.0)
         self.renderer.AddLight(light1)
-
+        
         # フィルライト
         light2 = vtk.vtkLight()
         light2.SetPosition(-5, -5, 5)
         light2.SetIntensity(0.4)
         light2.SetColor(0.9, 0.9, 1.0)
         self.renderer.AddLight(light2)
-
+        
     def add_axes(self):
         """大きな座標軸を画面左下隅に追加"""
         # 座標軸アクターを作成
@@ -15076,104 +25321,104 @@ class pyNuD_simulator(QMainWindow):
         axes.SetCylinderRadius(0.05)        # ★★★ 線を細く（0.24→0.05） ★★★
         axes.SetShaftType(0)                # シンプルな軸
         axes.SetAxisLabels(1)               # ラベル表示
-
+        
         # ★★★ ラベルのフォントサイズは大きく維持 ★★★
         axes.GetXAxisCaptionActor2D().GetCaptionTextProperty().SetFontSize(54)  # 大きく維持
         axes.GetYAxisCaptionActor2D().GetCaptionTextProperty().SetFontSize(54)  # 大きく維持
         axes.GetZAxisCaptionActor2D().GetCaptionTextProperty().SetFontSize(54)  # 大きく維持
-
+        
         # 軸ラベルの色設定（より鮮明に）
         axes.GetXAxisCaptionActor2D().GetCaptionTextProperty().SetColor(1, 0.1, 0.1)  # より鮮明な赤
         axes.GetYAxisCaptionActor2D().GetCaptionTextProperty().SetColor(0.1, 1, 0.1)  # より鮮明な緑
         axes.GetZAxisCaptionActor2D().GetCaptionTextProperty().SetColor(0.1, 0.1, 1)  # より鮮明な青
-
+        
         # オリエンテーションマーカーウィジェットを作成
         self.orientation_widget = vtk.vtkOrientationMarkerWidget()
         self.orientation_widget.SetOrientationMarker(axes)
         self.orientation_widget.SetInteractor(self.interactor)
-
+        
         # ★★★ 位置とサイズを設定（左下隅、より小さく配置） ★★★
         self.orientation_widget.SetViewport(0.0, 0.0, 0.3, 0.3)  # 左下の30%×30%（60%→30%）
         self.orientation_widget.SetEnabled(True)
         self.orientation_widget.InteractiveOff()  # 相互作用を無効（邪魔にならない）
-
+    
     def debug_molecule_info(self):
         """分子情報のデバッグ表示"""
         if self.atoms_data is None:
             print("No molecule data available")
             QMessageBox.warning(self, "Debug", "No molecule data loaded!")
             return
-
+        
         atom_x = self.atoms_data['x']
-        atom_y = self.atoms_data['y']
+        atom_y = self.atoms_data['y'] 
         atom_z = self.atoms_data['z']
-
+        
         #print("\n" + "="*50)
         #print("MOLECULE DEBUG INFO")
         #print("="*50)
-
+        
         # 基本統計
         #print(f"Total atoms: {len(atom_x)}")
         #print(f"X range: {np.min(atom_x):.2f} to {np.max(atom_x):.2f}nm (size: {np.max(atom_x)-np.min(atom_x):.2f}nm)")
         #print(f"Y range: {np.min(atom_y):.2f} to {np.max(atom_y):.2f}nm (size: {np.max(atom_y)-np.min(atom_y):.2f}nm)")
         #print(f"Z range: {np.min(atom_z):.2f} to {np.max(atom_z):.2f}nm (size: {np.max(atom_z)-np.min(atom_z):.2f}nm)")
-
+        
         # 中心位置
         center_x = np.mean(atom_x)
         center_y = np.mean(atom_y)
         center_z = np.mean(atom_z)
         print(f"Center: ({center_x:.2f}, {center_y:.2f}, {center_z:.2f})nm")
-
+        
         # 推奨設定
         mol_size = max(np.max(atom_x)-np.min(atom_x), np.max(atom_y)-np.min(atom_y))
         recommended_scan = mol_size * 1.5
         recommended_tip_z = np.max(atom_z) + 2.0
-
+        
         #print(f"\nRECOMMENDED SETTINGS:")
         #print(f"Scan size: {recommended_scan:.1f}nm (current X: {self.spinScanXNm.value():.1f}nm)")
        # print(f"Tip Z position: {recommended_tip_z:.1f}nm (current: {self.afm_params['tip_z']:.1f}nm)")
-
+        
         # 探針位置チェック
         tip_x = self.afm_params['tip_x']
         tip_y = self.afm_params['tip_y']
         tip_z = self.afm_params['tip_z']
-
+        
         #print(f"\nTIP POSITION CHECK:")
         #print(f"Current tip: ({tip_x:.2f}, {tip_y:.2f}, {tip_z:.2f})nm")
-
+        
         # 分子との重なりチェック
-        if (np.min(atom_x) <= tip_x <= np.max(atom_x) and
+        if (np.min(atom_x) <= tip_x <= np.max(atom_x) and 
             np.min(atom_y) <= tip_y <= np.max(atom_y)):
             #print("✓ Tip is positioned over the molecule")
             pass
         else:
             #print("⚠ WARNING: Tip is NOT over the molecule!")
             pass
-
+        
         if tip_z > np.max(atom_z) + 1.0:
             #print("✓ Tip Z position is safe")
             pass
         else:
             #print("⚠ WARNING: Tip Z position may be too low!")
             pass
-
+        
         #print("="*50)
-
+        
         # UIに推奨設定を表示
         msg = f"""Debug Information:
-
+        
 Molecule size: {mol_size:.1f}nm
 Current scan size X: {self.spinScanXNm.value():.1f}nm
 Current scan size Y: {self.spinScanYNm.value():.1f}nm
 Recommended scan size: {recommended_scan:.1f}nm
 
-Current tip Z: {tip_z:.1f}nm
+Current tip Z: {tip_z:.1f}nm  
 Recommended tip Z: {recommended_tip_z:.1f}nm
 
 Tip over molecule: {np.min(atom_x) <= tip_x <= np.max(atom_x) and np.min(atom_y) <= tip_y <= np.max(atom_y)}
 
 Check console for detailed information."""
-
+        
         QMessageBox.information(self, "Debug Info", msg)
 
     def quick_collision_test(self):
@@ -15181,25 +25426,25 @@ Check console for detailed information."""
         if self.atoms_data is None:
             print("No molecule data available")
             return
-
+        
         atom_x = self.atoms_data['x']
         atom_y = self.atoms_data['y']
         atom_z = self.atoms_data['z']
         atom_elem = self.atoms_data['element']
         atom_radii = np.array([self.vdw_radii.get(e, self.vdw_radii['other']) for e in atom_elem])
-
+        
         # 分子の中心での衝突テスト
         center_x = np.mean(atom_x)
         center_y = np.mean(atom_y)
         test_z = np.max(atom_z) + 3.0
-
+        
         #print(f"\nQUICK COLLISION TEST:")
         #print(f"Test point: ({center_x:.2f}, {center_y:.2f}, {test_z:.2f})nm")
-
+        
         try:
             height = self.find_collision_height(center_x, center_y, atom_x, atom_y, atom_z, atom_radii)
             #print(f"Calculated collision height: {height:.3f}nm")
-
+            
             # 妥当性チェック
             if height > np.max(atom_z):
                 #print("✓ Result seems reasonable (above molecule)")
@@ -15207,9 +25452,9 @@ Check console for detailed information."""
             else:
                 #print("⚠ WARNING: Result may be too low")
                 result_msg = f"⚠ Collision test FAILED\n\nTest point: ({center_x:.2f}, {center_y:.2f})\nCalculated height: {height:.3f}nm\nMolecule top: {np.max(atom_z):.3f}nm\n\nHeight is too low!"
-
+                
             QMessageBox.information(self, "Collision Test", result_msg)
-
+            
         except Exception as e:
             print(f"ERROR in collision calculation: {e}")
             QMessageBox.critical(self, "Error", f"Collision test failed:\n{str(e)}")
@@ -15219,66 +25464,74 @@ Check console for detailed information."""
         if self.atoms_data is None:
             QMessageBox.warning(self, "Warning", "No molecule data loaded!")
             return
-
+        
         atom_x = self.atoms_data['x']
-        atom_y = self.atoms_data['y']
+        atom_y = self.atoms_data['y'] 
         atom_z = self.atoms_data['z']
-
+        
         # 推奨設定を計算
         mol_size = max(np.max(atom_x)-np.min(atom_x), np.max(atom_y)-np.min(atom_y))
         recommended_scan = mol_size * 1.5
-        recommended_tip_z = np.max(atom_z) + 2.0
-
+        tip_z = self._get_tip_z_nm()
+        
         # UIに設定を適用
         self.spinScanXNm.setValue(recommended_scan)
         self.spinScanYNm.setValue(recommended_scan)
-
-        # 探針Z位置を設定（スライダー値に変換）
-        slider_value = int(recommended_tip_z * 5.0)  # z = value / 5.0 の逆算
-        slider_value = max(self.tip_z_slider.minimum(),
-                          min(self.tip_z_slider.maximum(), slider_value))
-        self.tip_z_slider.setValue(slider_value)
-
-        # 探針を分子中心に移動
+        
+        # Keep tip Z unchanged (display-only; not used by AFM simulation).
+        # Move tip XY to the molecule center.
         center_x = np.mean(atom_x)
         center_y = np.mean(atom_y)
-
-        self.tip_x_slider.setValue(int(center_x * 5.0))  # x = value / 5.0 の逆算
-        self.tip_y_slider.setValue(int(center_y * 5.0))  # y = value / 5.0 の逆算
-
+        
+        self._set_tip_center_xy_nm(center_x, center_y, update=True)
+        
         print(f"Applied recommended settings:")
         print(f"- Scan size: {recommended_scan:.1f}nm")
-        print(f"- Tip position: ({center_x:.1f}, {center_y:.1f}, {recommended_tip_z:.1f})nm")
-
-        QMessageBox.information(self, "Settings Applied",
+        print(f"- Tip position: ({center_x:.1f}, {center_y:.1f}, {tip_z:.1f})nm")
+        
+        QMessageBox.information(self, "Settings Applied", 
                                f"Recommended settings applied:\n\n"
                                f"Scan size: {recommended_scan:.1f}nm\n"
-                               f"Tip position: ({center_x:.1f}, {center_y:.1f}, {recommended_tip_z:.1f})nm")
+                               f"Tip XY: ({center_x:.1f}, {center_y:.1f})nm\n"
+                               f"Tip Z kept at {tip_z:.1f}nm")
 
-
+        
     def import_file(self):
         """統合ファイルインポート（PDB/CIF/MRC）"""
+        if getattr(self, "_structure_load_in_progress", False):
+            return
         initial_dir = self.last_import_dir if hasattr(self, 'last_import_dir') and self.last_import_dir else ""
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Select Structure File", initial_dir,
             "Structure Files (*.pdb *.cif *.mmcif *.mrc);;PDB files (*.pdb);;mmCIF files (*.cif *.mmcif);;MRC Files (*.mrc);;All Files (*)",
             options=QFileDialog.DontUseNativeDialog)
-
+        
         if not file_path:
             return
-
+        
         self.last_import_dir = os.path.dirname(file_path)
         ext = os.path.splitext(file_path)[1].lower()
-
-        if ext == '.pdb':
-            self._import_pdb_internal(file_path)
-        elif ext in ['.cif', '.mmcif']:
-            self._import_cif_internal(file_path)
-        elif ext == '.mrc':
-            self._import_mrc_internal(file_path)
-        else:
-            QMessageBox.warning(self, "Unsupported Format",
-                              f"File format '{ext}' is not supported.\nSupported formats: .pdb, .cif, .mmcif, .mrc")
+        
+        self._structure_load_in_progress = True
+        try:
+            if hasattr(self, "import_btn"):
+                self.import_btn.setEnabled(False)
+            if ext == '.pdb':
+                self._import_pdb_internal(file_path)
+            elif ext in ['.cif', '.mmcif']:
+                self._import_cif_internal(file_path)
+            elif ext == '.mrc':
+                self._import_mrc_internal(file_path)
+            else:
+                QMessageBox.warning(self, "Unsupported Format",
+                                  f"File format '{ext}' is not supported.\nSupported formats: .pdb, .cif, .mmcif, .mrc")
+        finally:
+            self._structure_load_in_progress = False
+            if hasattr(self, "import_btn"):
+                try:
+                    self.import_btn.setEnabled(True)
+                except RuntimeError:
+                    pass
 
     def _structure_path_from_mime(self, mime_data):
         """Return first supported local structure path from a Qt mime payload."""
@@ -15649,7 +25902,7 @@ Check console for detailed information."""
 
     def _import_pdb_internal(self, file_path):
         """PDBファイルの読み込み（内部メソッド）"""
-
+        load_stage = "initialization"
         try:
             # MRCデータをクリア（PDBファイルimport時）
             self.clear_mrc_data()
@@ -15686,79 +25939,71 @@ Check console for detailed information."""
             # プログレスバー表示
             self.progress_bar.setVisible(True)
             self.progress_bar.setValue(0)
-            QApplication.processEvents()
-
+            self.progress_bar.repaint()
+            
+            load_stage = "parsing atoms"
             self.read_pdb_file(file_path)
             self._store_original_atoms_data()
             self.progress_bar.setValue(50)
-            QApplication.processEvents()
-
+            self.progress_bar.repaint()
+            
+            load_stage = "updating sequence and statistics"
             self.update_statistics()
             self.selected_residue_keys = set()
             self._last_sequence_key = None
             self._rebuild_sequence_panel()
             self._update_sequence_control()
             self.progress_bar.setValue(70)
-            QApplication.processEvents()
-
+            self.progress_bar.repaint()
+            
+            load_stage = "building the molecular view"
             self.display_molecule()
             self.progress_bar.setValue(90)
-            QApplication.processEvents()
+            self.progress_bar.repaint()
 
             # ロード直後にモデルが画面内に収まるように調整
             self.fit_view_to_contents()
             self.set_standard_view('xy')
-
+            
             self.create_tip()
-             # ★★★ ここから追加 ★★★
-            # PDB構造の最高点から2nm上に探針の初期位置を設定
-            if self.atoms_data is not None:
-                z_max = self.atoms_data['z'].max()
-                initial_tip_z = z_max + 2.0
-
-                # Z位置スライダーの物理値と表示値を更新
-                # スライダー値は物理値の5倍 (z = value / 5.0 の逆算)
-                slider_value = int(initial_tip_z * 5.0)
-
-                # スライダーが設定可能な範囲内に収まるように調整
-                min_val, max_val = self.tip_z_slider.minimum(), self.tip_z_slider.maximum()
-                slider_value = max(min_val, min(max_val, slider_value))
-
-                # スライダーの値を設定 (これによりupdate_tip_positionが自動で呼ばれる)
-                self.tip_z_slider.setValue(slider_value)
-            # ★★★ ここまで追加 ★★★
+            # Tip Z is display-only and is not used by AFM simulation /
+            # Estimate Pose. Keep the UI default (2.0 nm) instead of raising
+            # it to molecule height (which clamped to the 20 nm slider max).
+            self.update_tip_position()
+            load_stage = "finalizing controls"
             self.progress_bar.setValue(100)
-            QApplication.processEvents()
-
+            self.progress_bar.repaint()
+            
             # ファイル名表示
-            self.pdb_name = os.path.basename(file_path)
+            self.pdb_name = os.path.basename(file_path) 
             self.pdb_id = os.path.splitext(self.pdb_name)[0]
             self.file_label.setText(f"File Name: {self.pdb_name} (PDB)")
-
+            
             # シミュレーションボタンを有効化
             self.simulate_btn.setEnabled(True)
-
+            
             # 回転ウィジェットも有効化
             if hasattr(self, 'rotation_widgets'):
                 for axis in ['X', 'Y', 'Z']:
                     self.rotation_widgets[axis]['spin'].setEnabled(True)
                     self.rotation_widgets[axis]['slider'].setEnabled(True)
-
+            
             # プログレスバー非表示
             QTimer.singleShot(1000, lambda: self.progress_bar.setVisible(False))
 
             # Default behavior: auto-run a first simulation when Interactive Update is enabled.
             if hasattr(self, 'interactive_update_check') and self.interactive_update_check.isChecked():
                 QTimer.singleShot(0, self.trigger_interactive_simulation)
-
-            QMessageBox.information(self, "Success",
+            
+            QMessageBox.information(self, "Success", 
                                 f"Successfully loaded {self.pdb_name}\n"
                                 f"Atoms: {len(self.atoms_data['x'])}")
-
+            
         except Exception as e:
+            traceback.print_exc()
             self.progress_bar.setVisible(False)
-            QMessageBox.critical(self, "Error",
-                            f"Failed to load PDB file:\n{str(e)}")
+            QMessageBox.critical(self, "Error", 
+                            f"Failed to load PDB file ({load_stage}):\n{str(e)}")
 
     def _import_cif_internal(self, file_path):
         """mmCIFファイルの読み込み（内部メソッド）"""
@@ -15823,14 +26068,9 @@ Check console for detailed information."""
             self.set_standard_view('xy')
 
             self.create_tip()
-            # 分子の最高点から2nm上に探針の初期位置を設定
-            if self.atoms_data is not None:
-                z_max = self.atoms_data['z'].max()
-                initial_tip_z = z_max + 2.0
-                slider_value = int(initial_tip_z * 5.0)  # z = value / 5.0 の逆算
-                min_val, max_val = self.tip_z_slider.minimum(), self.tip_z_slider.maximum()
-                slider_value = max(min_val, min(max_val, slider_value))
-                self.tip_z_slider.setValue(slider_value)
+            # Tip Z is display-only; keep the UI default rather than clamping
+            # molecule height into the 20 nm slider maximum.
+            self.update_tip_position()
 
             self.progress_bar.setValue(100)
             QApplication.processEvents()
@@ -15864,13 +26104,13 @@ Check console for detailed information."""
         except Exception as e:
             self.progress_bar.setVisible(False)
             QMessageBox.critical(self, "Error", f"Failed to load mmCIF file:\n{str(e)}")
-
+            
     def read_pdb_file(self, file_path):
         """PDBファイルの解析"""
         atoms = []
         helices = []  # (chain_id, start_residue, end_residue)
         sheets = []   # (chain_id, start_residue, end_residue)
-
+        
         with open(file_path, 'r') as file:
             for line_num, line in enumerate(file, 1):
                 # HELIXレコードの解析
@@ -15882,7 +26122,7 @@ Check console for detailed information."""
                         helices.append((chain_id, start_residue, end_residue))
                     except (ValueError, IndexError):
                         pass
-
+                
                 # SHEETレコードの解析
                 elif line.startswith('SHEET'):
                     try:
@@ -15892,7 +26132,7 @@ Check console for detailed information."""
                         sheets.append((chain_id, start_residue, end_residue))
                     except (ValueError, IndexError):
                         pass
-
+                
                 # ATOM/HETATMレコードの解析
                 elif line.startswith('ATOM') or line.startswith('HETATM'):
                     try:
@@ -15902,22 +26142,22 @@ Check console for detailed information."""
                         chain_id = line[21:22].strip()
                         residue_id = int(line[22:26].strip())
                         icode = line[26:27].strip()
-
+                        
                         x = float(line[30:38]) / 10.0  # Åからnmに変換
                         y = float(line[38:46]) / 10.0
                         z = float(line[46:54]) / 10.0
-
+                        
                         # 元素名取得
                         element = line[76:78].strip()
                         if not element:
                             element = atom_name[0]
-
+                        
                         # B-factor取得
                         try:
                             b_factor = float(line[60:66])
                         except:
                             b_factor = 20.0
-
+                        
                         atoms.append({
                             'name': atom_name,
                             'x': x, 'y': y, 'z': z,
@@ -15928,14 +26168,14 @@ Check console for detailed information."""
                             'icode': icode,
                             'b_factor': b_factor
                         })
-
+                        
                     except (ValueError, IndexError) as e:
                         print(f"Error parsing line {line_num}: {e}")
                         continue
-
+        
         if not atoms:
             raise ValueError("No valid atoms found in PDB file")
-
+        
         # numpy配列に変換
         self.atoms_data = {
             'x': np.array([atom['x'] for atom in atoms]),
@@ -15950,31 +26190,31 @@ Check console for detailed information."""
             'b_factor': np.array([atom['b_factor'] for atom in atoms])
         }
         self._clear_domain_state()
-
+        
         # 二次構造情報を辞書に格納
         self.secondary_structure = {}
-
+        
         # ヘリックスを登録
         for chain_id, start_res, end_res in helices:
             for res_id in range(start_res, end_res + 1):
                 key = (chain_id, res_id)
                 self.secondary_structure[key] = 'H'
-
+        
         # シートを登録
         for chain_id, start_res, end_res in sheets:
             for res_id in range(start_res, end_res + 1):
                 key = (chain_id, res_id)
                 self.secondary_structure[key] = 'E'
-
+        
         # 座標を中心化
         self.center_coordinates()
-
+        
         print(f"Loaded {len(atoms)} atoms")
         if helices:
             print(f"Found {len(helices)} helix regions (from PDB)")
         if sheets:
             print(f"Found {len(sheets)} sheet regions (from PDB)")
-
+        
         # HELIX/SHEETレコードがない、または少ない場合は幾何学的検出を実行
         if len(helices) + len(sheets) < 3:
             print("Running geometric secondary structure detection...")
@@ -16201,7 +26441,7 @@ Check console for detailed information."""
 
         self.center_coordinates()
         print(f"Loaded {len(atoms)} atoms from mmCIF")
-
+    
     def detect_secondary_structure_geometric(self):
         """
         幾何学的な二次構造検出（PyMOL風）
@@ -16209,23 +26449,23 @@ Check console for detailed information."""
         """
         if self.atoms_data is None:
             return
-
+        
         # Cα原子のみを抽出
         mask = (self.atoms_data['atom_name'] == 'CA')
         if not np.any(mask):
             return
-
+        
         ca_x = self.atoms_data['x'][mask]
         ca_y = self.atoms_data['y'][mask]
         ca_z = self.atoms_data['z'][mask]
         chain_ids = self.atoms_data['chain_id'][mask]
         residue_ids = self.atoms_data['residue_id'][mask]
-
+        
         unique_chains = np.unique(chain_ids)
-
+        
         helix_count = 0
         sheet_count = 0
-
+        
         for chain in unique_chains:
             # チェーン内のCα原子を抽出
             chain_mask = (chain_ids == chain)
@@ -16233,53 +26473,53 @@ Check console for detailed information."""
             c_y = ca_y[chain_mask]
             c_z = ca_z[chain_mask]
             c_res_id = residue_ids[chain_mask]
-
+            
             # 残基ID順にソート
             sort_idx = np.argsort(c_res_id)
             c_x = c_x[sort_idx]
             c_y = c_y[sort_idx]
             c_z = c_z[sort_idx]
             c_res_id_sorted = c_res_id[sort_idx]
-
+            
             if len(c_x) < 5:
                 continue
-
+            
             # 各残基について二次構造を判定
             for i in range(len(c_x)):
                 res_id = c_res_id_sorted[i]
                 key = (chain, res_id)
-
+                
                 # 既に二次構造が割り当てられている場合はスキップ
                 if key in self.secondary_structure:
                     continue
-
+                
                 # ヘリックス検出: i, i+3, i+4 の距離パターン
                 is_helix = False
                 if i + 4 < len(c_x):
                     # 隣接CA間の距離
-                    d1 = np.sqrt((c_x[i+1] - c_x[i])**2 +
-                                 (c_y[i+1] - c_y[i])**2 +
+                    d1 = np.sqrt((c_x[i+1] - c_x[i])**2 + 
+                                 (c_y[i+1] - c_y[i])**2 + 
                                  (c_z[i+1] - c_z[i])**2)
-
+                    
                     # i と i+3 の距離（ヘリックスの特徴）
-                    d3 = np.sqrt((c_x[i+3] - c_x[i])**2 +
-                                 (c_y[i+3] - c_y[i])**2 +
+                    d3 = np.sqrt((c_x[i+3] - c_x[i])**2 + 
+                                 (c_y[i+3] - c_y[i])**2 + 
                                  (c_z[i+3] - c_z[i])**2)
-
+                    
                     # i と i+4 の距離（ヘリックスの特徴）
-                    d4 = np.sqrt((c_x[i+4] - c_x[i])**2 +
-                                 (c_y[i+4] - c_y[i])**2 +
+                    d4 = np.sqrt((c_x[i+4] - c_x[i])**2 + 
+                                 (c_y[i+4] - c_y[i])**2 + 
                                  (c_z[i+4] - c_z[i])**2)
-
+                    
                     # ヘリックスの判定基準
                     # - 隣接CA距離: 約3.6-4.0Å (0.36-0.40 nm)
                     # - i→i+3距離: 約5.0-5.5Å (0.50-0.55 nm)
                     # - i→i+4距離: 約5.8-6.5Å (0.58-0.65 nm)
-                    if (0.34 < d1 < 0.42 and
-                        0.48 < d3 < 0.58 and
+                    if (0.34 < d1 < 0.42 and 
+                        0.48 < d3 < 0.58 and 
                         0.56 < d4 < 0.68):
                         is_helix = True
-
+                
                 if is_helix:
                     self.secondary_structure[key] = 'H'
                     helix_count += 1
@@ -16288,14 +26528,14 @@ Check console for detailed information."""
                     is_sheet = False
                     if i + 2 < len(c_x) and i > 0:
                         # 隣接CA間の距離が約3.3-3.5Å (シートの特徴)
-                        d1 = np.sqrt((c_x[i+1] - c_x[i])**2 +
-                                     (c_y[i+1] - c_y[i])**2 +
+                        d1 = np.sqrt((c_x[i+1] - c_x[i])**2 + 
+                                     (c_y[i+1] - c_y[i])**2 + 
                                      (c_z[i+1] - c_z[i])**2)
-
-                        d_prev = np.sqrt((c_x[i] - c_x[i-1])**2 +
-                                        (c_y[i] - c_y[i-1])**2 +
+                        
+                        d_prev = np.sqrt((c_x[i] - c_x[i-1])**2 + 
+                                        (c_y[i] - c_y[i-1])**2 + 
                                         (c_z[i] - c_z[i-1])**2)
-
+                        
                         # シートの判定基準
                         # - CA間距離: 約3.2-3.5Å (0.32-0.35 nm)
                         # - 比較的伸びた構造
@@ -16303,65 +26543,65 @@ Check console for detailed information."""
                             # 前後の点を含めて判定
                             if i + 2 < len(c_x):
                                 # 3つの連続したCAがほぼ直線状かチェック
-                                vec1 = np.array([c_x[i] - c_x[i-1],
-                                                c_y[i] - c_y[i-1],
+                                vec1 = np.array([c_x[i] - c_x[i-1], 
+                                                c_y[i] - c_y[i-1], 
                                                 c_z[i] - c_z[i-1]])
-                                vec2 = np.array([c_x[i+1] - c_x[i],
-                                                c_y[i+1] - c_y[i],
+                                vec2 = np.array([c_x[i+1] - c_x[i], 
+                                                c_y[i+1] - c_y[i], 
                                                 c_z[i+1] - c_z[i]])
-
+                                
                                 # ベクトルを正規化
                                 vec1_norm = np.linalg.norm(vec1)
                                 vec2_norm = np.linalg.norm(vec2)
-
+                                
                                 if vec1_norm > 1e-6 and vec2_norm > 1e-6:
                                     vec1 = vec1 / vec1_norm
                                     vec2 = vec2 / vec2_norm
-
+                                    
                                     # 内積が大きい（ほぼ同じ方向）ならシート
                                     dot_product = np.dot(vec1, vec2)
                                     if dot_product > 0.85:  # 約30度以内
                                         is_sheet = True
-
+                    
                     if is_sheet:
                         self.secondary_structure[key] = 'E'
                         sheet_count += 1
                     else:
                         # デフォルトはコイル
                         self.secondary_structure[key] = 'C'
-
+        
         print(f"Geometric detection: {helix_count} helix, {sheet_count} sheet residues")
-
+        
     def center_coordinates(self):
         """座標を中心に移動"""
         for coord in ['x', 'y', 'z']:
             center = (self.atoms_data[coord].max() + self.atoms_data[coord].min()) / 2
             self.atoms_data[coord] -= center
-
+            
     def update_statistics(self):
         """原子統計の更新"""
         if self.atoms_data is None:
             return
-
+            
         total = len(self.atoms_data['x'])
         self.stats_labels['Total'].setText(f"Total: {total}")
-
+        
         for atom_type in ['C', 'O', 'N', 'H']:
             count = np.sum(self.atoms_data['element'] == atom_type)
             self.stats_labels[atom_type].setText(f"{atom_type}: {count}")
-
+        
         # その他の原子
         known_types = ['C', 'O', 'N', 'H']
         other_count = np.sum(~np.isin(self.atoms_data['element'], known_types))
         self.stats_labels['Other'].setText(f"Other: {other_count}")
-
+        
     def get_filtered_atoms(self):
         """表示フィルターに基づいて原子を選択"""
         if self.atoms_data is None:
             return None, None, None, None, None, None, None
-
+            
         atom_filter = self.atom_combo.currentText()
-
+        
         if atom_filter == "All Atoms":
             mask = np.ones(len(self.atoms_data['x']), dtype=bool)
         elif atom_filter == "Heavy Atoms":
@@ -16372,10 +26612,10 @@ Check console for detailed information."""
             mask = self.atoms_data['element'] == atom_filter
         else:
             mask = np.ones(len(self.atoms_data['x']), dtype=bool)
-
+        
         if not np.any(mask):
             return None, None, None, None, None, None, None
-
+            
         chain_ids = self.atoms_data['chain_id'][mask]
         try:
             if (
@@ -16392,7 +26632,7 @@ Check console for detailed information."""
         except Exception:
             chain_ids = self.atoms_data['chain_id'][mask]
 
-        return (self.atoms_data['x'][mask],
+        return (self.atoms_data['x'][mask], 
                 self.atoms_data['y'][mask],
                 self.atoms_data['z'][mask],
                 self.atoms_data['element'][mask],
@@ -16409,11 +26649,11 @@ Check console for detailed information."""
                 idx = 0
             return self.chain_colors[idx % len(self.chain_colors)]
         return (0.55, 0.55, 0.55)
-
+        
     def get_atom_color(self, element, chain_id, b_factor):
         """原子の色を取得"""
         color_scheme = self.color_combo.currentText()
-
+        
         if color_scheme == "By Element":
             base_color = self.element_colors.get(element, self.element_colors['other'])
         elif color_scheme == "By Chain":
@@ -16423,7 +26663,7 @@ Check console for detailed information."""
             base_color = self._domain_color_from_label(chain_id)
         elif color_scheme == "Single Color":
             # Single Colorの場合は選択された色を直接返す
-            base_color = self.current_single_color
+            base_color = self.current_single_color  
             #print(f"Using single color / 単色を使用: {base_color}")  # デバッグ用
         elif color_scheme == "By B-Factor":
             # B-factorを0-1に正規化（0-50の範囲を想定）
@@ -16440,11 +26680,11 @@ Check console for detailed information."""
                 base_color = (1, 1 - 0.5*t, 0)
         else:
             base_color = self.element_colors.get(element, self.element_colors['other'])
-
+        
         # 明るさファクターを適用
         adjusted_color = tuple(min(1.0, c * self.brightness_factor) for c in base_color)
         return adjusted_color
-
+        
     def display_molecule(self):
         """分子の表示"""
         if self.pymol_available:
@@ -16477,115 +26717,115 @@ Check console for detailed information."""
                 'Y': self.rotation_widgets['Y']['spin'].value(),
                 'Z': self.rotation_widgets['Z']['spin'].value()
             }
-
+            
         self.request_render()
-
+        
     def create_sphere_display(self, x, y, z, elements, chain_ids, b_factors, size_factor, resolution):
         """球体表示"""
         points = vtk.vtkPoints()
         colors = vtk.vtkUnsignedCharArray()
         colors.SetNumberOfComponents(3)
         colors.SetName("Colors")
-
+        
         # 全ての点と色を設定（Single Colorでも個別に設定）
         for i in range(len(x)):
             points.InsertNextPoint(x[i], y[i], z[i])
-
+            
             # 色を取得（Single Colorでも get_atom_color を通す）
             color = self.get_atom_color(elements[i], chain_ids[i], b_factors[i])
             colors.InsertNextTuple3(int(color[0]*255), int(color[1]*255), int(color[2]*255))
-
+        
         polydata = vtk.vtkPolyData()
         polydata.SetPoints(points)
         polydata.GetPointData().SetScalars(colors)
         polydata.Modified()
-
+        
         # 球体ソース
         sphere = vtk.vtkSphereSource()
         sphere.SetRadius(0.15 * size_factor)
         sphere.SetPhiResolution(resolution)
         sphere.SetThetaResolution(resolution)
-
+        
         glyph = vtk.vtkGlyph3D()
         glyph.SetInputData(polydata)
         glyph.SetSourceConnection(sphere.GetOutputPort())
         glyph.SetScaleModeToDataScalingOff()
         glyph.SetColorModeToColorByScalar()  # 重要：色をスカラーで制御
         glyph.Update()
-
+        
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(glyph.GetOutputPort())
         mapper.ScalarVisibilityOn()  # 常にOn
         mapper.SetScalarModeToUsePointData()  # ポイントデータを使用
         mapper.Update()
-
+        
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
         actor.GetProperty().SetSpecular(0.4)
         actor.GetProperty().SetSpecularPower(20)
-
+        
         return actor
-
+        
     def create_point_display(self, x, y, z, elements, chain_ids, b_factors, size_factor):
         """点表示"""
         points = vtk.vtkPoints()
         colors = vtk.vtkUnsignedCharArray()
         colors.SetNumberOfComponents(3)
         colors.SetName("Colors")
-
+        
         for i in range(len(x)):
             points.InsertNextPoint(x[i], y[i], z[i])
             color = self.get_atom_color(elements[i], chain_ids[i], b_factors[i])
             colors.InsertNextTuple3(int(color[0]*255), int(color[1]*255), int(color[2]*255))
-
+        
         polydata = vtk.vtkPolyData()
         polydata.SetPoints(points)
         polydata.GetPointData().SetScalars(colors)
         polydata.Modified()  # 追加
-
+        
         vertex_filter = vtk.vtkVertexGlyphFilter()
         vertex_filter.SetInputData(polydata)
         vertex_filter.Update()  # 追加
-
+        
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(vertex_filter.GetOutputPort())
         mapper.ScalarVisibilityOn()  # 追加
         mapper.Update()  # 追加
-
+        
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
         actor.GetProperty().SetPointSize(max(1, size_factor * 5))
-
+        
         return actor
-
+        
     def create_wireframe_display(self, x, y, z):
         """ワイヤーフレーム表示"""
         points = vtk.vtkPoints()
         for i in range(len(x)):
             points.InsertNextPoint(x[i], y[i], z[i])
-
+        
         polydata = vtk.vtkPolyData()
         polydata.SetPoints(points)
-
+        
         # Delaunay 3D
         delaunay = vtk.vtkDelaunay3D()
         delaunay.SetInputData(polydata)
-
+        
         # 表面抽出
         surface_filter = vtk.vtkDataSetSurfaceFilter()
         surface_filter.SetInputConnection(delaunay.GetOutputPort())
-
+        
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(surface_filter.GetOutputPort())
-
+        
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
         actor.GetProperty().SetRepresentationToWireframe()
         actor.GetProperty().SetColor(0.7, 0.7, 0.7)
         actor.GetProperty().SetLineWidth(1.5)
-
+        
         return actor
-
+        
     def create_simple_cartoon_display_safe(self):
         """
         簡易的なCartoon表示を作成（スプライン補間などを行わない安全な実装）
@@ -16594,47 +26834,47 @@ Check console for detailed information."""
         mask = (self.atoms_data['atom_name'] == 'CA')
         if not np.any(mask):
             return None
-
+            
         ca_x = self.atoms_data['x'][mask]
         ca_y = self.atoms_data['y'][mask]
         ca_z = self.atoms_data['z'][mask]
         chain_ids = self.atoms_data['chain_id'][mask]
         residue_ids = self.atoms_data['residue_id'][mask]
-
+        
         # チェーンごとにソート
         unique_chains = np.unique(chain_ids)
-
+        
         append_poly = vtk.vtkAppendPolyData()
-
+        
         for chain in unique_chains:
             chain_mask = (chain_ids == chain)
             c_x = ca_x[chain_mask]
             c_y = ca_y[chain_mask]
             c_z = ca_z[chain_mask]
             c_res_id = residue_ids[chain_mask]
-
+            
             # 残基ID順にソート
             sort_idx = np.argsort(c_res_id)
             c_x = c_x[sort_idx]
             c_y = c_y[sort_idx]
             c_z = c_z[sort_idx]
-
+            
             if len(c_x) < 2:
                 continue
-
+                
             points = vtk.vtkPoints()
             lines = vtk.vtkCellArray()
-
+            
             lines.InsertNextCell(len(c_x))
-
+            
             for i in range(len(c_x)):
                 points.InsertNextPoint(c_x[i], c_y[i], c_z[i])
                 lines.InsertCellPoint(i)
-
+                
             poly = vtk.vtkPolyData()
             poly.SetPoints(points)
             poly.SetLines(lines)
-
+            
             # チューブフィルターで太さを持たせる
             tube = vtk.vtkTubeFilter()
             tube.SetInputData(poly)
@@ -16642,21 +26882,21 @@ Check console for detailed information."""
             tube.SetNumberOfSides(8)
             tube.CappingOn()
             tube.Update()
-
+            
             append_poly.AddInputData(tube.GetOutput())
-
+            
         append_poly.Update()
-
+        
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(append_poly.GetOutputPort())
-
+        
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-
+        
         # 色は一律（またはチェーンごとに変えるなど改善の余地あり）
         # 这里ではAtomごとの色を取得して適用
         # 簡易実装では単色などにするが、既存動作に合わせる
-
+        
         return actor
 
     def create_ribbon_display(self, size_factor):
@@ -16673,7 +26913,7 @@ Check console for detailed information."""
             mask = (self.atoms_data['atom_name'] == 'P')
             if not np.any(mask):
                 return None
-
+            
         ca_x = self.atoms_data['x'][mask]
         ca_y = self.atoms_data['y'][mask]
         ca_z = self.atoms_data['z'][mask]
@@ -16681,11 +26921,11 @@ Check console for detailed information."""
         chain_ids = self.atoms_data['chain_id'][mask]
         residue_ids = self.atoms_data['residue_id'][mask]
         b_factors = self.atoms_data['b_factor'][mask]
-
+        
         unique_chains = np.unique(chain_ids)
-
+        
         append_poly = vtk.vtkAppendPolyData()
-
+        
         for chain in unique_chains:
             # チェーン内の原子を抽出
             chain_mask = (chain_ids == chain)
@@ -16695,7 +26935,7 @@ Check console for detailed information."""
             c_res_id = residue_ids[chain_mask]
             c_elements = elements[chain_mask]
             c_b_factors = b_factors[chain_mask]
-
+            
             # 残基ID順にソート
             sort_idx = np.argsort(c_res_id)
             c_x = c_x[sort_idx]
@@ -16704,47 +26944,47 @@ Check console for detailed information."""
             c_res_id_sorted = c_res_id[sort_idx]
             c_elements = c_elements[sort_idx]
             c_b_factors = c_b_factors[sort_idx]
-
+            
             if len(c_x) < 4:  # スプライン補間のため最低4点必要
                 continue
-
+            
             # 各残基の二次構造タイプを取得
             ss_types = []
             for res_id in c_res_id_sorted:
                 key = (chain, res_id)
                 ss_type = self.secondary_structure.get(key, 'C')  # デフォルトはコイル
                 ss_types.append(ss_type)
-
+            
             # Catmull-Romスプラインで滑らかに補間
             num_points = len(c_x)
             subdivisions = 10  # 各セグメント間の分割数
-
+            
             interpolated_points = []
             interpolated_colors = []
             interpolated_ss = []  # 二次構造タイプも補間点に関連付け
-
+            
             for i in range(num_points - 1):
                 # Catmull-Romスプライン用の4点を取得
                 p0_idx = max(0, i - 1)
                 p1_idx = i
                 p2_idx = i + 1
                 p3_idx = min(num_points - 1, i + 2)
-
+                
                 p0 = np.array([c_x[p0_idx], c_y[p0_idx], c_z[p0_idx]])
                 p1 = np.array([c_x[p1_idx], c_y[p1_idx], c_z[p1_idx]])
                 p2 = np.array([c_x[p2_idx], c_y[p2_idx], c_z[p2_idx]])
                 p3 = np.array([c_x[p3_idx], c_y[p3_idx], c_z[p3_idx]])
-
+                
                 # 色（p1とp2の間を補間）
                 color1 = self.get_atom_color(c_elements[p1_idx], chain, c_b_factors[p1_idx])
                 color2 = self.get_atom_color(c_elements[p2_idx], chain, c_b_factors[p2_idx])
-
+                
                 # 二次構造タイプ（p1を使用）
                 ss_type = ss_types[p1_idx]
-
+                
                 for j in range(subdivisions):
                     t = j / subdivisions
-
+                    
                     # Catmull-Romスプライン補間
                     point = 0.5 * (
                         (2 * p1) +
@@ -16752,9 +26992,9 @@ Check console for detailed information."""
                         (2*p0 - 5*p1 + 4*p2 - p3) * t**2 +
                         (-p0 + 3*p1 - 3*p2 + p3) * t**3
                     )
-
+                    
                     interpolated_points.append(point)
-
+                    
                     # 色を線形補間
                     interp_color = tuple(
                         color1[k] * (1 - t) + color2[k] * t
@@ -16762,27 +27002,27 @@ Check console for detailed information."""
                     )
                     interpolated_colors.append(interp_color)
                     interpolated_ss.append(ss_type)
-
+            
             # 最後の点を追加
             interpolated_points.append(np.array([c_x[-1], c_y[-1], c_z[-1]]))
             color_last = self.get_atom_color(c_elements[-1], chain, c_b_factors[-1])
             interpolated_colors.append(color_last)
             interpolated_ss.append(ss_types[-1])
-
+            
             # NumPy配列に変換
             interpolated_points = np.array(interpolated_points)
             n_interp = len(interpolated_points)
-
+            
             if n_interp < 3:
                 continue
-
+            
             # リボンメッシュを構築（二次構造に応じて幅を変える）
             points = vtk.vtkPoints()
             triangles = vtk.vtkCellArray()
             colors = vtk.vtkUnsignedCharArray()
             colors.SetNumberOfComponents(3)
             colors.SetName("Colors")
-
+            
             # 各補間点でリボンの左右の点を生成
             for i in range(n_interp):
                 # 二次構造に応じた幅を決定
@@ -16793,7 +27033,7 @@ Check console for detailed information."""
                     ribbon_width = 0.8 * size_factor
                 else:  # コイル
                     ribbon_width = 0.2 * size_factor
-
+                
                 # 接線ベクトル（進行方向）
                 if i == 0:
                     tangent = interpolated_points[1] - interpolated_points[0]
@@ -16801,20 +27041,20 @@ Check console for detailed information."""
                     tangent = interpolated_points[i] - interpolated_points[i-1]
                 else:
                     tangent = interpolated_points[i+1] - interpolated_points[i-1]
-
+                
                 tangent_norm = np.linalg.norm(tangent)
                 if tangent_norm > 1e-6:
                     tangent = tangent / tangent_norm
                 else:
                     tangent = np.array([1.0, 0.0, 0.0])
-
+                
                 # リボンの幅方向を計算
                 up = np.array([0.0, 0.0, 1.0])
-
+                
                 # 接線がZ軸と平行な場合は別の軸を使用
                 if abs(np.dot(tangent, up)) > 0.99:
                     up = np.array([1.0, 0.0, 0.0])
-
+                
                 # リボンの幅方向
                 width_dir = np.cross(tangent, up)
                 width_norm = np.linalg.norm(width_dir)
@@ -16822,206 +27062,228 @@ Check console for detailed information."""
                     width_dir = width_dir / width_norm
                 else:
                     width_dir = np.array([0.0, 1.0, 0.0])
-
+                
                 # 前の点との一貫性を保つため、必要に応じて方向を反転
                 if i > 0:
                     if np.dot(width_dir, prev_width_dir) < 0:
                         width_dir = -width_dir
-
+                
                 prev_width_dir = width_dir.copy()
-
+                
                 # リボンの左右の点
                 half_width = ribbon_width / 2.0
                 center = interpolated_points[i]
                 left_point = center - width_dir * half_width
                 right_point = center + width_dir * half_width
-
+                
                 # 点を追加
                 points.InsertNextPoint(left_point[0], left_point[1], left_point[2])
                 points.InsertNextPoint(right_point[0], right_point[1], right_point[2])
-
+                
                 # 色を設定
                 color = interpolated_colors[i]
                 color_tuple = (int(color[0]*255), int(color[1]*255), int(color[2]*255))
                 colors.InsertNextTuple3(*color_tuple)
                 colors.InsertNextTuple3(*color_tuple)
-
+                
                 # 三角形メッシュを構築
                 if i > 0:
                     prev_left = (i - 1) * 2
                     prev_right = (i - 1) * 2 + 1
                     curr_left = i * 2
                     curr_right = i * 2 + 1
-
+                    
                     # 三角形1
                     triangle1 = vtk.vtkTriangle()
                     triangle1.GetPointIds().SetId(0, prev_left)
                     triangle1.GetPointIds().SetId(1, curr_left)
                     triangle1.GetPointIds().SetId(2, prev_right)
                     triangles.InsertNextCell(triangle1)
-
+                    
                     # 三角形2
                     triangle2 = vtk.vtkTriangle()
                     triangle2.GetPointIds().SetId(0, curr_left)
                     triangle2.GetPointIds().SetId(1, curr_right)
                     triangle2.GetPointIds().SetId(2, prev_right)
                     triangles.InsertNextCell(triangle2)
-
+            
             # PolyDataを作成
             poly = vtk.vtkPolyData()
             poly.SetPoints(points)
             poly.SetPolys(triangles)
             poly.GetPointData().SetScalars(colors)
-
+            
             append_poly.AddInputData(poly)
-
+            
         append_poly.Update()
-
+        
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(append_poly.GetOutputPort())
         mapper.ScalarVisibilityOn()
         mapper.SetScalarModeToUsePointData()
-
+        
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-
+        
         # マテリアル設定
         actor.GetProperty().SetSpecular(0.5)
         actor.GetProperty().SetSpecularPower(40)
         actor.GetProperty().SetAmbient(0.3)
         actor.GetProperty().SetDiffuse(0.7)
-
+        
         return actor
-
+    
     def create_simple_ca_points(self, ca_x, ca_y, ca_z, ca_chains):
         """CAアトムの点表示（フォールバック用）"""
         points = vtk.vtkPoints()
         colors = vtk.vtkUnsignedCharArray()
         colors.SetNumberOfComponents(3)
         colors.SetName("Colors")
-
+        
         for i in range(len(ca_x)):
             points.InsertNextPoint(ca_x[i], ca_y[i], ca_z[i])
-
+            
             # チェーン色
             chain_hash = hash(ca_chains[i]) % len(self.chain_colors)
             color = self.chain_colors[chain_hash]
             colors.InsertNextTuple3(int(color[0]*255), int(color[1]*255), int(color[2]*255))
-
+        
         polydata = vtk.vtkPolyData()
         polydata.SetPoints(points)
         polydata.GetPointData().SetScalars(colors)
-
+        
         # 球体で表示
         sphere = vtk.vtkSphereSource()
         sphere.SetRadius(0.3)
         sphere.SetPhiResolution(12)
         sphere.SetThetaResolution(12)
-
+        
         glyph = vtk.vtkGlyph3D()
         glyph.SetInputData(polydata)
         glyph.SetSourceConnection(sphere.GetOutputPort())
         glyph.SetScaleModeToDataScalingOff()
-
+        
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(glyph.GetOutputPort())
-
+        
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
         actor.GetProperty().SetSpecular(0.4)
         actor.GetProperty().SetSpecularPower(20)
-
+        
         return actor
-
-    def create_ball_stick_display(self, x, y, z, elements, chain_ids, b_factors,
+        
+    def create_ball_stick_display(self, x, y, z, elements, chain_ids, b_factors, 
                                 size_factor, resolution):
         """ボール&スティック表示"""
-        return self.create_sphere_display(x, y, z, elements, chain_ids, b_factors,
+        return self.create_sphere_display(x, y, z, elements, chain_ids, b_factors, 
                                         size_factor * 0.7, resolution)
-
-    def create_stick_display(self, x, y, z, elements, chain_ids, b_factors,
+        
+    def create_stick_display(self, x, y, z, elements, chain_ids, b_factors, 
                            size_factor, resolution):
         """スティック表示"""
-        return self.create_sphere_display(x, y, z, elements, chain_ids, b_factors,
+        return self.create_sphere_display(x, y, z, elements, chain_ids, b_factors, 
                                         size_factor * 0.3, resolution)
-
-    def create_bonds_display(self, x, y, z, elements, chain_ids, b_factors,
+        
+    def create_bonds_display(self, x, y, z, elements, chain_ids, b_factors, 
                            bond_radius, resolution):
         """結合の表示"""
         if self.bonds_actor:
             self.renderer.RemoveActor(self.bonds_actor)
-
+            
         # 簡単な距離ベース結合判定
         points = vtk.vtkPoints()
         lines = vtk.vtkCellArray()
         colors = vtk.vtkUnsignedCharArray()
         colors.SetNumberOfComponents(3)
         colors.SetName("Colors")
-
+        
         # 全ての点を追加
         for i in range(len(x)):
             points.InsertNextPoint(x[i], y[i], z[i])
-
+        
         # 近接原子間で結合を作成（効率化のため制限）
         max_bonds = 10000
         bond_count = 0
-
+        
         for i in range(len(x)):
             if bond_count >= max_bonds:
                 break
-
+                
             for j in range(i + 1, min(i + 20, len(x))):  # 近くの原子のみチェック
                 if bond_count >= max_bonds:
                     break
-
+                    
                 dist = np.sqrt((x[i] - x[j])**2 + (y[i] - y[j])**2 + (z[i] - z[j])**2)
-
+                
                 # 結合距離判定
                 if dist < 0.18:  # 1.8 Å
                     line = vtk.vtkLine()
                     line.GetPointIds().SetId(0, i)
                     line.GetPointIds().SetId(1, j)
                     lines.InsertNextCell(line)
-
+                    
                     # 結合の色（平均色）
                     color1 = self.get_atom_color(elements[i], chain_ids[i], b_factors[i])
                     color2 = self.get_atom_color(elements[j], chain_ids[j], b_factors[j])
                     avg_color = [(color1[k] + color2[k])/2 for k in range(3)]
                     colors.InsertNextTuple3(
-                        int(avg_color[0]*255),
-                        int(avg_color[1]*255),
+                        int(avg_color[0]*255), 
+                        int(avg_color[1]*255), 
                         int(avg_color[2]*255)
                     )
-
+                    
                     bond_count += 1
-
+        
         if bond_count > 0:
             polydata = vtk.vtkPolyData()
             polydata.SetPoints(points)
             polydata.SetLines(lines)
             polydata.GetCellData().SetScalars(colors)
-
+            
             # チューブフィルター
             tube_filter = vtk.vtkTubeFilter()
             tube_filter.SetInputData(polydata)
             tube_filter.SetRadius(bond_radius)
             tube_filter.SetNumberOfSides(max(4, resolution // 2))
-
+            
             mapper = vtk.vtkPolyDataMapper()
             mapper.SetInputConnection(tube_filter.GetOutputPort())
-
+            
             self.bonds_actor = vtk.vtkActor()
             self.bonds_actor.SetMapper(mapper)
             self.bonds_actor.GetProperty().SetSpecular(0.3)
             self.bonds_actor.GetProperty().SetSpecularPower(20)
-
+            
             self.renderer.AddActor(self.bonds_actor)
-
+        
     def _get_tip_position_nm(self):
         """Return current tip position in pyNuD/simulation coordinates (nm)."""
-        x = self.tip_x_slider.value() / 5.0 if hasattr(self, 'tip_x_slider') else 0.0
-        y = self.tip_y_slider.value() / 5.0 if hasattr(self, 'tip_y_slider') else 0.0
-        z = self.tip_z_slider.value() / 5.0 if hasattr(self, 'tip_z_slider') else 0.0
+        if (
+            hasattr(self, "tip_x_spin")
+            and hasattr(self, "tip_y_spin")
+            and hasattr(self, "tip_z_spin")
+        ):
+            return (
+                float(self.tip_x_spin.value()),
+                float(self.tip_y_spin.value()),
+                float(self.tip_z_spin.value()),
+            )
+        x = (
+            self._tip_slider_to_nm(self.tip_x_slider.value())
+            if hasattr(self, "tip_x_slider")
+            else 0.0
+        )
+        y = (
+            self._tip_slider_to_nm(self.tip_y_slider.value())
+            if hasattr(self, "tip_y_slider")
+            else 0.0
+        )
+        z = (
+            self._tip_slider_to_nm(self.tip_z_slider.value())
+            if hasattr(self, "tip_z_slider")
+            else 0.0
+        )
         return float(x), float(y), float(z)
 
     def _delete_pymol_tip_overlay(self):
@@ -17259,15 +27521,15 @@ Check console for detailed information."""
             return
         if self.tip_actor:
             self.renderer.RemoveActor(self.tip_actor)
-
+            
         tip_shape = self.tip_shape_combo.currentText().lower()
         radius = self.tip_radius_spin.value()
         angle = self.tip_angle_spin.value()
         # ★★★ 追加: 新しいUIからminitipの半径を取得 ★★★
         minitip_radius = self.minitip_radius_spin.value()
-
+        
         #print(f"Creating tip: {tip_shape}, radius={radius}nm, angle={angle}°, minitip_radius={minitip_radius}nm")
-
+        
         if tip_shape == "cone":
             self.tip_actor = self.create_cone_tip(radius, angle)
         elif tip_shape == "sphere":
@@ -17275,7 +27537,7 @@ Check console for detailed information."""
             self.tip_actor = self.create_sphere_tip(radius, angle, minitip_radius)
         else:  # paraboloid
             self.tip_actor = self.create_paraboloid_tip(radius)
-
+        
         if self.tip_actor:
             self.update_tip_position()
             self.renderer.AddActor(self.tip_actor)
@@ -17299,7 +27561,7 @@ Check console for detailed information."""
         if half_angle < 1.0: half_angle = 1.0
         if half_angle >= 89.0: half_angle = 89.0
         half_angle_rad = np.radians(float(half_angle))
-
+        
         # 形状が球から円錐に切り替わる臨界半径
         r_crit = tip_radius * np.cos(half_angle_rad)
         # 円錐部分が滑らかに接続するためのZオフセット
@@ -17307,24 +27569,24 @@ Check console for detailed information."""
 
         # --- 点群グリッドの生成 ---
         resolution = 101  # グリッドの解像度 (奇数にすると中心点ができます)
-
+        
         # ★★★ 変更点1: コーンを長くするため、高さを大きく設定 ★★★
         max_height = tip_radius * 50.0  # 以前は 25.0 でした
-
+        
         max_radius = (max_height + z_offset) * np.tan(half_angle_rad)
-
+        
         points = vtk.vtkPoints()
-
+        
         # グリッド上の各点の3D座標を計算
         for i in range(resolution):
             for j in range(resolution):
                 # グリッド座標(i, j)を物理座標(x, y)に変換
                 x = (j - (resolution - 1) / 2.0) * (2 * max_radius / (resolution - 1))
                 y = (i - (resolution - 1) / 2.0) * (2 * max_radius / (resolution - 1))
-
+                
                 # 中心からの距離rを計算
                 r = np.sqrt(x**2 + y**2)
-
+                
                 # Igorの数式を使ってz座標(高さ)を計算
                 if r <= r_crit:
                     # 球状部分の計算式
@@ -17333,14 +27595,14 @@ Check console for detailed information."""
                 else:
                     # 円錐状部分の計算式
                     z = (r / np.tan(half_angle_rad)) - z_offset
-
+                
                 # ★★★ 変更点2: 先端が-Z方向を向くように、Z座標を反転 ★★★
                 points.InsertNextPoint(x, y, z)
 
         # --- 点群からサーフェスメッシュを生成 ---
         polydata = vtk.vtkPolyData()
         polydata.SetPoints(points)
-
+        
         # Delaunay2Dアルゴリズムで点群から三角形メッシュを生成
         delaunay = vtk.vtkDelaunay2D()
         delaunay.SetInputData(polydata)
@@ -17348,12 +27610,12 @@ Check console for detailed information."""
 
         # --- ★★★ 変更点3: Z反転を直接行ったため、後処理が不要に ★★★
         # 以前のtransformやnormalsの処理は不要になり、コードがシンプルになりました。
-
+        
         # --- アクターの作成 ---
         mapper = vtk.vtkPolyDataMapper()
         # Delaunayの結果を直接マッパーに接続します
         mapper.SetInputConnection(delaunay.GetOutputPort())
-
+        
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
 
@@ -17362,12 +27624,12 @@ Check console for detailed information."""
         actor.GetProperty().SetSpecular(0.9)         # 高い鏡面反射で金属感を強調
         actor.GetProperty().SetSpecularPower(100)    # 光沢を強くする
         actor.GetProperty().SetDiffuse(0.6)          # 拡散反射
-        actor.GetProperty().SetAmbient(0.3)
+        actor.GetProperty().SetAmbient(0.3)    
 
         #print(f"SUCCESS: Flipped and elongated cone tip created: radius={tip_radius:.1f}nm, angle={half_angle}°")
-
+        
         return actor
-
+    
     # +++ この関数で既存のcreate_sphere_tipを置き換えてください +++
     # +++ この関数で既存のcreate_sphere_tipを置き換えてください +++
     def create_sphere_tip(self, tip_radius, half_angle, minitip_radius):
@@ -17380,15 +27642,15 @@ Check console for detailed information."""
         # --- 部品1: 先端に突き出る球を作成 ---
         # ★★★ 変更点: 引数で渡されたminitip_radiusを使用 ★★★
         sphere_radius = minitip_radius
-
+        
         sphere_source = vtk.vtkSphereSource()
         sphere_source.SetRadius(sphere_radius)
         sphere_source.SetPhiResolution(50)
         sphere_source.SetThetaResolution(50)
-
+        
         sphere_transform = vtk.vtkTransform()
         sphere_transform.Translate(0, 0, sphere_radius)
-
+        
         sphere_filter = vtk.vtkTransformPolyDataFilter()
         sphere_filter.SetInputConnection(sphere_source.GetOutputPort())
         sphere_filter.SetTransform(sphere_transform)
@@ -17398,35 +27660,35 @@ Check console for detailed information."""
         if half_angle < 1.0: half_angle = 1.0
         if half_angle >= 89.0: half_angle = 89.0
         half_angle_rad = np.radians(float(half_angle))
-
+        
         r_crit_cone = tip_radius * np.cos(half_angle_rad)
         z_offset_cone = (tip_radius / np.sin(half_angle_rad)) - tip_radius
-
+        
         resolution = 101
         max_height_cone = tip_radius * 50.0
         max_radius_cone = (max_height_cone + z_offset_cone) * np.tan(half_angle_rad)
-
+        
         cone_points = vtk.vtkPoints()
         for i in range(resolution):
             for j in range(resolution):
                 x = (j - (resolution - 1) / 2.0) * (2 * max_radius_cone / (resolution - 1))
                 y = (i - (resolution - 1) / 2.0) * (2 * max_radius_cone / (resolution - 1))
                 r = np.sqrt(x**2 + y**2)
-
+                
                 if r <= r_crit_cone:
                     z = tip_radius - np.sqrt(max(0, tip_radius**2 - r**2))
                 else:
                     z = (r / np.tan(half_angle_rad)) - z_offset_cone
                 cone_points.InsertNextPoint(x, y, z)
-
+        
         cone_polydata = vtk.vtkPolyData()
         cone_polydata.SetPoints(cone_points)
         cone_delaunay = vtk.vtkDelaunay2D()
         cone_delaunay.SetInputData(cone_polydata)
-
+        
         cone_transform = vtk.vtkTransform()
         cone_transform.Translate(0, 0, 2 * sphere_radius)
-
+        
         cone_filter = vtk.vtkTransformPolyDataFilter()
         cone_filter.SetInputConnection(cone_delaunay.GetOutputPort())
         cone_filter.SetTransform(cone_transform)
@@ -17454,7 +27716,7 @@ Check console for detailed information."""
 
         print(f"SUCCESS: Composite 'Sphere' created. Cone R={tip_radius:.1f}, Minitip R={minitip_radius:.1f}")
         return actor
-
+    
     def create_paraboloid_tip(self, tip_radius):
         """
         Igor Proの数式に基づき、先端が下(-Z)を向く放物面探針を生成します。
@@ -17464,18 +27726,18 @@ Check console for detailed information."""
 
         # --- グリッドと点群の準備 ---
         resolution = 101
-        display_height = 20.0
+        display_height = 20.0 
         max_radius = np.sqrt(2 * tip_radius * display_height)
         points = vtk.vtkPoints()
-
+        
         for i in range(resolution):
             for j in range(resolution):
                 x = (j - (resolution - 1) / 2.0) * (2 * max_radius / (resolution - 1))
                 y = (i - (resolution - 1) / 2.0) * (2 * max_radius / (resolution - 1))
-
+                
                 # Igorの数式 z = (x^2 + y^2) / (2 * R)
                 z = (x**2 + y**2) / (2 * tip_radius)
-
+                
                 # ★★★ 修正点: 先端が下(-Z)を向くようにZ座標を反転 ★★★
                 points.InsertNextPoint(x, y, z)
 
@@ -17502,8 +27764,8 @@ Check console for detailed information."""
 
         print(f"SUCCESS: Paraboloid tip created (pointing down): R={tip_radius:.1f}nm")
         return actor
-
-
+    
+        
     def update_display(self):
         """表示の更新"""
         if self.atoms_data is not None:
@@ -17511,17 +27773,17 @@ Check console for detailed information."""
             #print(f"Updating display with color scheme: {current_scheme}")
             ##if current_scheme == "Single Color":
                 #print(f"Single color value: {self.current_single_color}")
-
+            
             self.display_molecule()
             self.request_render()
         self._queue_impose_overlay_refresh(0)
-
+    
     def update_tip_info(self):
         """探針情報の更新"""
         shape = self.tip_shape_combo.currentText()
         radius = self.tip_radius_spin.value()
         angle = self.tip_angle_spin.value()
-
+        
         if shape == "Cone":
             height = radius * 3
             base_radius = radius + height * np.tan(np.radians(angle))
@@ -17530,15 +27792,15 @@ Check console for detailed information."""
             info = f"Sphere: {radius}nm radius"
         else:
             info = f"Paraboloid: {radius}nm radius\nAngle: {angle}°"
-
+        
         self.tip_info_label.setText(info)
-
+            
     def update_tip(self):
         """探針の更新（パラメーター変更時）"""
         #print("Tip parameters changed - updating display...")
         self.create_tip()
         self.update_tip_info()  # 追加
-
+        
         # AFMパラメーターも更新
         self.afm_params.update({
             'tip_radius': self.tip_radius_spin.value(),
@@ -17548,7 +27810,7 @@ Check console for detailed information."""
 
         # スレッドの安全性をチェックしてからシミュレーションを実行
         self.trigger_interactive_simulation()
-
+    
     def trigger_interactive_simulation(self):
         """インタラクティブモードがONの場合にシミュレーションを実行する汎用トリガー"""
         if getattr(self, '_pose_estimation_running', False):
@@ -17559,30 +27821,32 @@ Check console for detailed information."""
         # スライダー操作中は実行しない
         if hasattr(self, 'tip_slider_pressed') and self.tip_slider_pressed:
             return
-
+        
         # 既にシミュレーションが実行中の場合は実行しない
         if self.is_worker_running(getattr(self, 'sim_worker_silent', None), attr_name='sim_worker_silent'):
             return
-
+            
         if self.interactive_update_check.isChecked():
             # ★★★ 通常のInteractive Updateでも軽量版を使用 ★★★
             self.run_simulation_silent()
-
+        
     def on_tip_slider_pressed(self):
         """Tip positionスライダーが押された時の処理"""
         # スライダー操作中のフラグを設定
         self.tip_slider_pressed = True
-
+        
     def on_tip_slider_released(self):
         """Tip positionスライダーが離された時の処理"""
         # スライダー操作完了のフラグを設定
         self.tip_slider_pressed = False
-
+        if self._is_impose_model_active():
+            self._queue_impose_overlay_refresh(0)
+        
         # スライダー操作完了後にシミュレーションを実行（Interactive UpdateがONの場合のみ）
         if self.interactive_update_check.isChecked():
             # 遅延実行でシミュレーションをトリガー
             QTimer.singleShot(100, self.trigger_interactive_simulation)
-
+    
     # Scan Size関連のイベントハンドラー
     def scan_size_value_changed(self, value):
         """Scan Size値変更時の処理（マウス/ボタン操作時は即時更新）"""
@@ -17594,12 +27858,12 @@ Check console for detailed information."""
             self.scan_size_debounce_timer.setSingleShot(True)
             self.scan_size_debounce_timer.timeout.connect(self.trigger_interactive_simulation)
             self.scan_size_debounce_timer.start(100)  # 100ms後に実行
-
+    
     def scan_size_editing_finished(self):
         """Scan Size編集完了時の処理（キー入力時はリターンで更新）"""
         self.scan_size_keyboard_input = False
         self.trigger_interactive_simulation()
-
+    
     # Tip Radius関連のイベントハンドラー
     def tip_radius_value_changed(self, value):
         """Tip Radius値変更時の処理（マウス/ボタン操作時は即時更新）"""
@@ -17611,12 +27875,12 @@ Check console for detailed information."""
             self.tip_radius_debounce_timer.setSingleShot(True)
             self.tip_radius_debounce_timer.timeout.connect(self.update_tip)
             self.tip_radius_debounce_timer.start(100)
-
+    
     def tip_radius_editing_finished(self):
         """Tip Radius編集完了時の処理（キー入力時はリターンで更新）"""
         self.tip_radius_keyboard_input = False
         self.update_tip()
-
+    
     # Minitip Radius関連のイベントハンドラー
     def minitip_radius_value_changed(self, value):
         """Minitip Radius値変更時の処理（マウス/ボタン操作時は即時更新）"""
@@ -17628,12 +27892,12 @@ Check console for detailed information."""
             self.minitip_radius_debounce_timer.setSingleShot(True)
             self.minitip_radius_debounce_timer.timeout.connect(self.update_tip)
             self.minitip_radius_debounce_timer.start(100)
-
+    
     def minitip_radius_editing_finished(self):
         """Minitip Radius編集完了時の処理（キー入力時はリターンで更新）"""
         self.minitip_radius_keyboard_input = False
         self.update_tip()
-
+    
     # Tip Angle関連のイベントハンドラー
     def tip_angle_value_changed(self, value):
         """Tip Angle値変更時の処理（マウス/ボタン操作時は即時更新）"""
@@ -17645,61 +27909,53 @@ Check console for detailed information."""
             self.tip_angle_debounce_timer.setSingleShot(True)
             self.tip_angle_debounce_timer.timeout.connect(self.update_tip)
             self.tip_angle_debounce_timer.start(100)
-
+    
     def tip_angle_editing_finished(self):
         """Tip Angle編集完了時の処理（キー入力時はリターンで更新）"""
         self.tip_angle_keyboard_input = False
         self.update_tip()
-
+    
     # キープレスイベントハンドラー
     def scan_size_key_press_event(self, widget, event):
         """Scan Sizeキー入力時の処理"""
         # 数字キーや編集キーが押された場合はキーボード入力フラグを設定
-        if event.key() in [Qt.Key_0, Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4,
+        if event.key() in [Qt.Key_0, Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4, 
                           Qt.Key_5, Qt.Key_6, Qt.Key_7, Qt.Key_8, Qt.Key_9,
                           Qt.Key_Backspace, Qt.Key_Delete, Qt.Key_Left, Qt.Key_Right]:
             self.scan_size_keyboard_input = True
         QDoubleSpinBox.keyPressEvent(widget, event)
-
+    
     def tip_radius_key_press_event(self, event):
         """Tip Radiusキー入力時の処理"""
-        if event.key() in [Qt.Key_0, Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4,
+        if event.key() in [Qt.Key_0, Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4, 
                           Qt.Key_5, Qt.Key_6, Qt.Key_7, Qt.Key_8, Qt.Key_9,
                           Qt.Key_Backspace, Qt.Key_Delete, Qt.Key_Left, Qt.Key_Right]:
             self.tip_radius_keyboard_input = True
         QDoubleSpinBox.keyPressEvent(self.tip_radius_spin, event)
-
+    
     def minitip_radius_key_press_event(self, event):
         """Minitip Radiusキー入力時の処理"""
-        if event.key() in [Qt.Key_0, Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4,
+        if event.key() in [Qt.Key_0, Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4, 
                           Qt.Key_5, Qt.Key_6, Qt.Key_7, Qt.Key_8, Qt.Key_9,
                           Qt.Key_Backspace, Qt.Key_Delete, Qt.Key_Left, Qt.Key_Right]:
             self.minitip_radius_keyboard_input = True
         QDoubleSpinBox.keyPressEvent(self.minitip_radius_spin, event)
-
+    
     def tip_angle_key_press_event(self, event):
         """Tip Angleキー入力時の処理"""
-        if event.key() in [Qt.Key_0, Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4,
+        if event.key() in [Qt.Key_0, Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4, 
                           Qt.Key_5, Qt.Key_6, Qt.Key_7, Qt.Key_8, Qt.Key_9,
                           Qt.Key_Backspace, Qt.Key_Delete, Qt.Key_Left, Qt.Key_Right]:
             self.tip_angle_keyboard_input = True
         QDoubleSpinBox.keyPressEvent(self.tip_angle_spin, event)
-
+    
     def update_tip_position(self):
         """探針位置の更新（適切な範囲）"""
-        # スライダー値をnm単位に変換（範囲を調整）
         x, y, z = self._get_tip_position_nm()
-
+        
         if getattr(self, 'tip_actor', None):
             self.tip_actor.SetPosition(x, y, z)
-
-        if hasattr(self, 'tip_x_label'):
-            self.tip_x_label.setText(f"{x:.1f}")
-        if hasattr(self, 'tip_y_label'):
-            self.tip_y_label.setText(f"{y:.1f}")
-        if hasattr(self, 'tip_z_label'):
-            self.tip_z_label.setText(f"{z:.1f}")
-
+        
         # AFMパラメーターも更新
         self.afm_params.update({
             'tip_x': x,
@@ -17708,13 +27964,18 @@ Check console for detailed information."""
         })
         if self._is_pymol_active():
             self._display_pymol_tip_overlay()
-
+        
         self.request_render()
 
-        # スライダー操作中はシミュレーションを実行しない
-        if hasattr(self, 'tip_slider_pressed') and self.tip_slider_pressed:
-            return
-
+        # Impose model is framed on the tip/scan center, so refresh it whenever
+        # tip XYZ changes (including mid-drag fine adjustments).
+        tip_dragging = bool(
+            hasattr(self, 'tip_slider_pressed') and self.tip_slider_pressed
+        )
+        if self._is_impose_model_active():
+            self._queue_impose_overlay_refresh(80 if tip_dragging else 40)
+        self._record_manual_pose_geometry()
+ 
     def toggle_molecule_visibility(self, visible):
         """分子表示の切り替え"""
         if self._is_pymol_active():
@@ -17731,7 +27992,7 @@ Check console for detailed information."""
         if self.sample_actor:
             self.sample_actor.SetVisibility(visible)
             self.vtk_widget.GetRenderWindow().Render()
-
+            
     def _update_tip_visual_state(self, visible=None):
         """Apply tip visibility and opacity based on checkbox and current view."""
         if self._is_pymol_active():
@@ -17770,7 +28031,7 @@ Check console for detailed information."""
         if self._is_pymol_active():
             self._display_pymol_tip_overlay()
         self._update_tip_visual_state(visible)
-
+            
     def toggle_bonds_visibility(self, visible):
         """結合表示の切り替え"""
         if self._is_pymol_only():
@@ -17798,7 +28059,7 @@ Check console for detailed information."""
         try:
             # Get the 4x4 transformation matrix from the combined_transform (base + local)
             vtk_matrix = self.combined_transform.GetMatrix()
-
+            
             # 変換行列の値を安全に取得
             transform_matrix = np.zeros((4, 4))
             for i in range(4):
@@ -17809,41 +28070,41 @@ Check console for detailed information."""
                         print(f"[WARNING] Invalid transform matrix element [{i},{j}]: {element}")
                         return np.column_stack([x, y, z])
                     transform_matrix[i, j] = element
-
+            
             # 変換行列の妥当性をチェック（単位行列に近いかどうか）
             identity = np.eye(4)
             if np.allclose(transform_matrix, identity, atol=1e-6):
                 # 変換がない場合は元の座標を返す
                 return np.column_stack([x, y, z])
-
+            
             # 座標を同次座標に変換
             original_coords = np.vstack([x, y, z, np.ones(num_atoms)])
-
+            
             # 変換を適用
             with np.errstate(all='ignore'):  # 警告を無視
                 rotated_coords_homogeneous = transform_matrix @ original_coords
-
+            
             # NaNやInfをチェック
             if not np.all(np.isfinite(rotated_coords_homogeneous)):
                 print("[WARNING] Non-finite values in rotation calculation, using original coordinates")
                 return np.column_stack([x, y, z])
-
+            
             # 3D座標に変換
             rotated_coords = rotated_coords_homogeneous[:3, :].T
-
+            
             # 結果の妥当性をチェック
             if not np.all(np.isfinite(rotated_coords)):
                 print("[WARNING] Non-finite values in rotated coordinates, using original coordinates")
                 return np.column_stack([x, y, z])
-
+            
             # 座標が異常に大きくなっていないかチェック
             max_coord = np.max(np.abs(rotated_coords))
             if max_coord > 1e6:
                 print(f"[WARNING] Rotated coordinates too large (max: {max_coord}), using original coordinates")
                 return np.column_stack([x, y, z])
-
+            
             return rotated_coords
-
+            
         except Exception as e:
             print(f"[WARNING] Error in rotation calculation: {e}, using original coordinates")
             return np.column_stack([x, y, z])
@@ -17874,8 +28135,8 @@ Check console for detailed information."""
             return rotated
         except Exception:
             return np.array(arr, copy=True)
-
-
+        
+    
     def _connect_worker_delete_later(self, worker):
         """ワーカー終了時にdeleteLaterで安全に破棄する（重複接続は避ける）"""
         if worker is None:
@@ -18012,8 +28273,8 @@ Check console for detailed information."""
             'scan_y_nm': self.spinScanYNm.value(),
             'nx': self.spinNx.value(),
             'ny': self.spinNy.value(),
-            'center_x': self.tip_x_slider.value() / 5.0,
-            'center_y': self.tip_y_slider.value() / 5.0,
+            'center_x': self._get_tip_center_xy_nm()[0],
+            'center_y': self._get_tip_center_xy_nm()[1],
             'tip_radius': self.tip_radius_spin.value(),
             'minitip_radius': self.minitip_radius_spin.value(),
             'tip_angle': self.tip_angle_spin.value(),
@@ -18060,7 +28321,7 @@ Check console for detailed information."""
             if not stopped:
                 print("[INFO] sim_worker still running; skipping new simulation start.")
                 return
-
+        
         self.sim_worker = AFMSimulationWorker(
             self, sim_params, tasks,
             self.atoms_data['element'] if sim_params['use_vdw'] and self.atoms_data is not None else None,
@@ -18086,7 +28347,7 @@ Check console for detailed information."""
             print("Cancel request sent.")
             self.status_label.setText("Cancelling...")
             self.sim_worker.cancel()
-
+    
     def show_afm_result(self, z_map):
         import matplotlib.pyplot as plt
         from matplotlib.colors import Normalize
@@ -18096,121 +28357,42 @@ Check console for detailed information."""
             return
 
         fig, ax = plt.subplots(figsize=(6, 5))
-        im = ax.imshow(z_map, cmap='viridis', origin='lower',
+        im = ax.imshow(z_map, cmap='viridis', origin='lower', 
                     interpolation='nearest',
                     extent=[-0.5, 0.5, -0.5, 0.5])  # 正規化不要なら適宜修正
         ax.set_title("Simulated AFM Topography")
         plt.colorbar(im, ax=ax, label="Height [nm]")
         plt.tight_layout()
         plt.show()
-
-    def _simulation_worker(self):
-        """シミュレーションワーカー（デバッグ用レガシーコード）"""
-        # UIからパラメータを取得
-        scan_x = self.spinScanXNm.value()
-        scan_y = self.spinScanYNm.value()
-        nx = self.spinNx.value()
-        ny = self.spinNy.value()
-
-        # スキャン範囲を計算
-        x_coords = np.linspace(-scan_x/2.0, scan_x/2.0, nx)
-        y_coords = np.linspace(-scan_y/2.0, scan_y/2.0, ny)
-
-        height_map = np.zeros((ny, nx))
-
-        # 衝突判定用の原子データを準備
-        atom_x = self.atoms_data['x']
-        atom_y = self.atoms_data['y']
-        atom_z = self.atoms_data['z']
-        atom_elem = self.atoms_data['element']
-        atom_radii = np.array([self.vdw_radii.get(e, self.vdw_radii['other']) for e in atom_elem])
-
-        total_steps = resolution * resolution
-        current_step = 0
-
-        # ★追加: 分子の統計情報を表示
-        mol_center_x = np.mean(atom_x)
-        mol_center_y = np.mean(atom_y)
-        mol_center_z = np.mean(atom_z)
-        mol_size_x = np.max(atom_x) - np.min(atom_x)
-        mol_size_y = np.max(atom_y) - np.min(atom_y)
-        mol_size_z = np.max(atom_z) - np.min(atom_z)
-
-        print(f"=== AFM Simulation Started (FIXED v2) ===")
-        print(f"Scan size: {scan_size}nm, Resolution: {resolution}x{resolution}")
-        print(f"Total atoms: {len(atom_x)}")
-        print(f"Molecule center: ({mol_center_x:.2f}, {mol_center_y:.2f}, {mol_center_z:.2f})nm")
-        print(f"Molecule size: {mol_size_x:.2f} x {mol_size_y:.2f} x {mol_size_z:.2f}nm")
-        print(f"Z range: {np.min(atom_z):.2f} to {np.max(atom_z):.2f}nm")
-        print(f"Tip: {self.tip_shape_combo.currentText()}, R={self.tip_radius_spin.value()}nm")
-        print(f"Scan range: {-half_size:.1f} to {+half_size:.1f}nm")
-
-        # スキャンループ
-        debug_count = 0
-        for iy, y in enumerate(y_coords):
-            for ix, x in enumerate(x_coords):
-                if self.progress_dialog.wasCanceled():
-                    print("Simulation canceled by user.")
-                    self.simulation_done.emit(None)
-                    return
-
-                # 衝突高さ計算
-                z_height = self.find_collision_height(x, y, atom_x, atom_y, atom_z, atom_radii)
-                height_map[iy, ix] = z_height
-
-                # ★改良: より多様な位置でデバッグ出力
-                if debug_count < 10:  # 最初の10点
-                    print(f"Point ({x:6.2f}, {y:6.2f}) -> Z={z_height:8.3f}nm")
-                    debug_count += 1
-                elif (iy == resolution//2 and ix == resolution//2):  # 中心点
-                    print(f"Center ({x:6.2f}, {y:6.2f}) -> Z={z_height:8.3f}nm")
-                elif (iy == resolution-1 and ix == resolution-1):  # 最後の点
-                    print(f"End    ({x:6.2f}, {y:6.2f}) -> Z={z_height:8.3f}nm")
-
-                current_step += 1
-                progress = int((current_step / total_steps) * 100)
-                self.simulation_progress.emit(progress)
-
-        # ★追加: 詳細な統計情報
-        valid_heights = height_map[height_map > mol_center_z - 10]  # 明らかに低すぎる値を除外
-
-        print(f"=== Simulation Completed ===")
-        print(f"Height range: {np.min(height_map):.3f} to {np.max(height_map):.3f}nm")
-        print(f"Valid heights: {np.min(valid_heights):.3f} to {np.max(valid_heights):.3f}nm")
-        print(f"Mean height: {np.mean(valid_heights):.3f}nm")
-        print(f"Height std: {np.std(valid_heights):.3f}nm")
-
-        # 完了シグナルを送信
-        self.simulation_done.emit(height_map)
-
+        
     def check_tip_position_and_molecule_overlap(self):
         """探針位置と分子の位置関係を確認するデバッグメソッド"""
         if self.atoms_data is None:
             print("No molecule loaded")
             return
-
+        
         # 現在の探針位置を取得
         tip_x = self.afm_params['tip_x']
-        tip_y = self.afm_params['tip_y']
+        tip_y = self.afm_params['tip_y'] 
         tip_z = self.afm_params['tip_z']
-
+        
         # 分子の統計
         mol_x_range = (np.min(self.atoms_data['x']), np.max(self.atoms_data['x']))
         mol_y_range = (np.min(self.atoms_data['y']), np.max(self.atoms_data['y']))
         mol_z_range = (np.min(self.atoms_data['z']), np.max(self.atoms_data['z']))
-
+        
         print(f"\n=== Position Check ===")
         print(f"Tip position: ({tip_x:.2f}, {tip_y:.2f}, {tip_z:.2f})nm")
         print(f"Molecule X range: {mol_x_range[0]:.2f} to {mol_x_range[1]:.2f}nm")
-        print(f"Molecule Y range: {mol_y_range[0]:.2f} to {mol_y_range[1]:.2f}nm")
+        print(f"Molecule Y range: {mol_y_range[0]:.2f} to {mol_y_range[1]:.2f}nm") 
         print(f"Molecule Z range: {mol_z_range[0]:.2f} to {mol_z_range[1]:.2f}nm")
-
+        
         # 探針が分子の上にあるかチェック
-        tip_over_molecule = (mol_x_range[0] <= tip_x <= mol_x_range[1] and
+        tip_over_molecule = (mol_x_range[0] <= tip_x <= mol_x_range[1] and 
                             mol_y_range[0] <= tip_y <= mol_y_range[1])
-
+        
         print(f"Tip over molecule: {tip_over_molecule}")
-
+        
         if tip_z <= mol_z_range[1]:
             print(f"WARNING: Tip Z position ({tip_z:.2f}) is too low! Molecule top is at {mol_z_range[1]:.2f}nm")
 
@@ -18221,16 +28403,16 @@ Check console for detailed information."""
         tip_pixel_radius = int(np.ceil(R * 3 / pixel_size))
         size = 2 * tip_pixel_radius + 1
         footprint = np.zeros((size, size))
-
+        
         center = tip_pixel_radius
         alpha = np.radians(alpha_deg)
         ca, sa = np.cos(alpha), np.sin(alpha)
-
+        
         for iy in range(size):
             for ix in range(size):
                 # ピクセル中心からの物理的な距離
                 r_2d = np.sqrt(((ix - center) * pixel_size)**2 + ((iy - center) * pixel_size)**2)
-
+                
                 # 探針の高さを計算 (反転させた形状)
                 r_crit = R * ca
                 if r_2d <= r_crit:
@@ -18239,21 +28421,21 @@ Check console for detailed information."""
                     z = (r_2d * sa + R * (1 - ca)) / ca # 修正された円錐式
 
                 footprint[iy, ix] = -z # Dilationでは反転した探針を使う
-
+        
         return footprint
-
+    
     def on_task_finished(self, z_map, target_panel):
         """個別の計算タスクが完了した際に呼び出されるスロット"""
         if z_map is not None and target_panel is not None:
             image_key = target_panel.objectName()
-
+            
             # ★★★ 修正箇所: 生データを保存し、表示更新関数を呼び出す ★★★
             # 1. フィルターをかける前の「生」データを保存
             self.raw_simulation_results[image_key] = z_map
-
+            
             # 2. フィルター適用と表示更新を行う関数を呼び出す
             self.process_and_display_single_image(image_key)
-
+    
     def process_and_display_single_image(self, image_key):
         """指定されたキーの画像を処理して表示する"""
         if image_key not in self.raw_simulation_results:
@@ -18261,10 +28443,10 @@ Check console for detailed information."""
 
         raw_data = self.raw_simulation_results[image_key]
         ny, nx = raw_data.shape
-
+        
         scan_x = self.spinScanXNm.value()
         scan_y = self.spinScanYNm.value()
-
+        
         # フィルターが有効かチェック
         if self.apply_filter_check.isChecked():
             cutoff_wl = self.filter_cutoff_spin.value()
@@ -18283,19 +28465,26 @@ Check console for detailed information."""
 
         # 表示用と保存用のデータを更新
         self.simulation_results[image_key] = processed_data
-
+        
         # 対応するパネルを見つけて表示を更新
         target_panel = self.findChild(QFrame, image_key)
         if target_panel:
             self.display_afm_image(processed_data, target_panel)
 
-        # Keep Real AFM window "Sim Aligned" panel identical to current XY simulated image.
+        # Keep Real AFM window "Sim Aligned" and Difference in sync with XY,
+        # including pose residual.
         if image_key == "XY_Frame":
             self.sim_aligned_nm = processed_data
             aligned_panel = getattr(self, 'real_afm_window_aligned_frame', None)
             if aligned_panel is not None:
-                self.display_afm_image(processed_data, aligned_panel)
-
+                self.display_afm_image(
+                    self._sim_aligned_display_image(processed_data),
+                    aligned_panel,
+                )
+            try:
+                self._update_difference_panel()
+            except Exception:
+                pass
 
     def process_and_display_all_images(self):
         """現在表示されている全ての画像を再処理・再表示する"""
@@ -18307,12 +28496,12 @@ Check console for detailed information."""
         """フィルターのカットオフ値変更時にタイマーで更新を遅延させる"""
         if not self.apply_filter_check.isChecked():
             return # フィルターがOFFの時は何もしない
-
+            
         if not hasattr(self, 'filter_update_timer'):
             self.filter_update_timer = QTimer(self)  # 親ウィンドウを設定
             self.filter_update_timer.setSingleShot(True)
             self.filter_update_timer.timeout.connect(self.process_and_display_all_images)
-
+        
         self.filter_update_timer.start(500) # 500ミリ秒後に更新
 
     def on_simulation_finished(self, result):
@@ -18341,10 +28530,10 @@ Check console for detailed information."""
             #print("Simulation finished, but no results were generated (or it was cancelled).")
             pass
 
+        
 
 
-
-
+    
     def _height_map_to_rgb(self, height_map):
         """Convert a height map to an (H, W, 3) uint8 RGB array using the main display method.
 
@@ -18368,9 +28557,9 @@ Check console for detailed information."""
         計算された高さマップをグレイスケールでUIに表示します。
         """
         if target_panel is None or height_map is None: return
-
+        
         from PyQt5.QtGui import QImage, QPixmap
-
+        
         # --- 正規化処理（メイン表示方式: _height_map_to_rgb に集約）---
         image_data = self._height_map_to_rgb(height_map)
 
@@ -18517,7 +28706,7 @@ Check console for detailed information."""
         for i in range(len(atom_x)):
             atom_pos = (atom_x[i], atom_y[i], atom_z[i])
             tip_apex = (tip_x, tip_y, tip_z)
-
+            
             # 探針表面から原子中心までの距離を計算
             if tip_shape == "cone":
                 dist_surface = self.dist_point_to_cone_tip(
@@ -18528,11 +28717,11 @@ Check console for detailed information."""
             else:  # Paraboloid
                 dist_surface = self.dist_point_to_paraboloid_tip(
                     atom_pos, tip_apex, tip_radius)
-
+            
             # 衝突判定：探針表面から原子中心までの距離が原子半径以下なら衝突
             if dist_surface <= atom_radii[i]:
                 return True
-
+                
         return False
 
     def dist_point_to_cone_tip(self, p, tip_apex, R, alpha_deg):
@@ -18540,21 +28729,21 @@ Check console for detailed information."""
         alpha = np.radians(alpha_deg)
         px, py, pz = p
         tx, ty, tz = tip_apex
-
+        
         # 探針の先端（apex）を原点とした相対座標
         dx, dy, dz = px - tx, py - ty, pz - tz
         r_2d = np.sqrt(dx**2 + dy**2)
-
+        
         # 修正1: 円錐の幾何学を正確に計算
         cos_alpha = np.cos(alpha)
         sin_alpha = np.sin(alpha)
-
+        
         # 球状先端部分の中心位置を修正
         sphere_center_z = R  # 球の中心は先端からR上方
-
+        
         # 球との境界半径を正確に計算
         r_crit = R * sin_alpha  # 球と円錐の接続部の半径
-
+        
         # 修正2: 距離計算を改善
         if r_2d <= r_crit and dz <= sphere_center_z:
             # 球状部分との距離
@@ -18565,15 +28754,15 @@ Check console for detailed information."""
             # 円錐の母線方向の単位ベクトル：(sin_alpha, 0, cos_alpha)
             # 点から円錐軸（Z軸）への垂直距離：r_2d
             # 点のZ座標から適切な円錐面までの距離を計算
-
+            
             # 円錐面上の対応点のZ座標
             z_on_cone = sphere_center_z + (r_2d - r_crit) / np.tan(alpha)
-
+            
             # 修正3: 符号付き距離を正確に計算
             # 円錐面の法線ベクトル：(-sin_alpha, 0, cos_alpha)
             # 点から円錐面への符号付き距離
             dist_surface = (r_2d - r_crit) * cos_alpha + (dz - z_on_cone) * sin_alpha
-
+            
         return dist_surface
 
     def dist_point_to_sphere_tip(self, p, tip_apex, R_cone, alpha_deg, R_sphere):
@@ -18599,23 +28788,23 @@ Check console for detailed information."""
         """背景色選択ダイアログ"""
         # 現在の背景色を取得
         current_color = QColor()
-        current_color.setRgbF(self.current_bg_color[0],
-                             self.current_bg_color[1],
+        current_color.setRgbF(self.current_bg_color[0], 
+                             self.current_bg_color[1], 
                              self.current_bg_color[2])
-
+        
         color = QColorDialog.getColor(current_color, self, "Choose Background Color")
         if color.isValid():
             # RGB値を0-1範囲に変換
             self.current_bg_color = (color.redF(), color.greenF(), color.blueF())
             self._apply_current_background_color()
-
+    
     def clear_mrc_data(self):
         """MRCデータとアクターをクリア"""
         # MRCアクターをレンダラーから削除
         if hasattr(self, 'mrc_actor') and self.mrc_actor is not None:
             self.renderer.RemoveActor(self.mrc_actor)
             self.mrc_actor = None
-
+        
         # MRCデータをクリア
         if hasattr(self, 'mrc_data'):
             self.mrc_data = None
@@ -18631,26 +28820,26 @@ Check console for detailed information."""
         if self.current_structure_type == "mrc":
             self.current_structure_path = None
             self.current_structure_type = None
-
+        
         # MRCラベルをリセット
         if hasattr(self, 'file_label'):
             self.file_label.setText("File Name: (none)")
-
+        
         # MRCグループを無効化
         if hasattr(self, 'mrc_group'):
             self.mrc_group.setEnabled(False)
-
+        
         # 回転ウィジェットも無効化（PDBデータがない場合）
         if not hasattr(self, 'atoms_data') or self.atoms_data is None:
             if hasattr(self, 'rotation_widgets'):
                 for axis in ['X', 'Y', 'Z']:
                     self.rotation_widgets[axis]['spin'].setEnabled(False)
                     self.rotation_widgets[axis]['slider'].setEnabled(False)
-
+        
         # レンダリング更新
         self._update_single_color_control_state()
         self.request_render()
-
+    
     def clear_pdb_data(self):
         """PDBデータとアクターをクリア"""
         # PDBアクターをレンダラーから削除
@@ -18660,7 +28849,7 @@ Check console for detailed information."""
         if hasattr(self, 'bonds_actor') and self.bonds_actor is not None:
             self.renderer.RemoveActor(self.bonds_actor)
             self.bonds_actor = None
-
+        
         # PDBデータをクリア
         if hasattr(self, 'atoms_data'):
             self.atoms_data = None
@@ -18676,22 +28865,22 @@ Check console for detailed information."""
         self.pymol_esp_object = None
         self.original_atoms_data = None
         self._clear_domain_state()
-
+        
         # PDBラベルをリセット
         if hasattr(self, 'file_label'):
             self.file_label.setText("File Name: (none)")
-
+        
         # 統計情報をリセット
         if hasattr(self, 'stats_label'):
             self.stats_label.setText("No data loaded")
-
+        
         # 回転ウィジェットも無効化（MRCデータがない場合）
         if not (hasattr(self, 'mrc_data') and self.mrc_data is not None):
             if hasattr(self, 'rotation_widgets'):
                 for axis in ['X', 'Y', 'Z']:
                     self.rotation_widgets[axis]['spin'].setEnabled(False)
                     self.rotation_widgets[axis]['slider'].setEnabled(False)
-
+        
         # PyMOLオブジェクトを削除
         if self._is_pymol_active():
             try:
@@ -18707,7 +28896,7 @@ Check console for detailed information."""
         # レンダリング更新
         self._update_single_color_control_state()
         self.request_render()
-
+    
     def update_mrc_actor_color(self):
         """既存のMRCアクターの色を更新"""
         if hasattr(self, 'mrc_actor') and self.mrc_actor is not None:
@@ -18715,14 +28904,14 @@ Check console for detailed information."""
             mapper = self.mrc_actor.GetMapper()
             if mapper:
                 mapper.ScalarVisibilityOff()
-
+            
             prop = self.mrc_actor.GetProperty()
             # MRCは常に選択された色を使用（カラースキームは関係ない）
-
+           
             prop.SetColor(self.current_single_color[0], self.current_single_color[1], self.current_single_color[2])
             self.update_actor_materials()
             self.request_render()
-
+    
     def on_color_scheme_changed(self):
         """カラースキーム変更時の処理"""
         print(f"Color scheme changed to: {self.color_combo.currentText()}")
@@ -18754,7 +28943,7 @@ Check console for detailed information."""
             tip = "Enabled when Display Settings > Color is Single Color."
         btn.setToolTip(tip)
         btn.setStatusTip(tip)
-
+    
     def choose_single_color(self):
         """単色モード用カラー選択"""
         # 現在の単色を取得
@@ -18762,14 +28951,14 @@ Check console for detailed information."""
         current_color.setRgbF(self.current_single_color[0],
                             self.current_single_color[1],
                             self.current_single_color[2])
-
+        
         color = QColorDialog.getColor(current_color, self, "Choose Single Color")
         if color.isValid():
             # RGB値を0-1範囲に変換
             old_color = self.current_single_color
             self.current_single_color = (color.redF(), color.greenF(), color.blueF())
-
-
+            
+           
             # ボタンの色を更新
             self.single_color_btn.setStyleSheet(f"""
                 QPushButton {{
@@ -18787,19 +28976,19 @@ Check console for detailed information."""
                     border-color: #aaa;
                 }}
             """)
-
+            
             # 表示を更新
-            if self.atoms_data is not None:
+            if self.atoms_data is not None:                
                 self.update_display()
             elif hasattr(self, 'mrc_data') and self.mrc_data is not None:             # MRCデータの場合も色を更新
                 self.update_mrc_actor_color()
-
+    
     def update_brightness(self):
         """明るさ調整"""
         brightness = self.brightness_slider.value()
         self.brightness_factor = brightness / 100.0
         self.brightness_label.setText(f"{brightness}%")
-
+        
         # ライティングを更新
         if self._is_pymol_active():
             self._apply_pymol_lighting()
@@ -18808,12 +28997,12 @@ Check console for detailed information."""
         if not self._is_pymol_only():
             self.update_lighting_intensity()
         self.request_render()
-
+    
     def update_lighting(self):
         """環境光設定の更新"""
         ambient = self.ambient_slider.value()
         self.ambient_label.setText(f"{ambient}%")
-
+        
         # レンダラーの環境光を設定
         if self._is_pymol_active():
             self._apply_pymol_lighting()
@@ -18822,24 +29011,24 @@ Check console for detailed information."""
             self.renderer.SetAmbient(ambient_factor, ambient_factor, ambient_factor)
             self.update_actor_materials()
         self.request_render()
-
+    
     def update_material(self):
         """マテリアル設定の更新"""
         specular = self.specular_slider.value()
         self.specular_label.setText(f"{specular}%")
-
+        
         # 全てのアクターのスペキュラを更新
         if self._is_pymol_active():
             self._apply_pymol_lighting()
         if not self._is_pymol_only():
             self.update_actor_materials()
         self.request_render()
-
+    
     def update_lighting_intensity(self):
         """ライトの強度を明るさファクターで調整"""
         lights = self.renderer.GetLights()
         lights.InitTraversal()
-
+        
         light = lights.GetNextItem()
         while light:
             # 元の強度に明るさファクターを適用
@@ -18849,28 +29038,28 @@ Check console for detailed information."""
                 # 初回は現在の強度を保存
                 light._original_intensity = light.GetIntensity()
                 light.SetIntensity(light._original_intensity * self.brightness_factor)
-
+            
             light = lights.GetNextItem()
-
+    
     def update_actor_materials(self):
         """全アクターのマテリアル特性を更新"""
         specular_factor = self.specular_slider.value() / 100.0
         ambient_factor = self.ambient_slider.value() / 100.0 if hasattr(self, 'ambient_slider') else 0.15
         material_ambient = min(1.0, ambient_factor * 2.0)
-
+        
         # 分子アクター
         if self.sample_actor and hasattr(self.sample_actor, 'GetProperty'):
             prop = self.sample_actor.GetProperty()
             prop.SetAmbient(material_ambient)
             prop.SetSpecular(specular_factor)
             prop.SetSpecularPower(50)
-
+        
         # 結合アクター
         if self.bonds_actor and hasattr(self.bonds_actor, 'GetProperty'):
             prop = self.bonds_actor.GetProperty()
             prop.SetAmbient(material_ambient)
             prop.SetSpecular(specular_factor * 0.5)
-
+        
         # 探針アクター
         if self.tip_actor and hasattr(self.tip_actor, 'GetProperty'):
             prop = self.tip_actor.GetProperty()
@@ -18888,7 +29077,7 @@ Check console for detailed information."""
             prop.SetAmbient(material_ambient)
             prop.SetSpecular(specular_factor)
             prop.SetSpecularPower(50)
-
+    
     def apply_dark_theme(self):
         """ダークテーマプリセット適用"""
         # 背景をダークグレーに
@@ -18897,7 +29086,7 @@ Check console for detailed information."""
             self._pymol_set_background(self.current_bg_color)
         if not self._is_pymol_only():
             self.renderer.SetBackground(*self.current_bg_color)
-
+        
         # ボタンの色を更新
         self.bg_color_btn.setStyleSheet("""
             QPushButton {
@@ -18910,48 +29099,48 @@ Check console for detailed information."""
                 border-color: #777;
             }
         """)
-
+        
         # 明るさを100%に
         self.brightness_slider.setValue(100)
         self.brightness_factor = 1.0
         self.brightness_label.setText("100%")
-
+        
         # 環境光を15%に
         self.ambient_slider.setValue(15)
         self.ambient_label.setText("15%")
         if not self._is_pymol_only():
             self.renderer.SetAmbient(0.15, 0.15, 0.15)
-
+        
         # スペキュラを60%に
         self.specular_slider.setValue(60)
         self.specular_label.setText("60%")
-
+        
         # 設定を適用
         if self._is_pymol_active():
             self._apply_pymol_lighting()
         if not self._is_pymol_only():
             self.update_lighting_intensity()
             self.update_actor_materials()
-
+        
         # 表示を更新
         if self.atoms_data is not None:
             self.update_display()
 
         self.request_render()
-
+        
         QMessageBox.information(self, "Theme Applied", "Dark theme applied successfully!")
-
+    
     def load_settings(self):
         """起動時にウィンドウの位置、サイズ、スプリッターの状態を復元する"""
         try:
             if os.path.exists(self.settings_file):
                 with open(self.settings_file, 'r') as f:
                     settings = json.load(f)
-
+                
                 # ウィンドウのジオメトリ（位置とサイズ）を復元
                 if 'geometry' in settings:
                     self.setGeometry(*settings['geometry'])
-
+                
                 # 各スプリッターの状態を復元
                 if 'main_splitter' in settings:
                     self.main_splitter.setSizes(settings['main_splitter'])
@@ -18962,7 +29151,7 @@ Check console for detailed information."""
 
                 if 'last_import_dir' in settings:
                     self.last_import_dir = settings['last_import_dir']
-
+                
                 # MRCのZ軸フリップ状態を復元（デフォルトはTrue）
                 if 'mrc_z_flip' in settings:
                     self.mrc_z_flip = settings['mrc_z_flip']
@@ -18977,13 +29166,13 @@ Check console for detailed information."""
                     except Exception:
                         pass
                 self._apply_current_background_color()
-
+                
                 # チェックボックスの状態を確実に設定
                 if hasattr(self, 'mrc_z_flip_check'):
                     self.mrc_z_flip_check.blockSignals(True)  # シグナルを一時的にブロック
                     self.mrc_z_flip_check.setChecked(self.mrc_z_flip)
                     self.mrc_z_flip_check.blockSignals(False)  # シグナルを再有効化
-
+                
                 #print("Settings loaded successfully.")
 
         except (IOError, json.JSONDecodeError, KeyError) as e:
@@ -19028,11 +29217,10 @@ Check console for detailed information."""
         # Tip position
         tip_pos = {}
         if hasattr(self, 'tip_x_slider'):
-            tip_pos['x_nm'] = float(self.tip_x_slider.value()) / 5.0
-        if hasattr(self, 'tip_y_slider'):
-            tip_pos['y_nm'] = float(self.tip_y_slider.value()) / 5.0
-        if hasattr(self, 'tip_z_slider'):
-            tip_pos['z_nm'] = float(self.tip_z_slider.value()) / 5.0
+            tip_x_nm, tip_y_nm, tip_z_nm = self._get_tip_position_nm()
+            tip_pos['x_nm'] = float(tip_x_nm)
+            tip_pos['y_nm'] = float(tip_y_nm)
+            tip_pos['z_nm'] = float(tip_z_nm)
         if tip_pos:
             params['tip_position'] = tip_pos
 
@@ -19046,13 +29234,13 @@ Check console for detailed information."""
             scan['nx'] = int(self.spinNx.value())
         if hasattr(self, 'spinNy'):
             scan['ny'] = int(self.spinNy.value())
-
+            
         # Optional backward compatibility in saved JSON
         if 'scan_x_nm' in scan:
             scan['size_nm'] = scan['scan_x_nm']
         if 'nx' in scan:
             scan['resolution'] = f"{scan['nx']}x{scan['nx']}"
-
+            
         if scan:
             params['scan'] = scan
 
@@ -19280,11 +29468,16 @@ Check console for detailed information."""
         tip_pos = params.get('tip_position', {})
         if tip_pos:
             if hasattr(self, 'tip_x_slider') and 'x_nm' in tip_pos:
-                _set_slider(self.tip_x_slider, int(round(float(tip_pos['x_nm']) * 5.0)))
+                _set_slider(self.tip_x_slider, self._tip_nm_to_slider(tip_pos['x_nm']))
             if hasattr(self, 'tip_y_slider') and 'y_nm' in tip_pos:
-                _set_slider(self.tip_y_slider, int(round(float(tip_pos['y_nm']) * 5.0)))
+                _set_slider(self.tip_y_slider, self._tip_nm_to_slider(tip_pos['y_nm']))
             if hasattr(self, 'tip_z_slider') and 'z_nm' in tip_pos:
-                _set_slider(self.tip_z_slider, int(round(float(tip_pos['z_nm']) * 5.0)))
+                _set_slider(self.tip_z_slider, self._tip_nm_to_slider(tip_pos['z_nm']))
+            self._sync_tip_spins_from_sliders()
+            try:
+                self.update_tip_position()
+            except Exception:
+                pass
 
         # Scan
         scan = params.get('scan', {})
@@ -19294,12 +29487,12 @@ Check console for detailed information."""
                 _set_spin(self.spinScanXNm, float(scan['scan_x_nm']))
             elif hasattr(self, 'spinScanXNm') and 'size_nm' in scan: # Migration
                 _set_spin(self.spinScanXNm, float(scan['size_nm']))
-
+                
             if hasattr(self, 'spinScanYNm') and 'scan_y_nm' in scan:
                 _set_spin(self.spinScanYNm, float(scan['scan_y_nm']))
             elif hasattr(self, 'spinScanYNm') and 'size_nm' in scan: # Migration
                 _set_spin(self.spinScanYNm, float(scan['size_nm']))
-
+                
             if hasattr(self, 'spinNx') and 'nx' in scan:
                 _set_spin(self.spinNx, int(scan['nx']))
             elif hasattr(self, 'spinNx') and 'resolution' in scan: # Migration
@@ -19307,7 +29500,7 @@ Check console for detailed information."""
                     res = int(str(scan['resolution']).split('x')[0])
                     _set_spin(self.spinNx, res)
                 except: pass
-
+                
             if hasattr(self, 'spinNy') and 'ny' in scan:
                 _set_spin(self.spinNy, int(scan['ny']))
             elif hasattr(self, 'spinNy') and 'resolution' in scan: # Migration
@@ -19315,7 +29508,7 @@ Check console for detailed information."""
                     res = int(str(scan['resolution']).split('x')[0])
                     _set_spin(self.spinNy, res)
                 except: pass
-
+                
             if hasattr(self, 'resolution_combo') and 'resolution' in scan:
                 _set_combo(self.resolution_combo, scan['resolution'])
 
@@ -19660,8 +29853,13 @@ Check console for detailed information."""
         """Load structure using existing import functions. Returns True if loaded."""
         if not path or not os.path.exists(path):
             return False
+        if getattr(self, "_structure_load_in_progress", False):
+            return False
         ext = os.path.splitext(path)[1].lower()
+        self._structure_load_in_progress = True
         try:
+            if hasattr(self, "import_btn"):
+                self.import_btn.setEnabled(False)
             if ext == '.pdb':
                 self._import_pdb_internal(path)
             elif ext in ('.cif', '.mmcif'):
@@ -19673,7 +29871,15 @@ Check console for detailed information."""
             self.last_import_dir = os.path.dirname(path)
             return True
         except Exception:
+            traceback.print_exc()
             return False
+        finally:
+            self._structure_load_in_progress = False
+            if hasattr(self, "import_btn"):
+                try:
+                    self.import_btn.setEnabled(True)
+                except RuntimeError:
+                    pass
 
     def load_session_json(self, json_path):
         """Load session JSON and apply parameters (schema v1/v2)."""
@@ -19819,7 +30025,7 @@ Check console for detailed information."""
             self.request_render()
         except Exception:
             pass
-
+    
     def handle_save_asd(self):
         """「Save as ASD...」ボタンが押されたときの処理"""
         if not self.simulation_results:
@@ -19828,17 +30034,17 @@ Check console for detailed information."""
 
          # 保存可能なデータの名前（キー）を取得
         available_keys = list(self.simulation_results.keys())
-
+        
         # ユーザーに表示するための分かりやすい名前の辞書
         display_names = {
             "XY_Frame": "XY View",
             "YZ_Frame": "YZ View",
             "ZX_Frame": "ZX View"
         }
-
+        
         # 選択肢リストを作成
         choices = [display_names.get(key, key) for key in available_keys]
-
+        
         selected_key = None
         if len(available_keys) > 1:
             # データが複数ある場合、ダイアログで選択させる
@@ -19859,7 +30065,7 @@ Check console for detailed information."""
 
         if selected_key is None:
             return
-
+                
         data_to_save = self.simulation_results[selected_key]
         image_key_name = display_names.get(selected_key, selected_key).replace(" ", "") # ファイル名用
         default_id = self.get_active_dataset_id()
@@ -19869,7 +30075,7 @@ Check console for detailed information."""
         # 最後に使用したディレクトリが存在し、アクセス可能かチェック
         if self.last_import_dir and os.path.isdir(self.last_import_dir):
             directory = self.last_import_dir
-
+        
         # ファイル名と安全なディレクトリを結合して、最終的なデフォルトパスを作成
         default_save_path = os.path.join(directory, default_filename)
 
@@ -19881,23 +30087,22 @@ Check console for detailed information."""
         if not save_path:
             return
 
-        try:
+        try:            
             # --- シミュレーション条件を収集 ---
             rot_x = self.rotation_widgets['X']['spin'].value()
             rot_y = self.rotation_widgets['Y']['spin'].value()
             rot_z = self.rotation_widgets['Z']['spin'].value()
-
+            
             tip_shape = self.tip_shape_combo.currentText()
             tip_radius = self.tip_radius_spin.value()
             tip_angle = self.tip_angle_spin.value()
-
+            
             scan_x = self.spinScanXNm.value()
             scan_y = self.spinScanYNm.value()
             nx = self.spinNx.value()
             ny = self.spinNy.value()
-            center_x = self.tip_x_slider.value() / 5.0
-            center_y = self.tip_y_slider.value() / 5.0
-
+            center_x, center_y = self._get_tip_center_xy_nm()
+            
             use_vdw = "Yes" if self.use_vdw_check.isChecked() else "No"
             sim_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -19922,7 +30127,7 @@ Check console for detailed information."""
                 f"Shape: {tip_shape}",
                 f"Radius: {tip_radius:.2f} nm",
             ]
-
+            
             if tip_shape == "Cone":
                 comment_lines.append(f"Angle: {tip_angle:.1f} deg")
             elif tip_shape == "Sphere":
@@ -19941,9 +30146,9 @@ Check console for detailed information."""
                 f"[Calculation Method]",
                 f"Consider vdW: {use_vdw}",
             ])
-
+            
             comment = "\n".join(comment_lines)
-
+            
             # # save_simulation_as_asd を呼び出す
             success = self.save_simulation_as_asd(save_path, comment, data_to_save)
             if success:
@@ -19961,104 +30166,24 @@ Check console for detailed information."""
 
 
     def save_simulation_as_asd(self, save_path, comment_string, height_map):
-        """
-        ASDファイルを保存するメソッド。Igor Proのコードと完全に一致させる。
-        """
+        """Save a simulated height map as a one-frame ASD file."""
         try:
-            y_pixels, x_pixels = height_map.shape
-            x_scan_size = self.spinScanXNm.value()
-            y_scan_size = self.spinScanYNm.value()
+            from asd_io import write_asd_height_frame
 
-            # ★★★ 修正点2: comment_bytes を正しく使用する ★★★
-            ope_name_bytes = "Nobody".encode('utf-8')
-            comment_bytes = comment_string.encode('utf-8')
-
-            # Igorコードの `165` は固定ヘッダーのバイト数
-            file_header_size = 165 + len(ope_name_bytes) + len(comment_bytes)
-            frame_header_size = 32
-
-            now = datetime.datetime.now()
-
-            with open(save_path, 'wb') as f:
-                # --- ファイルヘッダー書き込み ---
-                f.write(struct.pack('<i', 1))
-                f.write(struct.pack('<i', file_header_size))
-                f.write(struct.pack('<i', frame_header_size))
-                f.write(struct.pack('<i', 932))
-                f.write(struct.pack('<i', len(ope_name_bytes)))
-                f.write(struct.pack('<i', len(comment_bytes))) # 正しいコメント長を書き込む
-                f.write(struct.pack('<i', 20564))
-                f.write(struct.pack('<i', 0))
-                f.write(struct.pack('<i', 1))
-                f.write(struct.pack('<i', 1))
-                f.write(struct.pack('<i', 0))
-                f.write(struct.pack('<i', 1))
-                f.write(struct.pack('<i', x_pixels))
-                f.write(struct.pack('<i', y_pixels))
-                f.write(struct.pack('<i', int(x_scan_size)))
-                f.write(struct.pack('<i', int(y_scan_size)))
-                f.write(struct.pack('<B', 0))
-                f.write(struct.pack('<i', 1))
-                f.write(struct.pack('<i', now.year))
-                f.write(struct.pack('<i', now.month))
-                f.write(struct.pack('<i', now.day))
-                f.write(struct.pack('<i', now.hour))
-                f.write(struct.pack('<i', now.minute))
-                f.write(struct.pack('<i', now.second))
-                f.write(struct.pack('<i', 0))
-                f.write(struct.pack('<i', 0))
-                f.write(struct.pack('<f', 1.0))
-                f.write(struct.pack('<f', 1.0))
-                f.write(struct.pack('<f', 1.0))
-                f.write(struct.pack('<iiii', 0, 0, 0, 0))
-                f.write(struct.pack('<i', 1))
-                f.write(struct.pack('<i', 262144))
-                f.write(struct.pack('<i', 12))
-                f.write(struct.pack('<f', 4000.0))
-                f.write(struct.pack('<f', 1700.0))
-                f.write(struct.pack('<f', 1.0))
-                f.write(struct.pack('<f', 1.0))
-                f.write(struct.pack('<f', 20.0))
-                f.write(struct.pack('<f', 2.0))
-
-                f.write(ope_name_bytes)
-                f.write(comment_bytes) # ★★★ 正しいコメント本体を書き込む ★★★
-
-                # --- フレームヘッダー書き込み ---
-                max_data_raw = np.max(height_map)
-                min_data_raw = np.min(height_map)
-
-                f.write(struct.pack('<I', 0))
-                f.write(struct.pack('<H', int(max_data_raw)))
-                f.write(struct.pack('<H', int(min_data_raw)))
-                f.write(struct.pack('<h', 0))
-                f.write(struct.pack('<h', 0))
-                f.write(struct.pack('<f', 0.0))
-                f.write(struct.pack('<f', 0.0))
-                f.write(struct.pack('<B', 0))
-                f.write(struct.pack('<B', 0))
-                f.write(struct.pack('<h', 0))
-                f.write(struct.pack('<i', 0))
-                f.write(struct.pack('<i', 0))
-
-                # --- 画像データ書き込み ---
-                piezo_const_z = 20.0
-                driver_gain_z = 2.0
-
-                for y in range(y_pixels):
-                    for x in range(x_pixels):
-                        height_value = height_map[y, x]
-                        # シミュレーターは凹凸データのみなので、nm → uint16の変換のみ
-                        data = (5.0 - height_value / piezo_const_z / driver_gain_z) * 4096.0 / 10.0
-                        f.write(struct.pack('<h', int(data)))
+            write_asd_height_frame(
+                save_path,
+                height_map,
+                self.spinScanXNm.value(),
+                self.spinScanYNm.value(),
+                comment=comment_string,
+            )
             return True
-
         except Exception as e:
             print(f"[ERROR] SaveASD failed: {e}")
             import traceback
             traceback.print_exc()
             return False
-
+    
     def handle_save_3d_view(self):
         """現在の3Dビューを画像ファイルとして保存する"""
         if self.pdb_name == "":
@@ -20070,11 +30195,11 @@ Check console for detailed information."""
         directory = ""
         if self.last_import_dir and os.path.isdir(self.last_import_dir):
             directory = self.last_import_dir
-
+        
         default_save_path = os.path.join(directory, default_filename)
-
+        
         # ユーザーにファイル名と保存形式を選択させる
-        filters = "PNG Image (*.png);;TIFF Image (*.tif)"
+        filters = "Transparent PNG (*.png);;PNG Image (*.png);;TIFF Image (*.tif)"
         save_path, selected_filter = QFileDialog.getSaveFileName(
             self, "Save 3D View As...", default_save_path, filters,
             options=QFileDialog.DontUseNativeDialog
@@ -20082,6 +30207,10 @@ Check console for detailed information."""
 
         if not save_path:
             return
+
+        transparent = selected_filter.startswith("Transparent PNG")
+        if transparent and not save_path.lower().endswith(".png"):
+            save_path += ".png"
 
         # --- PyMOLウィンドウのキャプチャと保存 ---
         try:
@@ -20093,22 +30222,72 @@ Check console for detailed information."""
                     height = max(300, int(self.pymol_widget.height()))
                 # PyMOLでPNG/TIFFを保存
                 if not (save_path.endswith('.png') or save_path.endswith('.tif')):
-                    if "png" in selected_filter:
+                    if "PNG" in selected_filter:
                         save_path += ".png"
                     else:
                         save_path += ".tif"
-                self.pymol_cmd.png(save_path, width, height, dpi=300, ray=0, quiet=1)
+                saved_background_settings = {}
+                if transparent:
+                    for key in ("opaque_background", "ray_opaque_background"):
+                        try:
+                            saved_background_settings[key] = self.pymol_cmd.get(key)
+                            self.pymol_cmd.set(key, 0)
+                        except Exception:
+                            pass
+                try:
+                    self.pymol_cmd.png(save_path, width, height, dpi=300, ray=0, quiet=1)
+                finally:
+                    for key, value in saved_background_settings.items():
+                        try:
+                            self.pymol_cmd.set(key, value)
+                        except Exception:
+                            pass
                 QMessageBox.information(self, "Save Successful", f"3D view successfully saved to:\n{save_path}")
                 return
 
             # 1. VTKウィンドウを画像データに変換するフィルターを作成
+            render_window = self.vtk_widget.GetRenderWindow()
             window_to_image_filter = vtk.vtkWindowToImageFilter()
-            window_to_image_filter.SetInput(self.vtk_widget.GetRenderWindow())
-            # アルファチャンネル（透明度）を含めずにRGBのみをキャプチャ
-            window_to_image_filter.SetInputBufferTypeToRGB()
-            # スケーリングを無効にし、ウィンドウの解像度でキャプチャ
-            window_to_image_filter.SetScale(1)
-            window_to_image_filter.Update()
+            window_to_image_filter.SetInput(render_window)
+            if transparent:
+                old_alpha_bits = render_window.GetAlphaBitPlanes()
+                old_background_alpha = (
+                    self.renderer.GetBackgroundAlpha()
+                    if hasattr(self.renderer, "GetBackgroundAlpha") else 1.0
+                )
+                try:
+                    render_window.SetAlphaBitPlanes(1)
+                    if hasattr(self.renderer, "SetBackgroundAlpha"):
+                        self.renderer.SetBackgroundAlpha(0.0)
+                    render_window.Render()
+                    window_to_image_filter.SetInputBufferTypeToRGBA()
+                    window_to_image_filter.SetScale(1)
+                    window_to_image_filter.Update()
+                finally:
+                    render_window.SetAlphaBitPlanes(old_alpha_bits)
+                    if hasattr(self.renderer, "SetBackgroundAlpha"):
+                        self.renderer.SetBackgroundAlpha(old_background_alpha)
+                    render_window.Render()
+            else:
+                window_to_image_filter.SetInputBufferTypeToRGB()
+                # スケーリングを無効にし、ウィンドウの解像度でキャプチャ
+                window_to_image_filter.SetScale(1)
+                window_to_image_filter.Update()
+
+            if transparent:
+                rgba = self._vtk_image_to_rgba_array(window_to_image_filter.GetOutput())
+                # Some OpenGL/VTK combinations return an opaque alpha channel
+                # even with alpha bit planes enabled. Use the current background
+                # color as a safe fallback in that case.
+                if rgba is None or not np.any(rgba[:, :, 3] < 255):
+                    rgb = self._vtk_image_to_rgb_array(window_to_image_filter.GetOutput())
+                    bg = np.asarray(self.renderer.GetBackground(), dtype=float) * 255.0
+                    rgba = self._rgb_array_to_rgba_with_chroma_key(rgb, bg, tolerance=18.0)
+                pixmap = self._rgba_array_to_qpixmap(rgba)
+                if pixmap is None or pixmap.isNull() or not pixmap.save(save_path, "PNG"):
+                    raise RuntimeError("Failed to write transparent PNG")
+                QMessageBox.information(self, "Save Successful", f"3D view successfully saved to:\n{save_path}")
+                return
 
             # 2. 選択されたファイル形式に応じて適切なライターを選択
             if save_path.endswith('.png'):
@@ -20117,7 +30296,7 @@ Check console for detailed information."""
                 writer = vtk.vtkTIFFWriter()
             else:
                 # ユーザーが拡張子を入力しなかった場合、選択したフィルターから判断
-                if "png" in selected_filter:
+                if "PNG" in selected_filter:
                     save_path += ".png"
                     writer = vtk.vtkPNGWriter()
                 else:
@@ -20128,22 +30307,127 @@ Check console for detailed information."""
             writer.SetFileName(save_path)
             writer.SetInputConnection(window_to_image_filter.GetOutputPort())
             writer.Write()
-
+            
             QMessageBox.information(self, "Save Successful", f"3D view successfully saved to:\n{save_path}")
 
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"An error occurred while saving the 3D view:\n{e}")
+    
+    def simulate_views_blocking(self, desired_keys):
+        """Run the requested AFM views and wait while keeping Qt responsive."""
+        key_to_check = {
+            "XY_Frame": self.afm_x_check,
+            "YZ_Frame": self.afm_y_check,
+            "ZX_Frame": self.afm_z_check,
+        }
+        desired = {key for key in desired_keys if key in key_to_check}
+        if not desired:
+            return False
+
+        original = {
+            key: checkbox.isChecked()
+            for key, checkbox in key_to_check.items()
+        }
+        poll_timer = None
+        try:
+            for key, checkbox in key_to_check.items():
+                checkbox.blockSignals(True)
+                checkbox.setChecked(key in desired)
+                checkbox.blockSignals(False)
+
+            self.run_simulation()
+            worker = getattr(self, "sim_worker", None)
+            if not self.is_worker_running(worker, attr_name="sim_worker"):
+                return all(key in self.simulation_results for key in desired)
+
+            loop = QEventLoop(self)
+
+            def quit_when_finished(*_args):
+                if loop.isRunning():
+                    loop.quit()
+
+            try:
+                worker.done.connect(quit_when_finished)
+            except (AttributeError, RuntimeError):
+                pass
+
+            poll_timer = QTimer(self)
+            poll_timer.setInterval(20)
+            poll_timer.timeout.connect(
+                lambda: (
+                    None
+                    if self.is_worker_running(worker, attr_name="sim_worker")
+                    else quit_when_finished()
+                )
+            )
+            poll_timer.start()
+            if self.is_worker_running(worker, attr_name="sim_worker"):
+                loop.exec_()
+            return all(key in self.simulation_results for key in desired)
+        finally:
+            if poll_timer is not None:
+                poll_timer.stop()
+                poll_timer.deleteLater()
+            for key, checkbox in key_to_check.items():
+                checkbox.blockSignals(True)
+                checkbox.setChecked(original[key])
+                checkbox.blockSignals(False)
+            self.update_afm_display()
+
+    def _capture_afm_result_state(self):
+        """Capture AFM result references so a temporary export can restore them exactly."""
+        return {
+            "simulation_results": dict(self.simulation_results),
+            "raw_simulation_results": dict(self.raw_simulation_results),
+            "sim_aligned_nm": getattr(self, "sim_aligned_nm", None),
+        }
+
+    def _restore_afm_result_state(self, state):
+        """Restore AFM data and redraw panels after a temporary export simulation."""
+        self.simulation_results.clear()
+        self.simulation_results.update(state["simulation_results"])
+        self.raw_simulation_results.clear()
+        self.raw_simulation_results.update(state["raw_simulation_results"])
+        self.sim_aligned_nm = state["sim_aligned_nm"]
+
+        for image_key, data in self.simulation_results.items():
+            target_panel = self.findChild(QFrame, image_key)
+            if target_panel is not None:
+                self.display_afm_image(data, target_panel)
+
+        aligned_panel = getattr(self, "real_afm_window_aligned_frame", None)
+        if aligned_panel is not None and self.sim_aligned_nm is not None:
+            self.display_afm_image(
+                self._sim_aligned_display_image(self.sim_aligned_nm),
+                aligned_panel,
+            )
+        self.update_afm_display()
+
+    def _set_rotation_controls_silently(self, values):
+        """Set rotation spins/sliders without launching interactive simulations."""
+        for axis, value in values.items():
+            widgets = self.rotation_widgets[axis]
+            spin = widgets["spin"]
+            slider = widgets["slider"]
+            spin_was_blocked = spin.blockSignals(True)
+            slider_was_blocked = slider.blockSignals(True)
+            try:
+                spin.setValue(value)
+                slider.setValue(int(round(value * 10.0)))
+            finally:
+                spin.blockSignals(spin_was_blocked)
+                slider.blockSignals(slider_was_blocked)
 
     def handle_save_image(self):
         """Export one or more simulated AFM images (PNG) with optional incremental rotation."""
         if not self.simulation_results:
             QMessageBox.warning(self, "No Data", "No simulation data available to save.")
             return
-
+        
         # Build available (only those already simulated)
         available_keys = list(self.simulation_results.keys())
         display_names = {"XY_Frame": "XY View", "YZ_Frame": "YZ View", "ZX_Frame": "ZX View"}
-
+        
         dlg = SaveAFMImageDialog(available_keys, display_names, self.get_active_dataset_id(), self)
         if dlg.exec_() != QDialog.Accepted:
             return
@@ -20151,11 +30435,11 @@ Check console for detailed information."""
         selected_view_keys = result['selected_views']
         rot_inc = result['drot']
         base_name = result['base_name']
-
+        
         if not selected_view_keys:
             QMessageBox.warning(self, "No Selection", "No views selected.")
             return
-
+        
         # Map for filename friendly
         def key_to_short(k):
             return {
@@ -20163,31 +30447,40 @@ Check console for detailed information."""
                 "YZ_Frame": "YZ",
                 "ZX_Frame": "ZX"
             }.get(k, k.replace("_Frame", ""))
-
+        
         # Prepare directory & ensure last_import_dir is valid
         directory = ""
         if self.last_import_dir and os.path.isdir(self.last_import_dir):
             directory = self.last_import_dir
         if not directory:
             directory = os.getcwd()
-
+        
         # Save original rotation
         orig_rx = self.rotation_widgets['X']['spin'].value()
         orig_ry = self.rotation_widgets['Y']['spin'].value()
         orig_rz = self.rotation_widgets['Z']['spin'].value()
-
+        
         apply_rotation = any(abs(v) > 1e-6 for v in rot_inc.values())
-
+        original_result_state = self._capture_afm_result_state() if apply_rotation else None
+        
         try:
             if apply_rotation:
                 # Apply incremental rotation (add to current)
-                self.rotation_widgets['X']['spin'].setValue(self.normalize_angle(orig_rx + rot_inc['x']))
-                self.rotation_widgets['Y']['spin'].setValue(self.normalize_angle(orig_ry + rot_inc['y']))
-                self.rotation_widgets['Z']['spin'].setValue(self.normalize_angle(orig_rz + rot_inc['z']))
+                self._set_rotation_controls_silently({
+                    "X": self.normalize_angle(orig_rx + rot_inc['x']),
+                    "Y": self.normalize_angle(orig_ry + rot_inc['y']),
+                    "Z": self.normalize_angle(orig_rz + rot_inc['z']),
+                })
                 # Force apply transform & run simulation for required views
-                self.apply_structure_rotation()
-                self.simulate_views_blocking(selected_view_keys)
-
+                self.apply_structure_rotation(trigger_simulation=False)
+                if not self.simulate_views_blocking(selected_view_keys):
+                    QMessageBox.warning(
+                        self,
+                        "Simulation Failed",
+                        "The rotated AFM image could not be generated.",
+                    )
+                    return
+            
             # Export each selected view
             export_count = 0
             for key in selected_view_keys:
@@ -20200,7 +30493,7 @@ Check console for detailed information."""
                     norm = np.zeros_like(data, dtype=np.uint8)
                 else:
                     norm = ((data - mn) / (mx - mn) * 255).astype(np.uint8)
-
+                
                 # Resize to 512x512
                 try:
                     from PIL import Image
@@ -20210,7 +30503,7 @@ Check console for detailed information."""
                 img = Image.fromarray(norm, mode='L')
                 resample_filter = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS
                 img = img.resize((512, 512), resample=resample_filter)
-
+                
                 fname = f"{base_name}_{key_to_short(key)}_dx{rot_inc['x']:+.0f}_dy{rot_inc['y']:+.0f}_dz{rot_inc['z']:+.0f}.png"
                 save_path = os.path.join(directory, fname)
                 try:
@@ -20218,22 +30511,23 @@ Check console for detailed information."""
                     export_count += 1
                 except Exception as e:
                     print(f"[ERROR] Failed to save {save_path}: {e}")
-
+            
             if export_count:
                 QMessageBox.information(self, "Export Complete", f"Exported {export_count} image(s) to:\n{directory}")
             else:
                 QMessageBox.warning(self, "No Export", "No images were exported.")
-
+        
         finally:
             # Restore original rotation if we changed it
             if apply_rotation:
-                self.rotation_widgets['X']['spin'].setValue(orig_rx)
-                self.rotation_widgets['Y']['spin'].setValue(orig_ry)
-                self.rotation_widgets['Z']['spin'].setValue(orig_rz)
-                self.apply_structure_rotation()
-                # (Optionally regenerate original visible views if needed)
-                # self.simulate_views_blocking(available_keys)
-
+                self._set_rotation_controls_silently({
+                    "X": orig_rx,
+                    "Y": orig_ry,
+                    "Z": orig_rz,
+                })
+                self.apply_structure_rotation(trigger_simulation=False)
+                self._restore_afm_result_state(original_result_state)
+    
     def run_simulation_on_view_change(self, is_checked):
         """
         View選択チェックボックスがONになった時にシミュレーションを自動実行するスロット。
@@ -20402,11 +30696,11 @@ Check console for detailed information."""
             self.spinNy.setValue(res)
             self.spinNx.blockSignals(False)
             self.spinNy.blockSignals(False)
-
+            
             # Interactive Updateが有効な場合、新しい解像度を高解像度として記憶
             if self.interactive_update_check.isChecked():
                 self.user_selected_resolution = f"{res}x{res}"
-
+            
             self.trigger_interactive_simulation()
         except (ValueError, IndexError):
             pass
@@ -20419,7 +30713,7 @@ Check console for detailed information."""
         coords, mode = self.get_simulation_coords()
         if coords is None:
             return
-
+        
         # 既に別のシミュレーションが実行中の場合は何もしない（改良版）
         if self.is_worker_running(getattr(self, 'sim_worker', None), attr_name='sim_worker') or \
            self.is_worker_running(getattr(self, 'sim_worker_silent', None), attr_name='sim_worker_silent'):
@@ -20435,8 +30729,8 @@ Check console for detailed information."""
             'scan_y_nm': self.spinScanYNm.value(),
             'nx': 64,  # ★★★ ドラッグ中は常に低解像度で計算 ★★★
             'ny': 64,
-            'center_x': self.tip_x_slider.value() / 5.0,
-            'center_y': self.tip_y_slider.value() / 5.0,
+            'center_x': self._get_tip_center_xy_nm()[0],
+            'center_y': self._get_tip_center_xy_nm()[1],
             'tip_radius': self.tip_radius_spin.value(),
             'minitip_radius': self.minitip_radius_spin.value(),
             'tip_angle': self.tip_angle_spin.value(),
@@ -20481,7 +30775,7 @@ Check console for detailed information."""
                 self.stop_worker(self.sim_worker_silent, timeout_ms=50, allow_terminate=True, worker_name="sim_worker_silent")
             except Exception as e:
                 print(f"[WARNING] Error stopping sim_worker_silent: {e}")
-
+        
         # 軽量ワーカーを作成（UI変更なし）
         self.sim_worker_silent = AFMSimulationWorker(
             self, sim_params, tasks,
@@ -20505,11 +30799,11 @@ Check console for detailed information."""
         # データが読み込まれていない場合は何もしない
         if self.atoms_data is None and not (hasattr(self, 'mrc_data') and self.mrc_data is not None):
             return
-
+        
         # 以前のタイマーが作動中であれば停止する
         if hasattr(self, 'interactive_timer'):
             self.interactive_timer.stop()
-
+        
         # ★★★ 軽量シミュレーションを実行（ドラッグ中はXYのみ） ★★★
         self.run_simulation_silent(only_xy=True)
 
@@ -20521,25 +30815,25 @@ Check console for detailed information."""
         # データが読み込まれていない場合は何もしない
         if self.atoms_data is None and not (hasattr(self, 'mrc_data') and self.mrc_data is not None):
             return
-
+        
         # 以前のタイマーが作動中であれば停止する
         if hasattr(self, 'interactive_timer'):
             self.interactive_timer.stop()
-
+        
         # ★★★ 前のシミュレーションが完了するまで待機 ★★★
         if self.is_worker_running(getattr(self, 'sim_worker_silent', None), attr_name='sim_worker_silent'):
             # 前のシミュレーションが実行中の場合は、ドラッグ中の更新をスキップ
             return
-
+        
         # ★★★ 最小更新間隔の制御を強化 ★★★
         current_time = QTime.currentTime()
         if hasattr(self, 'last_drag_simulation_time'):
             time_diff = self.last_drag_simulation_time.msecsTo(current_time)
             if time_diff < 300:  # 300ms未満の場合はスキップ（200msから増加）
                 return
-
+        
         self.last_drag_simulation_time = current_time
-
+        
         # 軽量シミュレーションを実行（ドラッグ中はXYのみ）
         self.run_simulation_silent(only_xy=True)
 
@@ -20559,7 +30853,7 @@ Check console for detailed information."""
         # 既存のタイマーが動作中であれば停止
         if hasattr(self, 'high_res_timer'):
             self.high_res_timer.stop()
-
+        
         # 新しいタイマーを設定（1秒後に実行）
         self.high_res_timer = QTimer(self)  # 親ウィンドウを設定
         self.high_res_timer.setSingleShot(True)
@@ -20575,14 +30869,14 @@ Check console for detailed information."""
         if getattr(self, 'block_transform_dragging', False):
             self.schedule_high_res_simulation()
             return
-
+        
         # UI上の解像度表示は変更せず、内部で高解像度計算を実行
         if hasattr(self, 'user_selected_resolution') and self.user_selected_resolution:
             target_resolution = self.user_selected_resolution
         else:
             target_resolution = "256x256"  # デフォルト高解像度
-
-
+   
+        
         # 高解像度シミュレーションを実行（UI表示は変更しない）
         self.run_simulation_silent_high_res(target_resolution)
 
@@ -20593,7 +30887,7 @@ Check console for detailed information."""
         coords, mode = self.get_simulation_coords()
         if coords is None:
             return
-
+        
         # 既に別のシミュレーションが実行中の場合は何もしない
         if self.is_worker_running(getattr(self, 'sim_worker', None), attr_name='sim_worker'):
             return
@@ -20606,7 +30900,7 @@ Check console for detailed information."""
         try:
             if 'x' in target_resolution:
                 target_nx = int(target_resolution.split('x')[0])
-                target_ny = int(target_resolution.split('x')[int('x' in target_resolution)]) # logic for potentially split
+                target_ny = int(target_resolution.split('x')[int('x' in target_resolution)]) # logic for potentially split 
                 # simplification:
                 target_nx = int(target_resolution.split('x')[0])
                 target_ny = int(target_resolution.split('x')[1])
@@ -20622,8 +30916,8 @@ Check console for detailed information."""
             'scan_y_nm': self.spinScanYNm.value(),
             'nx': target_nx,
             'ny': target_ny,
-            'center_x': self.tip_x_slider.value() / 5.0,
-            'center_y': self.tip_y_slider.value() / 5.0,
+            'center_x': self._get_tip_center_xy_nm()[0],
+            'center_y': self._get_tip_center_xy_nm()[1],
             'tip_radius': self.tip_radius_spin.value(),
             'minitip_radius': self.minitip_radius_spin.value(),
             'tip_angle': self.tip_angle_spin.value(),
@@ -20653,7 +30947,7 @@ Check console for detailed information."""
         # 既存の高解像度ワーカーを停止
         if self.is_worker_running(getattr(self, 'sim_worker_high_res', None), attr_name='sim_worker_high_res'):
             self.stop_worker(self.sim_worker_high_res, timeout_ms=300, allow_terminate=False, worker_name="sim_worker_high_res")
-
+        
         # 高解像度ワーカーを作成
         self.sim_worker_high_res = AFMSimulationWorker(
             self, sim_params, tasks,
@@ -20675,15 +30969,15 @@ Check console for detailed information."""
         if self.simulation_results:
             self.save_image_button.setEnabled(True)
             self.save_asd_button.setEnabled(True)
-
+        
         # UI上の解像度表示は変更しない（既に正しい解像度が表示されている）
-
+       
 
     def on_task_finished_silent(self, z_map, target_panel):
         """軽量シミュレーション用のタスク完了処理（UI変更最小限）"""
         if z_map is not None and target_panel is not None:
             image_key = target_panel.objectName()
-
+            
             # 生データを保存し、表示更新関数を呼び出す
             self.raw_simulation_results[image_key] = z_map
             self.process_and_display_single_image(image_key)
@@ -20706,11 +31000,11 @@ Check console for detailed information."""
             return
         if self.is_worker_running(getattr(self, 'sim_worker', None), attr_name='sim_worker'):
             return
-
+        
         # 以前のタイマーが作動中であれば停止する
         if hasattr(self, 'interactive_timer'):
             self.interactive_timer.stop()
-
+        
         # 新しいタイマーを設定
         self.interactive_timer = QTimer(self)  # 親ウィンドウを設定
         self.interactive_timer.setSingleShot(True)  # 一度だけ実行
@@ -20725,7 +31019,7 @@ Check console for detailed information."""
         """実行中のスレッドを適切にクリーンアップする（完全版）"""
         try:
             print("Starting thread cleanup...")
-
+            
             # スレッドのリストを作成
             workers = []
             if hasattr(self, 'sim_worker') and self.sim_worker:
@@ -20734,7 +31028,7 @@ Check console for detailed information."""
                 workers.append(('sim_worker_silent', self.sim_worker_silent))
             if hasattr(self, 'sim_worker_high_res') and self.sim_worker_high_res:
                 workers.append(('sim_worker_high_res', self.sim_worker_high_res))
-
+            
             # 各ワーカーを停止
             for worker_name, worker in workers:
                 try:
@@ -20744,12 +31038,12 @@ Check console for detailed information."""
                         print(f"Stopped {worker_name} gracefully")
                     else:
                         print(f"[WARNING] {worker_name} may still be running")
-
+                        
                 except Exception as e:
                     print(f"[WARNING] Error stopping {worker_name}: {e}")
-
+            
             print("Thread cleanup completed")
-
+                
         except Exception as e:
             print(f"[WARNING] Error during thread cleanup: {e}")
 
@@ -20768,10 +31062,10 @@ Check console for detailed information."""
                             timer.deleteLater()  # タイマーを完全に削除
                         except Exception as e:
                             print(f"[WARNING] Failed to stop {timer_attr}: {e}")
-
+            
             # ★★★ スレッドの適切なクリーンアップ（同期的に実行） ★★★
             self.cleanup_threads()
-
+            
             # ヘルプウィンドウを閉じる
             if hasattr(self, 'help_window') and self.help_window:
                 try:
@@ -20795,21 +31089,21 @@ Check console for detailed information."""
                             print(f"[WARNING] {label} C++ object already deleted")
                         except Exception as e:
                             print(f"[WARNING] Failed to close {label}: {e}")
-
+            
             # スタンドアロンアプリケーションなのでwindow_managerは使用しない
-
+            
             # ウィンドウの位置とサイズを保存
             try:
                 self.save_geometry()
             except Exception as e:
                 print(f"[WARNING] Failed to save geometry: {e}")
-
+            
             # 設定を保存
             try:
                 self.save_settings()
             except Exception as e:
                 print(f"[WARNING] Failed to save settings: {e}")
-
+            
             # Qtのデフォルトのクローズ処理
             try:
                 super().closeEvent(event)
@@ -20817,9 +31111,9 @@ Check console for detailed information."""
                 print("[WARNING] C++ object already deleted during super().closeEvent()")
             except Exception as e:
                 print(f"[WARNING] Failed to call super().closeEvent(): {e}")
-
+            
             event.accept()
-
+            
         except Exception as e:
             print(f"[ERROR] Unexpected error in pyNuD_simulator closeEvent: {e}")
             import traceback
@@ -20832,7 +31126,7 @@ Check console for detailed information."""
         # 必要なライブラリのインポート
         import mrcfile
         from vtkmodules.util import numpy_support
-
+        
         # PDBデータをクリア（MRCファイルimport時）
         self.clear_pdb_data()
 
@@ -20847,42 +31141,42 @@ Check console for detailed information."""
             self.mrc_data_original = mrc.data.copy()
             # デフォルトでZ flipを適用（読み込み時にFlipさせて管理）
             self.mrc_data = np.flip(self.mrc_data_original, axis=0).copy()
-
+            
             if mrc.voxel_size.x:
-                voxel_size_angstrom = mrc.voxel_size.x
+                voxel_size_angstrom = mrc.voxel_size.x 
             else:
                 voxel_size_angstrom = 1.0
             self.mrc_voxel_size_nm = voxel_size_angstrom / 10.0
-
+            
         # MRCファイル名を表示
         self.mrc_name = os.path.basename(file_path)
         self.mrc_id = ""
         self.mrc_id = os.path.splitext(self.mrc_name)[0]
         self.file_label.setText(f"File Name: {self.mrc_name} (MRC)")
-
+        
         self.mrc_group.setEnabled(True)
         # Z flipの状態に応じてmrc_surface_coordsを初期化
         self.mrc_surface_coords = self._get_mrc_surface_coords()
         self.update_mrc_display()
         self.simulate_btn.setEnabled(True)
-
+        
         # 回転ウィジェットも有効化
         if hasattr(self, 'rotation_widgets'):
             for axis in ['X', 'Y', 'Z']:
                 self.rotation_widgets[axis]['spin'].setEnabled(True)
                 self.rotation_widgets[axis]['slider'].setEnabled(True)
-
+        
         # チェックボックスの状態を確実に設定（デフォルトでTrue）
         if hasattr(self, 'mrc_z_flip_check'):
             self.mrc_z_flip_check.blockSignals(True)
             self.mrc_z_flip_check.setChecked(True)
             self.mrc_z_flip_check.blockSignals(False)
             self.mrc_z_flip = True
-
+        
         # 回転状態をリセット（MRCファイル読み込み時）
         self.reset_structure_rotation()
         self.set_standard_view('xy')
-
+        
         # Interactive Updateが有効な場合は初期シミュレーションを実行
         if hasattr(self, 'interactive_update_check') and self.interactive_update_check.isChecked():
             self.run_simulation_interactively()
@@ -20891,17 +31185,17 @@ Check console for detailed information."""
         """スライダーの値が変更されたときに呼ばれる（リアルタイム更新用）"""
         # ラベルを更新
         self.mrc_threshold_label.setText(f"Value: {value/100.0:.2f}")
-
+        
         # Interactive Updateが有効な場合は疑似AFM像を自動更新
         if hasattr(self, 'interactive_update_check') and self.interactive_update_check.isChecked():
             self.mrc_threshold = value / 100.0
             self.run_simulation_interactively()
-
+    
     def on_mrc_threshold_released(self):
         """スライダーが離されたときに呼ばれ、しきい値を更新して再描画する"""
         self.mrc_threshold = self.mrc_threshold_slider.value() / 100.0
         self.update_mrc_display()
-
+        
         # Interactive Updateが有効な場合は疑似AFM像も自動更新
         if hasattr(self, 'interactive_update_check') and self.interactive_update_check.isChecked():
             self.run_simulation_interactively()
@@ -20909,7 +31203,7 @@ Check console for detailed information."""
     def on_mrc_z_flip_changed(self, state):
         """Z軸フリップチェックボックスの状態変更時の処理"""
         self.mrc_z_flip = state == Qt.Checked
-
+        
         # mrc_data_originalが存在しない場合は、現在のmrc_dataを元データとして使用
         if not hasattr(self, 'mrc_data_original') or self.mrc_data_original is None:
             if hasattr(self, 'mrc_data') and self.mrc_data is not None:
@@ -20917,11 +31211,11 @@ Check console for detailed information."""
                 self.mrc_data_original = self.mrc_data.copy()
             else:
                 return
-
+        
         if self.mrc_data_original is not None:
             # フリップ状態変更時に回転状態をリセット（ジャンプを防ぐ）
             self.reset_structure_rotation()
-
+            
             # チェック時：フリップ済みデータを使用（現在の状態を維持）
             # アンチェック時：元のデータを使用（元の向きに戻す）
             if self.mrc_z_flip:
@@ -20930,7 +31224,7 @@ Check console for detailed information."""
             else:
                 # アンチェック時：元のデータ（元の向きに戻す）
                 self.mrc_data = self.mrc_data_original.copy()
-
+            
             # 座標データを再生成
             self.mrc_surface_coords = self._get_mrc_surface_coords()
             self.update_mrc_display()
@@ -20939,7 +31233,7 @@ Check console for detailed information."""
         """MRCデータから表面座標を取得する"""
         if not hasattr(self, 'mrc_data') or self.mrc_data is None:
             return None
-
+        
         from vtkmodules.util import numpy_support
 
         # 現在のフリップ状態に応じたデータを使用
@@ -21099,7 +31393,7 @@ Check console for detailed information."""
             return coords, 'pdb'
         else:
             return None, None
-
+    
     def get_active_dataset_id(self):
         """
         Return an identifier for current dataset (PDB or MRC).
@@ -21116,8 +31410,8 @@ Check console for detailed information."""
             return "PDB"
         if getattr(self, 'mrc_id', ''):
             return "MRC"
-        return "Unknown"
-
+        return "Unknown"   
+    
 class SaveAFMImageDialog(QDialog):
     """
     Custom dialog to select multiple AFM views and specify incremental rotations
@@ -21133,12 +31427,12 @@ class SaveAFMImageDialog(QDialog):
         self.setMinimumWidth(420)
         self._result = None
         self._build_ui()
-
+    
     def _build_ui(self):
         main = QVBoxLayout(self)
         main.setContentsMargins(12, 12, 12, 12)
         main.setSpacing(10)
-
+        
         # Views group
         views_group = QGroupBox("Select Views to Export")
         vg = QVBoxLayout(views_group)
@@ -21164,7 +31458,7 @@ class SaveAFMImageDialog(QDialog):
         btn_row.addWidget(sel_none)
         vg.addLayout(btn_row)
         main.addWidget(views_group)
-
+        
         # Rotation increments
         rot_group = QGroupBox("Incremental Rotation (°)  (applied once before export)")
         rg = QGridLayout(rot_group)
@@ -21175,7 +31469,7 @@ class SaveAFMImageDialog(QDialog):
         rg.addWidget(QLabel("ΔY:"), 0, 2); rg.addWidget(self.dy_spin, 0, 3)
         rg.addWidget(QLabel("ΔZ:"), 0, 4); rg.addWidget(self.dz_spin, 0, 5)
         main.addWidget(rot_group)
-
+        
         # Base filename
         base_group = QGroupBox("Filename Base")
         bg = QHBoxLayout(base_group)
@@ -21184,7 +31478,7 @@ class SaveAFMImageDialog(QDialog):
         self.base_edit.setPlaceholderText("Base name (dataset id)")
         bg.addWidget(self.base_edit)
         main.addWidget(base_group)
-
+        
         # Example label
         self.example_label = QLabel()
         self.example_label.setStyleSheet("color:#555; font-size:11px;")
@@ -21195,7 +31489,7 @@ class SaveAFMImageDialog(QDialog):
                 sp.valueChanged.connect(self._update_example)
             else:
                 sp.textChanged.connect(self._update_example)
-
+        
         # Buttons
         btns = QHBoxLayout()
         btns.addStretch()
@@ -21206,31 +31500,31 @@ class SaveAFMImageDialog(QDialog):
         btns.addWidget(self.ok_btn)
         btns.addWidget(cancel_btn)
         main.addLayout(btns)
-
+        
         self._update_ok_state()
-
+    
     def _init_rot_spin(self, spin):
         spin.setRange(-360.0, 360.0)
         spin.setDecimals(1)
         spin.setSingleStep(1.0)
         spin.setValue(0.0)
         spin.setKeyboardTracking(False)
-
+    
     def _set_all(self, state):
         for cb in self.view_checks.values():
             cb.setChecked(state)
         self._update_ok_state()
-
+    
     def _update_ok_state(self):
         any_checked = any(cb.isChecked() for cb in self.view_checks.values())
         self.ok_btn.setEnabled(any_checked)
-
+    
     def _update_example(self):
         base = self.base_edit.text().strip() or "AFM"
         dx = self.dx_spin.value(); dy = self.dy_spin.value(); dz = self.dz_spin.value()
         example = f"Example filename: {base}_XY_dx{dx:+.0f}_dy{dy:+.0f}_dz{dz:+.0f}.png"
         self.example_label.setText(example)
-
+    
     def get_result(self):
         selected = [k for k, cb in self.view_checks.items() if cb.isChecked()]
         return {
@@ -21807,6 +32101,36 @@ class AFMSimulator(pyNuD_simulator):
         super().closeEvent(event)
 
 
+def _parse_cli_args(argv):
+    """Parse pyNuD Simulator launch arguments used for pyNuD interop.
+
+    Accepts an optional Real AFM ASD file to auto-load on startup, plus an
+    optional frame index. Unknown args (e.g. Qt switches) are ignored so the
+    parser never aborts startup.
+    """
+    parser = argparse.ArgumentParser(
+        prog="pyNuD Simulator", add_help=False, allow_abbrev=False
+    )
+    parser.add_argument("--real-asd", dest="real_asd", default=None,
+                        help="ASD file to load as Real AFM on startup")
+    parser.add_argument("--real-data", dest="real_data", default=None,
+                        help="Processed pyNuD frame (.npz) to load as Real AFM")
+    parser.add_argument("--frame", dest="frame", type=int, default=None,
+                        help="Frame index to show for the Real AFM file")
+    parser.add_argument("paths", nargs="*", default=[])
+    try:
+        args, _unknown = parser.parse_known_args(list(argv or []))
+    except SystemExit:
+        return None, None, None
+    real_asd = args.real_asd
+    if not real_asd:
+        for cand in args.paths:
+            if cand and str(cand).lower().endswith(".asd"):
+                real_asd = cand
+                break
+    return real_asd, args.real_data, args.frame
+
+
 def main():
     # アプリケーション作成前にHighDPI設定
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
@@ -21814,6 +32138,8 @@ def main():
     QApplication.setAttribute(Qt.AA_UseDesktopOpenGL, True)
     # macOSでもウィンドウ内にメニューを表示する
     QApplication.setAttribute(Qt.AA_DontUseNativeMenuBar, True)
+
+    real_asd_path, real_data_path, real_asd_frame = _parse_cli_args(sys.argv[1:])
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
@@ -21826,12 +32152,32 @@ def main():
     if not icon.isNull():
         app.setWindowIcon(icon)
         apply_macos_dock_icon(icon_path)
-
+    
     # VTKのエラー出力を抑制
     vtk.vtkObject.GlobalWarningDisplayOff()
-
+    
     window = pyNuD_simulator()
     window.show()
+
+    # pyNuD interop: load handed-off data after the window is shown so the
+    # user lands directly on it. A processed-frame .npz (the exact image shown
+    # in pyNuD) takes priority over a raw ASD path.
+    if real_data_path and os.path.isfile(real_data_path):
+        def _load_handoff():
+            try:
+                window.load_real_afm_from_handoff(real_data_path)
+            except Exception as e:
+                print(f"[pyNuD interop] Failed to auto-load handoff data: {e}")
+        QTimer.singleShot(0, _load_handoff)
+    elif real_asd_path and os.path.isfile(real_asd_path):
+        def _load_handoff():
+            try:
+                window.load_real_asd_file(real_asd_path, sync=True)
+                if real_asd_frame is not None:
+                    window.load_real_asd_frame(int(real_asd_frame))
+            except Exception as e:
+                print(f"[pyNuD interop] Failed to auto-load Real AFM: {e}")
+        QTimer.singleShot(0, _load_handoff)
 
     sys.exit(app.exec_())
 
@@ -21849,6 +32195,8 @@ __all__ = [
     "APP_NAME",
     "apply_domain_transforms",
     "detect_domains_enm",
+    "detect_domains_oligomer_enm",
+    "_partition_indices_into_blocks",
 ]
 
 
