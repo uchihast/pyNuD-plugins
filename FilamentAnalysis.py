@@ -131,6 +131,8 @@ FILAMENT_UI_TRANSLATIONS = {
     "スケール不明": "scale unknown",
     "記録した測定値": "Recorded Measurements",
     "記録した測定値表の全行をCSV保存します。初期フォルダは現在のAFMデータフォルダです": "Save all rows in the recorded measurements table as CSV. The initial folder is the current AFM data folder.",
+    "背骨/屈曲 CSV": "Backbone/Bending CSV",
+    "記録済み輪郭の背骨座標 path_full_xy と、屈曲角・円フィット半径・屈曲サブセグメント末端間距離をCSV保存します": "Save recorded backbone coordinates (path_full_xy) plus bend angle, circle-fit radius, and bent-subsegment end-to-end distance as CSV.",
     "モード": "Mode",
     "直線化 / Linearization": "Linearization",
     "記録済み輪郭から全フレームの直線化boxを一括作成し、カタログを開きます": "Create linearized boxes from all recorded contours and open the catalog",
@@ -164,6 +166,8 @@ FILAMENT_UI_TRANSLATIONS = {
     "直線化ボックスを出力しました": "Linearized boxes were exported",
     "この行を削除": "Delete this row",
     "記録した測定値がありません。": "No recorded measurements are available.",
+    "有効な背骨座標がありません。": "No valid backbone coordinates are available.",
+    "背骨座標と屈曲ダイナミクスを保存しました": "Backbone coordinates and bending dynamics were saved",
     "CSV保存に失敗しました": "CSV save failed",
     "CSVを保存しました": "CSV was saved",
     "上書き確認": "Overwrite confirmation",
@@ -239,6 +243,7 @@ FILAMENT_UI_EN_TO_JA = {
     "Catalog": "カタログ",
     "Box half width": "Box半幅",
     "CSV Save": "CSV保存",
+    "Backbone/Bending CSV": "背骨/屈曲 CSV",
     "Data Clear": "データ消去",
     "Clear Points": "位置クリア",
     "Save Session": "セッション保存",
@@ -761,6 +766,134 @@ def compute_curvature_from_path(
         kappa[:trim_n] = np.nan
         kappa[n - trim_n:] = np.nan
     return kappa
+
+
+def _fit_circle_to_points_xy(points_xy: np.ndarray) -> Dict[str, float]:
+    pts = np.asarray(points_xy, dtype=np.float64)
+    result = {
+        "circle_center_x": np.nan,
+        "circle_center_y": np.nan,
+        "circle_radius": np.nan,
+        "circle_fit_rmse": np.nan,
+    }
+    if pts.ndim != 2 or pts.shape[1] != 2 or pts.shape[0] < 3:
+        return result
+    mask = np.isfinite(pts[:, 0]) & np.isfinite(pts[:, 1])
+    pts = pts[mask]
+    if pts.shape[0] < 3:
+        return result
+    x = pts[:, 0]
+    y = pts[:, 1]
+    a = np.column_stack([2.0 * x, 2.0 * y, np.ones_like(x)])
+    b = x * x + y * y
+    try:
+        cx, cy, c0 = np.linalg.lstsq(a, b, rcond=None)[0]
+    except Exception:
+        return result
+    r2 = float(cx * cx + cy * cy + c0)
+    if not np.isfinite(r2) or r2 <= 0:
+        return result
+    radius = math.sqrt(r2)
+    distances = np.hypot(x - cx, y - cy)
+    result.update({
+        "circle_center_x": float(cx),
+        "circle_center_y": float(cy),
+        "circle_radius": float(radius),
+        "circle_fit_rmse": _finite_mean((distances - radius) ** 2) ** 0.5,
+    })
+    return result
+
+
+def compute_bending_geometry_from_path(
+    path_xy: List[Tuple[float, float]],
+    n_resample: int = 101,
+    arm_fraction: float = 0.20,
+) -> Dict[str, Any]:
+    """
+    Estimate robust low-order bending geometry from a backbone path.
+
+    The returned bend_angle_deg is a deflection angle: a straight filament is
+    near 0 deg, and stronger bending gives larger values. included_angle_deg is
+    the complementary two-arm angle, near 180 deg for a straight filament.
+    """
+    xy, total_length = resample_path_uniform(path_xy, max(21, int(n_resample)))
+    result: Dict[str, Any] = {
+        "status": "invalid_path",
+        "total_length": float(total_length),
+        "bend_angle_deg": np.nan,
+        "included_angle_deg": np.nan,
+        "bend_apex_index": -1,
+        "bend_apex_s": np.nan,
+        "bend_apex_fraction": np.nan,
+        "bend_apex_x": np.nan,
+        "bend_apex_y": np.nan,
+        "subsegment_start_s": np.nan,
+        "subsegment_end_s": np.nan,
+        "subsegment_length": np.nan,
+        "subsegment_end_to_end": np.nan,
+        "arm_fraction": float(arm_fraction),
+        "arm_points": 0,
+        "resample_points": int(xy.shape[0]) if xy.ndim == 2 else 0,
+        "circle_center_x": np.nan,
+        "circle_center_y": np.nan,
+        "circle_radius": np.nan,
+        "circle_fit_rmse": np.nan,
+    }
+    if xy.ndim != 2 or xy.shape[1] != 2 or xy.shape[0] < 9 or not np.isfinite(total_length) or total_length <= 0:
+        return result
+    n = xy.shape[0]
+    s_axis = np.linspace(0.0, float(total_length), n)
+    frac = max(0.05, min(0.45, float(arm_fraction)))
+    arm_points = int(round((n - 1) * frac))
+    arm_points = max(3, min(arm_points, max(3, (n - 1) // 2 - 1)))
+    if n < (2 * arm_points + 1):
+        result["status"] = "too_short_for_arms"
+        return result
+
+    best_idx = -1
+    best_angle = -np.inf
+    for idx in range(arm_points, n - arm_points):
+        v_left = xy[idx] - xy[idx - arm_points]
+        v_right = xy[idx + arm_points] - xy[idx]
+        norm_left = float(np.linalg.norm(v_left))
+        norm_right = float(np.linalg.norm(v_right))
+        if norm_left <= 0 or norm_right <= 0:
+            continue
+        cos_val = float(np.dot(v_left, v_right) / (norm_left * norm_right))
+        cos_val = max(-1.0, min(1.0, cos_val))
+        angle_deg = math.degrees(math.acos(cos_val))
+        if np.isfinite(angle_deg) and angle_deg > best_angle:
+            best_angle = float(angle_deg)
+            best_idx = int(idx)
+    if best_idx < 0:
+        result["status"] = "no_valid_bend"
+        return result
+
+    start_idx = max(0, best_idx - arm_points)
+    end_idx = min(n - 1, best_idx + arm_points)
+    sub_xy = xy[start_idx:end_idx + 1]
+    circle = _fit_circle_to_points_xy(sub_xy)
+    sub_end_to_end = float(np.linalg.norm(xy[end_idx] - xy[start_idx]))
+    result.update(circle)
+    result.update({
+        "status": "ok",
+        "total_length": float(total_length),
+        "bend_angle_deg": float(best_angle),
+        "included_angle_deg": float(max(0.0, 180.0 - best_angle)),
+        "bend_apex_index": best_idx,
+        "bend_apex_s": float(s_axis[best_idx]),
+        "bend_apex_fraction": float(s_axis[best_idx] / total_length) if total_length > 0 else np.nan,
+        "bend_apex_x": float(xy[best_idx, 0]),
+        "bend_apex_y": float(xy[best_idx, 1]),
+        "subsegment_start_s": float(s_axis[start_idx]),
+        "subsegment_end_s": float(s_axis[end_idx]),
+        "subsegment_length": float(s_axis[end_idx] - s_axis[start_idx]),
+        "subsegment_end_to_end": sub_end_to_end,
+        "arm_fraction": frac,
+        "arm_points": arm_points,
+        "resample_points": n,
+    })
+    return result
 
 
 def _finite_mean(values: np.ndarray) -> float:
@@ -2690,6 +2823,10 @@ class ContourLengthWindow(QtWidgets.QWidget):
         self.recorded_csv_btn.setToolTip("記録した測定値表の全行をCSV保存します。初期フォルダは現在のAFMデータフォルダです")
         self.recorded_csv_btn.clicked.connect(self._on_save_recorded_measurements_csv)
         table_layout.addWidget(self.recorded_csv_btn)
+        self.backbone_bending_csv_btn = QtWidgets.QPushButton("背骨/屈曲 CSV")
+        self.backbone_bending_csv_btn.setToolTip("記録済み輪郭の背骨座標 path_full_xy と、屈曲角・円フィット半径・屈曲サブセグメント末端間距離をCSV保存します")
+        self.backbone_bending_csv_btn.clicked.connect(self._on_save_backbone_bending_csv)
+        table_layout.addWidget(self.backbone_bending_csv_btn)
         layout.addWidget(gb_table)
 
         gb_box = QtWidgets.QGroupBox("直線化 / Linearization")
@@ -2874,6 +3011,7 @@ class ContourLengthWindow(QtWidgets.QWidget):
                 "- Persistence Length: when checked, OK also calculates and stores the persistence length.\n"
                 "- Prev / Next: moves between frames. The ROI and clicked positions are kept, while the calculated contour, length, snapped points, and persistence result are cleared for the new frame. Next asks for confirmation if a trace exists but has not been recorded with OK.\n"
                 "- CSV Save under Recorded Measurements: saves all visible recorded measurement rows as CSV in the current AFM data folder by default.\n"
+                "- Backbone/Bending CSV: saves *_filament_backbone_xy.csv with every path_full_xy point and *_filament_bending_dynamics.csv with one row per frame. The bending CSV contains bend_angle_deg, included_angle_deg, circle_radius, subsegment_end_to_end, and the bend apex position. geometry_unit is nm when image scale is available, otherwise px.\n"
                 "\n"
                 "Tracing and preprocessing\n"
                 "- Ridge sigma: Gaussian scale used for ridge detection. Start near the apparent filament width.\n"
@@ -2911,6 +3049,7 @@ class ContourLengthWindow(QtWidgets.QWidget):
             "- Persistence Length: チェックON時、OK記録時にパーシステンス長も計算して保存します。\n"
             "- Prev / Next: フレームを移動します。ROIとクリック位置は残し、計算済み輪郭、輪郭長、スナップ位置、Persistence Lengthは新フレーム用に消去します。未記録のトレースがある状態でNextを押すと確認します。\n"
             "- 記録した測定値のCSV Save: 表に表示されている全行をCSV保存します。初期保存先は現在のAFMデータフォルダです。\n"
+            "- 背骨/屈曲 CSV: *_filament_backbone_xy.csv に各フレームの path_full_xy 全点、*_filament_bending_dynamics.csv に1フレーム1行で bend_angle_deg、included_angle_deg、circle_radius、subsegment_end_to_end、屈曲点位置を保存します。geometry_unit はスケール取得時は nm、取得不可時は px です。\n"
             "\n"
             "トレースと前処理\n"
             "- リッジ σ: リッジ検出に使うガウシアン幅です。繊維の見かけ幅に近い値から調整します。\n"
@@ -4046,6 +4185,7 @@ class ContourLengthWindow(QtWidgets.QWidget):
         nm_per_px = self._get_nm_per_pixel()
         length_nm = (length_px * nm_per_px) if (nm_per_px and nm_per_px > 0) else None
         end_to_end_px = self._compute_current_end_to_end_px()
+        end_to_end_nm = (end_to_end_px * nm_per_px) if (end_to_end_px is not None and nm_per_px and nm_per_px > 0) else None
         analysis_mode = getattr(self.full_viz_window, "_analysis_mode", self._get_analysis_mode())
         point_count_raw = getattr(self.full_viz_window, "_anchor_point_count", None)
         point_count = int(point_count_raw) if point_count_raw is not None else len(getattr(self.full_viz_window, "_endpoints", []) or [])
@@ -4069,6 +4209,7 @@ class ContourLengthWindow(QtWidgets.QWidget):
             "length_px": length_px,
             "length_nm": length_nm,
             "end_to_end_px": end_to_end_px,
+            "end_to_end_nm": end_to_end_nm,
             "analysis_mode": analysis_mode,
             "point_count": point_count,
             "persistence_length_px": persistence_px,
@@ -4176,6 +4317,20 @@ class ContourLengthWindow(QtWidgets.QWidget):
             stem = self._get_current_image_id()
         stem = self._safe_output_folder_name(stem)
         return os.path.join(self._current_afm_data_dir(), f"{stem}_filament_measurements.csv")
+
+    def _default_recorded_export_prefix(self) -> str:
+        file_id = self._get_current_file_id()
+        if file_id:
+            stem = os.path.splitext(os.path.basename(str(file_id)))[0]
+        elif self._recorded_contours_list:
+            first_file_id = self._recorded_contours_list[0].get("file_id")
+            if first_file_id:
+                stem = os.path.splitext(os.path.basename(str(first_file_id)))[0]
+            else:
+                stem = self._get_current_image_id()
+        else:
+            stem = self._get_current_image_id()
+        return self._safe_output_folder_name(stem)
 
     def _save_session(self) -> None:
         """Save session (recorded contours, ROI, file info) to JSON. Default path from first measured file; overwrite prompt if exists."""
@@ -4554,6 +4709,217 @@ class ContourLengthWindow(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, self._tr("CSV Save"), f"{self._tr('CSV保存に失敗しました')}:\n{exc}")
             return
         QtWidgets.QMessageBox.information(self, self._tr("CSV Save"), f"{self._tr('CSVを保存しました')}:\n{path}")
+
+    def _record_export_rows(self) -> List[Tuple[int, Dict[str, Any]]]:
+        rows: List[Tuple[int, Dict[str, Any]]] = []
+        for idx, rec in enumerate(self._recorded_contours_list):
+            path = rec.get("path_full_xy") or []
+            if len(path) >= 2:
+                rows.append((idx, rec))
+
+        def sort_key(item: Tuple[int, Dict[str, Any]]) -> Tuple[str, int, int]:
+            idx, rec = item
+            file_token = self._record_file_token(rec.get("file_id")) or ""
+            try:
+                frame_index = int(rec.get("frame_index", 0))
+            except Exception:
+                frame_index = 0
+            return str(file_token), frame_index, idx
+
+        return sorted(rows, key=sort_key)
+
+    def _record_export_file_label(self, rec: Dict[str, Any]) -> str:
+        file_id = rec.get("file_id")
+        if file_id:
+            return self._display_file_name(file_id)
+        return self._get_current_image_id()
+
+    def _record_export_time_s(self, rec: Dict[str, Any]) -> Optional[float]:
+        try:
+            frame_index = int(rec.get("frame_index", 0))
+        except Exception:
+            return None
+        fps_val = None
+        if hasattr(self, "fps_spin"):
+            try:
+                fps_val = float(self.fps_spin.value())
+            except Exception:
+                fps_val = None
+        if fps_val is None or not np.isfinite(fps_val) or fps_val <= 0:
+            return None
+        return float(frame_index) / fps_val
+
+    def _record_export_scale_xy(self) -> Optional[Tuple[float, float]]:
+        scale_xy = self._get_nm_per_pixel_xy()
+        if scale_xy is not None:
+            try:
+                nm_x, nm_y = float(scale_xy[0]), float(scale_xy[1])
+                if np.isfinite(nm_x) and np.isfinite(nm_y) and nm_x > 0 and nm_y > 0:
+                    return nm_x, nm_y
+            except Exception:
+                pass
+        scale = self._get_nm_per_pixel()
+        if scale is not None:
+            try:
+                nm = float(scale)
+                if np.isfinite(nm) and nm > 0:
+                    return nm, nm
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def _path_s_axis(path_xy: np.ndarray) -> np.ndarray:
+        pts = np.asarray(path_xy, dtype=np.float64)
+        if pts.ndim != 2 or pts.shape[0] == 0:
+            return np.empty(0, dtype=np.float64)
+        if pts.shape[0] == 1:
+            return np.zeros(1, dtype=np.float64)
+        diffs = np.diff(pts, axis=0)
+        seg = np.hypot(diffs[:, 0], diffs[:, 1])
+        return np.concatenate([[0.0], np.cumsum(seg)])
+
+    def _write_backbone_xy_csv(
+        self,
+        path: str,
+        rows: List[Tuple[int, Dict[str, Any]]],
+        scale_xy: Optional[Tuple[float, float]],
+    ) -> None:
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "record_id", "source_path", "file_name", "frame_index", "frame",
+                "time_s", "fiber_group_id", "analysis_mode", "point_index",
+                "s_px", "s_nm", "x_px", "y_px", "x_nm", "y_nm",
+            ])
+            for idx, rec in rows:
+                pts = np.asarray(rec.get("path_full_xy") or [], dtype=np.float64)
+                if pts.ndim != 2 or pts.shape[1] != 2 or pts.shape[0] < 2:
+                    continue
+                s_px = self._path_s_axis(pts)
+                if scale_xy is not None:
+                    nm_x, nm_y = scale_xy
+                    pts_nm = np.column_stack([pts[:, 0] * nm_x, pts[:, 1] * nm_y])
+                    s_nm = self._path_s_axis(pts_nm)
+                else:
+                    pts_nm = np.full_like(pts, np.nan, dtype=np.float64)
+                    s_nm = np.full(pts.shape[0], np.nan, dtype=np.float64)
+                frame_index = int(rec.get("frame_index", 0))
+                time_s = self._record_export_time_s(rec)
+                file_label = self._record_export_file_label(rec)
+                for point_idx in range(pts.shape[0]):
+                    writer.writerow([
+                        idx + 1,
+                        rec.get("file_id", ""),
+                        file_label,
+                        frame_index,
+                        frame_index + 1,
+                        self._csv_number(time_s),
+                        rec.get("fiber_group_id", ""),
+                        rec.get("analysis_mode", ""),
+                        point_idx,
+                        self._csv_number(s_px[point_idx]),
+                        self._csv_number(s_nm[point_idx]),
+                        self._csv_number(pts[point_idx, 0]),
+                        self._csv_number(pts[point_idx, 1]),
+                        self._csv_number(pts_nm[point_idx, 0]),
+                        self._csv_number(pts_nm[point_idx, 1]),
+                    ])
+
+    def _write_bending_dynamics_csv(
+        self,
+        path: str,
+        rows: List[Tuple[int, Dict[str, Any]]],
+        scale_xy: Optional[Tuple[float, float]],
+    ) -> None:
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "record_id", "source_path", "file_name", "frame_index", "frame",
+                "time_s", "fiber_group_id", "analysis_mode", "geometry_unit",
+                "total_length", "bend_apex_s", "bend_apex_fraction",
+                "bend_angle_deg", "included_angle_deg", "circle_radius",
+                "circle_center_x", "circle_center_y", "circle_fit_rmse",
+                "subsegment_start_s", "subsegment_end_s", "subsegment_length",
+                "subsegment_end_to_end", "bend_apex_x", "bend_apex_y",
+                "resample_points", "arm_fraction", "arm_points", "status",
+            ])
+            for idx, rec in rows:
+                pts = np.asarray(rec.get("path_full_xy") or [], dtype=np.float64)
+                if pts.ndim != 2 or pts.shape[1] != 2 or pts.shape[0] < 2:
+                    continue
+                if scale_xy is not None:
+                    nm_x, nm_y = scale_xy
+                    metric_path = [(float(x) * nm_x, float(y) * nm_y) for x, y in pts]
+                    unit = "nm"
+                else:
+                    metric_path = [(float(x), float(y)) for x, y in pts]
+                    unit = "px"
+                geom = compute_bending_geometry_from_path(metric_path)
+                frame_index = int(rec.get("frame_index", 0))
+                time_s = self._record_export_time_s(rec)
+                writer.writerow([
+                    idx + 1,
+                    rec.get("file_id", ""),
+                    self._record_export_file_label(rec),
+                    frame_index,
+                    frame_index + 1,
+                    self._csv_number(time_s),
+                    rec.get("fiber_group_id", ""),
+                    rec.get("analysis_mode", ""),
+                    unit,
+                    self._csv_number(geom.get("total_length")),
+                    self._csv_number(geom.get("bend_apex_s")),
+                    self._csv_number(geom.get("bend_apex_fraction")),
+                    self._csv_number(geom.get("bend_angle_deg")),
+                    self._csv_number(geom.get("included_angle_deg")),
+                    self._csv_number(geom.get("circle_radius")),
+                    self._csv_number(geom.get("circle_center_x")),
+                    self._csv_number(geom.get("circle_center_y")),
+                    self._csv_number(geom.get("circle_fit_rmse")),
+                    self._csv_number(geom.get("subsegment_start_s")),
+                    self._csv_number(geom.get("subsegment_end_s")),
+                    self._csv_number(geom.get("subsegment_length")),
+                    self._csv_number(geom.get("subsegment_end_to_end")),
+                    self._csv_number(geom.get("bend_apex_x")),
+                    self._csv_number(geom.get("bend_apex_y")),
+                    geom.get("resample_points", ""),
+                    self._csv_number(geom.get("arm_fraction")),
+                    geom.get("arm_points", ""),
+                    geom.get("status", ""),
+                ])
+
+    def _export_backbone_bending_csvs(self, out_dir: str) -> Tuple[str, str]:
+        rows = self._record_export_rows()
+        if not rows:
+            raise ValueError(self._tr("有効な背骨座標がありません。"))
+        os.makedirs(out_dir, exist_ok=True)
+        prefix = self._default_recorded_export_prefix()
+        backbone_path = os.path.join(out_dir, f"{prefix}_filament_backbone_xy.csv")
+        bending_path = os.path.join(out_dir, f"{prefix}_filament_bending_dynamics.csv")
+        scale_xy = self._record_export_scale_xy()
+        self._write_backbone_xy_csv(backbone_path, rows, scale_xy)
+        self._write_bending_dynamics_csv(bending_path, rows, scale_xy)
+        return backbone_path, bending_path
+
+    def _on_save_backbone_bending_csv(self) -> None:
+        if not self._recorded_contours_list:
+            QtWidgets.QMessageBox.information(self, self._tr("Backbone/Bending CSV"), self._tr("記録した測定値がありません。"))
+            return
+        default_dir = self._current_afm_data_dir()
+        out_dir = QtWidgets.QFileDialog.getExistingDirectory(self, self._tr("Backbone/Bending CSV"), default_dir)
+        if not out_dir or not out_dir.strip():
+            return
+        try:
+            backbone_path, bending_path = self._export_backbone_bending_csvs(out_dir.strip())
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, self._tr("Backbone/Bending CSV"), f"{self._tr('CSV保存に失敗しました')}:\n{exc}")
+            return
+        QtWidgets.QMessageBox.information(
+            self,
+            self._tr("Backbone/Bending CSV"),
+            f"{self._tr('背骨座標と屈曲ダイナミクスを保存しました')}:\n{backbone_path}\n{bending_path}",
+        )
 
     def _on_recorded_table_context_menu(self, pos: QtCore.QPoint) -> None:
         """Right-click on table: show delete menu and remove the row and corresponding overlay."""

@@ -37,6 +37,74 @@ logger = logging.getLogger(__name__)
 # プラグイン表示名（Pluginメニューに表示される名前）
 PLUGIN_NAME = "Spot Analysis"
 
+# The Japanese strings remain the canonical keys so existing defaults and
+# persisted UI values stay compatible.  English is applied only to displayed
+# text, and switching back always restores the original wording.
+SPOT_UI_TRANSLATIONS = {
+    "解析を実行": "Run Analysis",
+    "スポットをSpot径の重心に設定": "Move Spots to Intensity Centroids",
+    "自動適用": "Apply Automatically",
+    "全フレーム解析": "Analyze All Frames",
+    "ROI / 基本": "ROI / Basic",
+    "ROI形状": "ROI Shape",
+    "自動解析": "Automatic Analysis",
+    "フレーム切替時に自動解析": "Analyze Automatically on Frame Change",
+    "情報量基準": "Information Criterion",
+    "最小": "Min",
+    "最大": "Max",
+    "ピーク数": "Peak Count",
+    "前処理（ROI内）": "Preprocessing (within ROI)",
+    "検出（LoG / DoG / Pre）": "Detection (LoG / DoG / Pre)",
+    "方式": "Method",
+    "初期化（初期位置）": "Initialization (Initial Positions)",
+    "ROIマージン (px)": "ROI Margin (px)",
+    "ピーク間隔 (px)": "Peak Spacing (px)",
+    "初期候補": "Initial Candidates",
+    "サブピクセル精度": "Subpixel Refinement",
+    "適応的h-maxima": "Adaptive h-maxima",
+    "フィット（ガウスモデル）": "Fit (Gaussian Model)",
+    "ガウスフィットを行う": "Perform Gaussian Fit",
+    "初期σ": "Initial σ",
+    "下限": "Lower",
+    "上限": "Upper",
+    "結果フィルタ": "Result Filters",
+    "S/N閾値（出力フィルタ）": "S/N Threshold (Output Filter)",
+    "DBSCAN 外れ値除去": "DBSCAN Outlier Removal",
+    "最小振幅": "Minimum Amplitude",
+    "最小σ (結果)": "Minimum σ (Result)",
+    "表示 / 記録": "Display / Recording",
+    "Spot半径 (px)": "Spot Radius (px)",
+    "ROI画像にスポット表示": "Show Spots on ROI Image",
+    "検出画像にスポット表示": "Show Spots on Detection Image",
+    "ROI(pre)にフィット後ピーク表示（デバッグ）": "Show Fitted Peaks on ROI (Debug)",
+    "最終ピークを局所最大へスナップ": "Snap Final Peaks to Local Maxima",
+    "スナップ半径 (px)": "Snap Radius (px)",
+    "スナップ後に再フィット(1回)": "Refit Once after Snapping",
+    "高さ保存値": "Saved Height Value",
+    "Spot位置": "Spot Position",
+    "Spot径内平均": "Mean within Spot Radius",
+    "CSVエクスポート": "Export CSV",
+    "CSV読み込み→復元": "Import CSV and Restore",
+    "解析結果をリセット": "Reset Analysis Results",
+    "Spot編集: Ctrl/⌘+ドラッグ=移動, Shift+クリック=追加, Alt(Option)+クリック=削除":
+        "Edit spots: Ctrl/⌘+drag=move, Shift+click=add, Alt/Option+click=delete",
+    "ROI未選択": "ROI Not Selected",
+    "ROI選択済み": "ROI Selected",
+    "ファイル選択情報を取得できません。": "File selection information is unavailable.",
+    "選択なし": "No Selection",
+    "Watershed (推奨)": "Watershed (recommended)",
+    "Blob DoH (高速)": "Blob DoH (fast)",
+}
+_SPOT_UI_TRANSLATIONS_REVERSE = {value: key for key, value in SPOT_UI_TRANSLATIONS.items()}
+
+
+def localize_spot_text(text: str, language: str) -> str:
+    """Return reversible Japanese/English display text for the Spot UI."""
+    canonical = _SPOT_UI_TRANSLATIONS_REVERSE.get(str(text), str(text))
+    if str(language).lower() == "en":
+        return SPOT_UI_TRANSLATIONS.get(canonical, canonical)
+    return canonical
+
 
 HELP_CSS = """
 <style>
@@ -3631,6 +3699,9 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
     def __init__(self, main_window, parent=None) -> None:
         super().__init__(parent)
         self.main_window = main_window
+        # Preserve the former SpotAnalysis.py appearance by default.  Users can
+        # switch the same window to English without loading a second plugin.
+        self.ui_language = "ja"
         self.setWindowTitle("Spot Analysis (AIC/BIC)")
         self.setMinimumWidth(420)
         self.spot_analyzer = SpotAnalysis()
@@ -3653,6 +3724,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self._reanalysis_timer.setSingleShot(True)
         self._reanalysis_timer.timeout.connect(self._reanalyze_current_frame_debounced)
         self._build_ui()
+        self._apply_ui_language()
         self._refresh_selection_label()
         self._connect_frame_signal()
         self.show_full_image_view()
@@ -3663,6 +3735,71 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         if self.viz_window:
             self.viz_window.close()
         super().closeEvent(event)
+
+    def _tr(self, text: str) -> str:
+        return localize_spot_text(text, self.ui_language)
+
+    @staticmethod
+    def _canonical_ui_text(text: str) -> str:
+        return localize_spot_text(text, "ja")
+
+    @classmethod
+    def _set_combo_canonical_text(cls, combo: QtWidgets.QComboBox, canonical_text: str) -> None:
+        canonical_text = cls._canonical_ui_text(canonical_text)
+        for index in range(combo.count()):
+            if cls._canonical_ui_text(combo.itemText(index)) == canonical_text:
+                combo.setCurrentIndex(index)
+                return
+
+    def _on_language_changed(self, _index: int = -1) -> None:
+        language = self.language_combo.currentData()
+        self.ui_language = "en" if language == "en" else "ja"
+        self._apply_ui_language()
+        self._refresh_selection_label()
+        self._update_frame_label()
+        if self.last_result is not None:
+            self._display_result(self.last_result)
+
+    def _apply_ui_language(self) -> None:
+        language = self.ui_language
+        for widget_type in (
+            QtWidgets.QLabel,
+            QtWidgets.QPushButton,
+            QtWidgets.QCheckBox,
+        ):
+            for widget in self.findChildren(widget_type):
+                widget.setText(localize_spot_text(widget.text(), language))
+        for group_box in self.findChildren(QtWidgets.QGroupBox):
+            group_box.setTitle(localize_spot_text(group_box.title(), language))
+
+        # Translate the few combo-box labels that contain Japanese while
+        # preserving their current index and canonical internal meaning.
+        for combo in (
+            getattr(self, "init_mode_combo", None),
+            getattr(self, "height_export_mode_combo", None),
+        ):
+            if combo is None:
+                continue
+            blocker = QtCore.QSignalBlocker(combo)
+            current_index = combo.currentIndex()
+            for index in range(combo.count()):
+                combo.setItemText(index, localize_spot_text(combo.itemText(index), language))
+            combo.setCurrentIndex(current_index)
+            del blocker
+
+        self.setWindowTitle(
+            "Spot Analysis (AIC/BIC)" if language == "en" else "Spot Analysis (AIC/BIC)"
+        )
+        if self.viz_window is not None and self._is_window_live(self.viz_window):
+            self.viz_window.setWindowTitle(
+                "Spot Analysis Visualization" if language == "en" else "Spot Analysis 可視化"
+            )
+        if self.full_viz_window is not None and self._is_window_live(self.full_viz_window):
+            self.full_viz_window.setWindowTitle(
+                "Spot Analysis: Full Overlay Image"
+                if language == "en"
+                else "Spot Analysis: 全画像オーバーレイ"
+            )
 
     @staticmethod
     def _help_html(body: str) -> str:
@@ -3735,7 +3872,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
         btn_ja.clicked.connect(lambda: set_lang(True))
         btn_en.clicked.connect(lambda: set_lang(False))
-        set_lang(False)
+        set_lang(self.ui_language == "ja")
 
         dialog.exec_()
 
@@ -3805,6 +3942,12 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.next_frame_btn = QtWidgets.QPushButton("▶")
         self.next_frame_btn.clicked.connect(self._next_frame)
         self.frame_label = QtWidgets.QLabel("Frame: - / -")
+        self.language_combo = QtWidgets.QComboBox()
+        self.language_combo.addItem("日本語", "ja")
+        self.language_combo.addItem("English", "en")
+        self.language_combo.setCurrentIndex(0 if self.ui_language == "ja" else 1)
+        self.language_combo.setToolTip("表示言語 / Display language")
+        self.language_combo.currentIndexChanged.connect(self._on_language_changed)
 
         # --- 1st row: Run button + Frame navigation ---
         top_row.addWidget(self.run_btn)
@@ -3812,6 +3955,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         top_row.addWidget(self.next_frame_btn)
         top_row.addWidget(self.frame_label)
         top_row.addWidget(self.help_btn)
+        top_row.addWidget(QtWidgets.QLabel("Language / 言語:"))
+        top_row.addWidget(self.language_combo)
         top_row.addStretch(1)
         outer_layout.addLayout(top_row)
 
@@ -4597,7 +4742,9 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         # NOTE: redraw/reanalysis is handled by the parameter-change handler
 
     def _update_init_mode_ui_enabled(self, *_args) -> None:
-        mode = (self.init_mode_combo.currentText() or "Watershed (推奨)").strip().lower()
+        mode = self._canonical_ui_text(
+            self.init_mode_combo.currentText() or "Watershed (推奨)"
+        ).strip().lower()
         is_doh = "doh" in mode
         is_ws = "watershed" in mode or "water" in mode
         is_peak = "peak" in mode
@@ -4768,7 +4915,9 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             min_peaks,
             max_peaks,
             det_sig,
-            (self.init_mode_combo.currentText() or "blob_log").strip().lower(),
+            self._canonical_ui_text(
+                self.init_mode_combo.currentText() or "blob_log"
+            ).strip().lower(),
             bool(getattr(self, "subpixel_check", None) is not None and self.subpixel_check.isChecked()),
             _rf(self.watershed_h_rel_spin.value()),
             bool(self.watershed_adaptive_h_check.isChecked()),
@@ -4879,7 +5028,9 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             self.spot_analyzer.log_sigma = log_sigma
 
         # fit params
-        init_ui = (self.init_mode_combo.currentText() or "Watershed (推奨)").strip().lower()
+        init_ui = self._canonical_ui_text(
+            self.init_mode_combo.currentText() or "Watershed (推奨)"
+        ).strip().lower()
         if "watershed" in init_ui or "water" in init_ui:
             self.spot_analyzer.init_mode = "watershed"
         elif "doh" in init_ui or "blob doh" in init_ui:
@@ -4938,18 +5089,20 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
     def _refresh_selection_label(self) -> None:
         if not self.main_window or not hasattr(self.main_window, "FileList"):
-            self.selection_label.setText("ファイル選択情報を取得できません。")
+            self.selection_label.setText(self._tr("ファイル選択情報を取得できません。"))
             return
         selected = self.main_window.FileList.selectedItems()
         if selected:
             names = [item.text() for item in selected]
-            self.selection_label.setText(f"選択中: {', '.join(names)}")
+            prefix = "Selected" if self.ui_language == "en" else "選択中"
+            self.selection_label.setText(f"{prefix}: {', '.join(names)}")
         else:
             current = self.main_window.FileList.currentItem()
             if current:
-                self.selection_label.setText(f"現在: {current.text()}")
+                prefix = "Current" if self.ui_language == "en" else "現在"
+                self.selection_label.setText(f"{prefix}: {current.text()}")
             else:
-                self.selection_label.setText("選択なし")
+                self.selection_label.setText(self._tr("選択なし"))
 
     def _ensure_selection_loaded(self) -> bool:
         if not self.main_window or not hasattr(self.main_window, "FileList"):
@@ -5038,9 +5191,9 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         else:
             self.manual_roi = self.roi_by_frame.get(frame_index)
         if self.manual_roi is None:
-            self.roi_status_label.setText("ROI未選択")
+            self.roi_status_label.setText(self._tr("ROI未選択"))
         else:
-            self.roi_status_label.setText("ROI選択済み")
+            self.roi_status_label.setText(self._tr("ROI選択済み"))
         self._sync_run_buttons_enabled()
         frame = self._prepare_frame()
         if frame is None:
@@ -5331,7 +5484,10 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         fit_suffix = ""
         if best_model is not None and not bool(getattr(best_model, "fit_applied", True)):
             fit_suffix = ", No Fit"
-        html_lines.append(esc(f"判定モデル: {result.best_n_peaks} peaks ({result.criterion.upper()}{fit_suffix})"))
+        model_heading = "Selected model" if self.ui_language == "en" else "判定モデル"
+        html_lines.append(
+            esc(f"{model_heading}: {result.best_n_peaks} peaks ({result.criterion.upper()}{fit_suffix})")
+        )
         for n_peaks in sorted(result.models.keys()):
             model = result.models[n_peaks]
             mode_label = "Fit" if bool(getattr(model, "fit_applied", True)) else "NoFit"
@@ -5388,7 +5544,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             if excluded_rows:
                 excluded_rows.sort(key=lambda t: (t[0], str(t[1].get("reasons", ""))))
                 html_lines.append("")
-                html_lines.append(esc("--- 除外されたピーク ---"))
+                excluded_heading = "Excluded peaks" if self.ui_language == "en" else "除外されたピーク"
+                html_lines.append(esc(f"--- {excluded_heading} ---"))
                 for idx0, ent in excluded_rows:
                     pk = ent.get("peak")
                     try:
@@ -5396,12 +5553,18 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                     except Exception:
                         reasons = []
                     if not reasons:
-                        reasons = ["理由取得失敗"]
+                        reasons = [
+                            "Reason unavailable"
+                            if self.ui_language == "en"
+                            else "理由取得失敗"
+                        ]
                     reason_str = ", ".join(reasons)
                     peak_label = f"P{idx0 + 1}" if np.isfinite(idx0) else "P?"
+                    excluded_label = "Excluded" if self.ui_language == "en" else "除外"
+                    reason_label = "Reason" if self.ui_language == "en" else "理由"
                     prefix = (
-                        f"  [除外] {peak_label}: amp={pk.amplitude:.3g}, sigma={pk.sigma:.3g}, "
-                        f"(x,y)=({pk.x:.2f},{pk.y:.2f}), S/N={pk.snr:.2f}  ★理由: "
+                        f"  [{excluded_label}] {peak_label}: amp={pk.amplitude:.3g}, sigma={pk.sigma:.3g}, "
+                        f"(x,y)=({pk.x:.2f},{pk.y:.2f}), S/N={pk.snr:.2f}  ★{reason_label}: "
                     )
                     html_lines.append(
                         esc(prefix)
@@ -5411,7 +5574,12 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                     )
 
         html_lines.append("")
-        html_lines.append(esc(f"S/N閾値（出力フィルタ）: {result.snr_threshold:.2f}"))
+        snr_label = (
+            "S/N Threshold (Output Filter)"
+            if self.ui_language == "en"
+            else "S/N閾値（出力フィルタ）"
+        )
+        html_lines.append(esc(f"{snr_label}: {result.snr_threshold:.2f}"))
 
         # Rich text (HTML) で表示（理由部分のみ赤字）
         body = "\n".join(html_lines)
@@ -5450,6 +5618,11 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             result = None
         win = self._ensure_live_window(self.full_viz_window, SpotFullImageWindow)
         self.full_viz_window = win
+        win.setWindowTitle(
+            "Spot Analysis: Full Overlay Image"
+            if self.ui_language == "en"
+            else "Spot Analysis: 全画像オーバーレイ"
+        )
         self.full_viz_window.enable_roi_selector(self.roi_shape_combo.currentText(), self._on_full_image_selected)
         self.full_viz_window.set_edit_handler(self._handle_edit_event)
         # Always pass both fit-spots and init-spots; rendering decides where to show them.
@@ -5521,7 +5694,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         except Exception:
             pass
         try:
-            self.roi_status_label.setText("ROI未選択")
+            self.roi_status_label.setText(self._tr("ROI未選択"))
         except Exception:
             pass
         for btn in (getattr(self, "run_btn", None), getattr(self, "run_all_btn", None), getattr(self, "export_btn", None)):
@@ -5544,7 +5717,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         frame_index = self._get_current_frame_index()
         self.roi_by_frame[frame_index] = roi_info
         self.manual_roi = roi_info
-        self.roi_status_label.setText("ROI選択済み")
+        self.roi_status_label.setText(self._tr("ROI選択済み"))
         self._sync_run_buttons_enabled()
         # 自動で再解析（ROI中心・サイズを利用）
         self.run_analysis()
@@ -5862,7 +6035,9 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
     def _selected_height_export_mode(self) -> str:
         try:
-            text = str(self.height_export_mode_combo.currentText() or "").strip()
+            text = self._canonical_ui_text(
+                str(self.height_export_mode_combo.currentText() or "")
+            ).strip()
         except Exception:
             text = ""
         if text == "Spot位置":
@@ -6373,7 +6548,11 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             "median_size": _try_get(lambda: int(self.median_size_spin.value()), 3),
             "open_enabled": _try_get(lambda: bool(self.open_check.isChecked()), False),
             "open_radius": _try_get(lambda: int(self.open_radius_spin.value()), 1),
-            "init_mode": _try_get(lambda: (self.init_mode_combo.currentText() or "Watershed (推奨)")),
+            "init_mode": _try_get(
+                lambda: self._canonical_ui_text(
+                    self.init_mode_combo.currentText() or "Watershed (推奨)"
+                )
+            ),
             "subpixel_refine": _try_get(lambda: bool(self.subpixel_check.isChecked()), False),
             "watershed_h_rel": _try_get(lambda: float(self.watershed_h_rel_spin.value()), 0.05),
             "watershed_adaptive_h": _try_get(lambda: bool(self.watershed_adaptive_h_check.isChecked()), True),
@@ -6489,17 +6668,17 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                 # Map old mode names to new UI labels
                 old_mode = str(params["init_mode"]).lower()
                 if "watershed" in old_mode or "water" in old_mode:
-                    self.init_mode_combo.setCurrentText("Watershed (推奨)")
+                    self._set_combo_canonical_text(self.init_mode_combo, "Watershed (推奨)")
                 elif "doh" in old_mode:
-                    self.init_mode_combo.setCurrentText("Blob DoH (高速)")
+                    self._set_combo_canonical_text(self.init_mode_combo, "Blob DoH (高速)")
                 elif "blob" in old_mode:
                     # Old blob_log maps to blob_doh
-                    self.init_mode_combo.setCurrentText("Blob DoH (高速)")
+                    self._set_combo_canonical_text(self.init_mode_combo, "Blob DoH (高速)")
                 elif "peak" in old_mode or "multiscale" in old_mode:
-                    self.init_mode_combo.setCurrentText("Peak")
+                    self._set_combo_canonical_text(self.init_mode_combo, "Peak")
                 else:
                     # Try to set directly if it matches new format
-                    self.init_mode_combo.setCurrentText(str(params["init_mode"]))
+                    self._set_combo_canonical_text(self.init_mode_combo, str(params["init_mode"]))
             if "subpixel_refine" in params:
                 self.subpixel_check.setChecked(bool(params["subpixel_refine"]))
             if "watershed_h_rel" in params:
@@ -6557,9 +6736,9 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             if "height_export_mode" in params:
                 mode = str(params["height_export_mode"]).strip().lower()
                 if mode == "point":
-                    self.height_export_mode_combo.setCurrentText("Spot位置")
+                    self._set_combo_canonical_text(self.height_export_mode_combo, "Spot位置")
                 else:
-                    self.height_export_mode_combo.setCurrentText("Spot径内平均")
+                    self._set_combo_canonical_text(self.height_export_mode_combo, "Spot径内平均")
         finally:
             blockers.clear()
 
@@ -6665,7 +6844,9 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         if frame is not None:
             self.last_frame = frame
         try:
-            self.roi_status_label.setText("ROI選択済み" if self.manual_roi is not None else "ROI未選択")
+            self.roi_status_label.setText(
+                self._tr("ROI選択済み" if self.manual_roi is not None else "ROI未選択")
+            )
         except Exception:
             pass
         self._sync_run_buttons_enabled()
