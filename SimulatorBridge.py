@@ -27,51 +27,61 @@ except ModuleNotFoundError:
 _PLUGIN_DIR = Path(__file__).resolve().parent
 _EMBEDDED_SIMULATOR_BRIDGE_B64 = (
 (
-    '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'
+    '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'
+    'SxitPvkfocMwmw=='
 )
 )
 
@@ -126,6 +136,7 @@ class SimulatorBridgeWindow(QtWidgets.QWidget):
         self.main_window = main_window
         self._bridge_seq = 0
         self._frame_signal_connected = False
+        self._processed_signal_connected = False
         self._pending_frame_index: Optional[int] = None
         self._refresh_timer: Optional[QtCore.QTimer] = None
         self._last_file_path: Optional[str] = None
@@ -148,10 +159,11 @@ class SimulatorBridgeWindow(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
 
         intro = QtWidgets.QLabel(
-            "pyNuD で表示中の処理済み AFM フレームを、"
-            "standalone pyNuD Simulator へ送ります。\n"
-            "Simulator 側で「Live sync from pyNuD」を ON にしてください。\n"
-            "Publish または Launch をクリックするとウィンドウを閉じます。"
+            "While this window is open, the processed AFM frame shown in pyNuD "
+            "is published to the standalone pyNuD Simulator.\n"
+            'Enable "Live sync from pyNuD" in the Simulator to receive it.\n'
+            "Frame and image changes are sent automatically. "
+            "Close this window to stop publishing."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -160,22 +172,17 @@ class SimulatorBridgeWindow(QtWidgets.QWidget):
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
-        button_row = QtWidgets.QHBoxLayout()
-        self.refresh_button = QtWidgets.QPushButton("Publish current frame")
-        self.refresh_button.clicked.connect(self._on_publish_and_close)
-        button_row.addWidget(self.refresh_button)
-
         self.launch_button = QtWidgets.QPushButton("Launch pyNuD Simulator")
+        self.launch_button.setToolTip(
+            "Start the standalone pyNuD Simulator if it is installed."
+        )
         self.launch_button.clicked.connect(self._on_launch_standalone)
-        button_row.addWidget(self.launch_button)
-        layout.addLayout(button_row)
+        layout.addWidget(self.launch_button)
 
         close_button = QtWidgets.QPushButton("Close")
+        close_button.setToolTip("Stop publishing frames to the Simulator.")
         close_button.clicked.connect(self.close)
         layout.addWidget(close_button)
-
-    def _close_after_action(self) -> None:
-        self.close()
 
     def _has_real_source(self) -> bool:
         return bool(
@@ -264,27 +271,50 @@ class SimulatorBridgeWindow(QtWidgets.QWidget):
         self.status_label.setText(text)
 
     def _connect_main_window_signals(self) -> None:
-        if self._frame_signal_connected:
+        if self.main_window is None:
             return
-        if self.main_window is None or not hasattr(self.main_window, "frameChanged"):
-            return
-        try:
-            self.main_window.frameChanged.connect(self._on_main_window_frame_changed)
-            self._frame_signal_connected = True
-        except Exception:
-            self._frame_signal_connected = False
+        if not self._frame_signal_connected and hasattr(self.main_window, "frameChanged"):
+            try:
+                self.main_window.frameChanged.connect(self._on_main_window_frame_changed)
+                self._frame_signal_connected = True
+            except Exception:
+                self._frame_signal_connected = False
+        if (
+            not self._processed_signal_connected
+            and hasattr(self.main_window, "processedImageChanged")
+        ):
+            try:
+                self.main_window.processedImageChanged.connect(
+                    self._on_main_window_frame_changed
+                )
+                self._processed_signal_connected = True
+            except Exception:
+                self._processed_signal_connected = False
 
     def _disconnect_main_window_signals(self) -> None:
-        if not self._frame_signal_connected:
-            return
-        if self.main_window is None or not hasattr(self.main_window, "frameChanged"):
+        if self.main_window is None:
             self._frame_signal_connected = False
+            self._processed_signal_connected = False
             return
-        try:
-            self.main_window.frameChanged.disconnect(self._on_main_window_frame_changed)
-        except Exception:
-            pass
+        if self._frame_signal_connected and hasattr(self.main_window, "frameChanged"):
+            try:
+                self.main_window.frameChanged.disconnect(
+                    self._on_main_window_frame_changed
+                )
+            except Exception:
+                pass
         self._frame_signal_connected = False
+        if (
+            self._processed_signal_connected
+            and hasattr(self.main_window, "processedImageChanged")
+        ):
+            try:
+                self.main_window.processedImageChanged.disconnect(
+                    self._on_main_window_frame_changed
+                )
+            except Exception:
+                pass
+        self._processed_signal_connected = False
 
     def _on_main_window_frame_changed(self, frame_index) -> None:
         if not self._has_real_source():
@@ -304,13 +334,12 @@ class SimulatorBridgeWindow(QtWidgets.QWidget):
             return
         self.refresh_current_frame(frame_index=self._pending_frame_index)
 
-    def _on_publish_and_close(self) -> None:
-        if self.refresh_current_frame():
-            self._close_after_action()
-
     def _on_launch_standalone(self) -> None:
+        self.refresh_current_frame()
         if launch_standalone():
-            self._close_after_action()
+            self._set_status(
+                "Status: launched pyNuD Simulator. Keep this window open for Live sync."
+            )
             return
         QtWidgets.QMessageBox.warning(
             self,
