@@ -4,6 +4,8 @@ pyNuD plugins distributed as standalone `.py` files.
 
 Use pyNuD `Plugin` -> `Load Plugin...` and select the downloaded `.py` file.
 
+Full plugin reference (English / Japanese): **[D-Lab software page](https://dlab-website-2026.vercel.app/software?section=plugins)** · [pyNuD user manual](https://dlab-website-2026.vercel.app/software?section=operation)
+
 ## Latest Download Links
 
 These URLs always point to the latest GitHub Release assets.
