@@ -1,0 +1,1 @@
+"""NormalModeAnalysis plugin bundle."""

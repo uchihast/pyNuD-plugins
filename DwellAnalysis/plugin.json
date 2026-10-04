@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "DwellAnalysis",
+  "name": "Dwell Analysis",
+  "entrypoint": "DwellAnalysis.py",
+  "version": "2026.10.4",
+  "updated": "2026-10-04",
+  "host_api": 1,
+  "files": [
+    "DwellAnalysis.py",
+    "__init__.py",
+    "dwell_ai.py",
+    "dwell_ai_ui.py",
+    "dwell_detection.py",
+    "dwell_fast.py",
+    "dwell_marks.py"
+  ]
+}

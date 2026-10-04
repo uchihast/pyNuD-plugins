@@ -1,0 +1,1 @@
+"""LAFMAnalysis plugin bundle."""

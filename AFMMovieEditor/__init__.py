@@ -1,0 +1,1 @@
+"""AFMMovieEditor plugin bundle."""

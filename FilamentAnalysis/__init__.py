@@ -1,0 +1,1 @@
+"""FilamentAnalysis plugin bundle."""

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "ParticleAnalysis",
+  "name": "Particle Analysis",
+  "entrypoint": "ParticleAnalysis.py",
+  "version": "2026.10.4",
+  "updated": "2026-10-04",
+  "host_api": 1,
+  "files": [
+    "ParticleAnalysis.py",
+    "__init__.py",
+    "particle_analysis_ai.py",
+    "particle_analysis_ai_ui.py"
+  ]
+}

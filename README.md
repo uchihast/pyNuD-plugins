@@ -1,61 +1,38 @@
 # pyNuD Plugins
 
-pyNuD plugins distributed as standalone `.py` files.
+Download **one ZIP per plugin** and import it in **pyNuD 2.13.0 or later** using **Plugin → Import Plugin ZIP...**. No manual extraction is needed. Each ZIP contains the complete plugin folder, including its dedicated AI modules and resources.
 
-Use pyNuD `Plugin` -> `Load Plugin...` and select the downloaded `.py` file.
+必要なプラグインのZIPを個別にダウンロードし、**pyNuD 2.13.0以降 → Plugin → Import Plugin ZIP...** で読み込んでください。解凍は不要です。旧 `.py` 単体ファイルでは必要な専用モジュールが不足します。
 
-Full plugin reference (English / Japanese): **[D-Lab software page](https://dlab-website-2026.vercel.app/software?section=plugins)** · [pyNuD user manual](https://dlab-website-2026.vercel.app/software?section=operation)
+- For an extracted bundle, use **Load Plugin Folder...** and select the folder containing `plugin.json`.
+- Close the plugin and its AI review windows before importing an updated ZIP. Restart pyNuD after updating the host application.
+- **Each plugin has its own version**, shown below and in its window title. The `bundles-2026.10.04` release identifies this collection; it is not a shared plugin version or the application version.
+- Do not import GitHub's repository-wide **Source code (zip)** as a plugin.
+- Older `.py` downloads remain in [historical releases](https://github.com/uchihast/pyNuD-plugins/releases). Root-level `.py` files are frozen legacy copies retained for existing external links; they do not contain the new bundle updates. Use the ZIP downloads below.
 
-## Latest Download Links
+## Downloads / ダウンロード
 
-These URLs always point to the latest GitHub Release assets.
+| Plugin | Version | Updated | Download |
+|---|---|---|---|
+| AFM Movie Editor | 2026.10.1 | 2026-10-01 | [AFMMovieEditor.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/AFMMovieEditor.zip) |
+| Dwell Analysis | 2026.10.4 | 2026-10-04 | [DwellAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/DwellAnalysis.zip) |
+| Filament Analysis | 2026.10.1 | 2026-10-01 | [FilamentAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/FilamentAnalysis.zip) |
+| Kymograph | 2026.10.1 | 2026-10-01 | [Kymograph.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/Kymograph.zip) |
+| L-AFM Analysis | 2026.10.1 | 2026-10-01 | [LAFMAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/LAFMAnalysis.zip) |
+| Normal Mode Analysis | 2026.10.1 | 2026-10-01 | [NormalModeAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/NormalModeAnalysis.zip) |
+| Particle Analysis | 2026.10.4 | 2026-10-04 | [ParticleAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/ParticleAnalysis.zip) |
+| Particle Tracking | 2026.10.4 | 2026-10-04 | [ParticleTracking.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/ParticleTracking.zip) |
+| Simulator Bridge | 2026.10.1 | 2026-10-01 | [SimulatorBridge.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/SimulatorBridge.zip) |
+| Spot Analysis | 2026.10.1 | 2026-10-01 | [SpotAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/SpotAnalysis.zip) |
+| Particle Cluster Analysis | 2026.10.4 | 2026-10-04 | [particle_cluster_analysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/particle_cluster_analysis.zip) |
 
-### Structure / Simulation
+[Plugin index](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/plugin_index.json) · [SHA-256 checksums](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/SHA256SUMS.txt) · [Bundle guide](PLUGIN_BUNDLES.md) · [Release notes](RELEASE_NOTES.md)
 
-- [AFMSimulator.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/AFMSimulator.py)  
-  Simulates AFM images from PDB/mmCIF/MRC data, aligns models to real AFM images, and includes Flexible Fit (Rigid Domains / Linear ANM / NMFF-AFM / NOLB / Official AFMfit). Single-file plugin (support modules embedded).
-- [NormalModeAnalysis.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/NormalModeAnalysis.py)  
-  Loads PDB files and visualizes molecular flexibility and collective motions using ProDy normal modes.
+The download links always target the latest collection. Every collection includes unchanged public plugins as well, so all listed links remain available. Future fixes advance only the affected plugin versions.
 
-### Contour / Molecular Analysis
+## Application and help
 
-- [FilamentAnalysis.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/FilamentAnalysis.py)  
-  Extracts filament centerlines and measures contour length using spline interpolation and arc-length integration.
-
-### Time Axis / Kymograph
-
-- [DwellAnalysis.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/DwellAnalysis.py)  
-  Links frame-by-frame marks, computes dwell times, and exports histogram/CSV results.
-- [Kymograph.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/Kymograph.py)  
-  Creates time-distance kymographs by stacking intensity profiles along line or polyline ROIs.
-
-### Movie Editing
-
-- [AFMMovieEditor.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/AFMMovieEditor.py)  
-  Builds presentation-ready AFM movies from loaded frame stacks, with clips, titles, text/shape overlays, preview playback, sessions, and MP4/AVI export.
-
-### L-AFM Analysis
-
-- [LAFMAnalysis.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/LAFMAnalysis.py)  
-  Localizes intensity peaks in time-series AFM data and reconstructs super-resolution images using an L-AFM-style workflow based on the algorithm reported by Heath, Scheuring, and colleagues (Nature 594, 385-390, 2021; DOI: 10.1038/s41586-021-03551-x).
-
-### Particle / Peak Analysis
-
-- [particle_cluster_analysis.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/particle_cluster_analysis.py)  
-  Detects particles and analyzes g(r), order parameters, clustering, ellipse fitting, and result save/load.
-- [ParticleAnalysis.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/ParticleAnalysis.py)  
-  Detects particles in AFM images and analyzes size, height, distributions, and summary statistics.
-- [ParticleTracking.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/ParticleTracking.py)  
-  Detects and tracks particles in time-series AFM data, including trajectories, velocity, and MSD analysis.
-- [SpotAnalysis.py](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/SpotAnalysis.py)  
-  Selects 2/3-peak 2D Gaussian mixture fits using AIC/BIC and evaluates spot counts and S/N.
-
-## Raw Main Links
-
-For development snapshots, use:
-
-```text
-https://raw.githubusercontent.com/uchihast/pyNuD-plugins/main/<PluginName>.py
-```
-
-Release links are recommended for websites because they stay stable across source branch changes.
+- [pyNuD application installers](https://github.com/uchihast/pyNuD-installer/releases/latest)
+- [D-Lab software page](https://dlab-website-2026.vercel.app/software?section=plugins) (older pages may still describe single-file installation; use the ZIP instructions above).
+- The old AFM Simulator plugin has been retired. Use the standalone pyNuD Simulator with **SimulatorBridge.zip** for Live sync.
+- Normal Mode Analysis additionally needs ProDy to calculate modes; plugin import alone does not install optional dependencies.

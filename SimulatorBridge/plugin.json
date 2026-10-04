@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "SimulatorBridge",
+  "name": "Simulator Bridge",
+  "entrypoint": "SimulatorBridge.py",
+  "version": "2026.10.1",
+  "updated": "2026-10-01",
+  "host_api": 1,
+  "files": [
+    "SimulatorBridge.py",
+    "__init__.py",
+    "pyNuD_sim.png"
+  ]
+}

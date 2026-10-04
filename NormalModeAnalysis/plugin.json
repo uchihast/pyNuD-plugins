@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "id": "NormalModeAnalysis",
+  "name": "Normal Mode Analysis",
+  "entrypoint": "NormalModeAnalysis.py",
+  "version": "2026.10.1",
+  "updated": "2026-10-01",
+  "host_api": 1,
+  "files": [
+    "NormalModeAnalysis.py",
+    "__init__.py"
+  ]
+}
