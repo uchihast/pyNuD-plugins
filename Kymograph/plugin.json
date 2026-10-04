@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "id": "Kymograph",
+  "name": "Kymograph",
+  "entrypoint": "Kymograph.py",
+  "version": "2026.10.1",
+  "updated": "2026-10-01",
+  "host_api": 1,
+  "files": [
+    "Kymograph.py",
+    "__init__.py"
+  ]
+}

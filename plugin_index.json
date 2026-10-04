@@ -1,0 +1,166 @@
+[
+  {
+    "schema_version": 1,
+    "id": "AFMMovieEditor",
+    "name": "AFM Movie Editor",
+    "entrypoint": "AFMMovieEditor.py",
+    "version": "2026.10.1",
+    "updated": "2026-10-01",
+    "host_api": 1,
+    "files": [
+      "AFMMovieEditor.py",
+      "__init__.py"
+    ],
+    "archive": "AFMMovieEditor.zip"
+  },
+  {
+    "schema_version": 1,
+    "id": "DwellAnalysis",
+    "name": "Dwell Analysis",
+    "entrypoint": "DwellAnalysis.py",
+    "version": "2026.10.4",
+    "updated": "2026-10-04",
+    "host_api": 1,
+    "files": [
+      "DwellAnalysis.py",
+      "__init__.py",
+      "dwell_ai.py",
+      "dwell_ai_ui.py",
+      "dwell_detection.py",
+      "dwell_fast.py",
+      "dwell_marks.py"
+    ],
+    "archive": "DwellAnalysis.zip"
+  },
+  {
+    "schema_version": 1,
+    "id": "FilamentAnalysis",
+    "name": "Filament Analysis",
+    "entrypoint": "FilamentAnalysis.py",
+    "version": "2026.10.1",
+    "updated": "2026-10-01",
+    "host_api": 1,
+    "files": [
+      "FilamentAnalysis.py",
+      "__init__.py"
+    ],
+    "archive": "FilamentAnalysis.zip"
+  },
+  {
+    "schema_version": 1,
+    "id": "Kymograph",
+    "name": "Kymograph",
+    "entrypoint": "Kymograph.py",
+    "version": "2026.10.1",
+    "updated": "2026-10-01",
+    "host_api": 1,
+    "files": [
+      "Kymograph.py",
+      "__init__.py"
+    ],
+    "archive": "Kymograph.zip"
+  },
+  {
+    "schema_version": 1,
+    "id": "LAFMAnalysis",
+    "name": "L-AFM Analysis",
+    "entrypoint": "LAFMAnalysis.py",
+    "version": "2026.10.1",
+    "updated": "2026-10-01",
+    "host_api": 1,
+    "files": [
+      "LAFMAnalysis.py",
+      "__init__.py"
+    ],
+    "archive": "LAFMAnalysis.zip"
+  },
+  {
+    "schema_version": 1,
+    "id": "NormalModeAnalysis",
+    "name": "Normal Mode Analysis",
+    "entrypoint": "NormalModeAnalysis.py",
+    "version": "2026.10.1",
+    "updated": "2026-10-01",
+    "host_api": 1,
+    "files": [
+      "NormalModeAnalysis.py",
+      "__init__.py"
+    ],
+    "archive": "NormalModeAnalysis.zip"
+  },
+  {
+    "schema_version": 1,
+    "id": "ParticleAnalysis",
+    "name": "Particle Analysis",
+    "entrypoint": "ParticleAnalysis.py",
+    "version": "2026.10.4",
+    "updated": "2026-10-04",
+    "host_api": 1,
+    "files": [
+      "ParticleAnalysis.py",
+      "__init__.py",
+      "particle_analysis_ai.py",
+      "particle_analysis_ai_ui.py"
+    ],
+    "archive": "ParticleAnalysis.zip"
+  },
+  {
+    "schema_version": 1,
+    "id": "ParticleTracking",
+    "name": "Particle Tracking",
+    "entrypoint": "ParticleTracking.py",
+    "version": "2026.10.4",
+    "updated": "2026-10-04",
+    "host_api": 1,
+    "files": [
+      "ParticleTracking.py",
+      "__init__.py",
+      "particle_agent.py",
+      "particle_movie.py"
+    ],
+    "archive": "ParticleTracking.zip"
+  },
+  {
+    "schema_version": 1,
+    "id": "SimulatorBridge",
+    "name": "Simulator Bridge",
+    "entrypoint": "SimulatorBridge.py",
+    "version": "2026.10.1",
+    "updated": "2026-10-01",
+    "host_api": 1,
+    "files": [
+      "SimulatorBridge.py",
+      "__init__.py",
+      "pyNuD_sim.png"
+    ],
+    "archive": "SimulatorBridge.zip"
+  },
+  {
+    "schema_version": 1,
+    "id": "SpotAnalysis",
+    "name": "Spot Analysis",
+    "entrypoint": "SpotAnalysis.py",
+    "version": "2026.10.1",
+    "updated": "2026-10-01",
+    "host_api": 1,
+    "files": [
+      "SpotAnalysis.py",
+      "__init__.py"
+    ],
+    "archive": "SpotAnalysis.zip"
+  },
+  {
+    "schema_version": 1,
+    "id": "particle_cluster_analysis",
+    "name": "Particle Cluster Analysis",
+    "entrypoint": "particle_cluster_analysis.py",
+    "version": "2026.10.4",
+    "updated": "2026-10-04",
+    "host_api": 1,
+    "files": [
+      "__init__.py",
+      "particle_cluster_analysis.py"
+    ],
+    "archive": "particle_cluster_analysis.zip"
+  }
+]

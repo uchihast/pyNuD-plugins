@@ -1,0 +1,1 @@
+"""SpotAnalysis plugin bundle."""

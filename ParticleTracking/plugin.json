@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "ParticleTracking",
+  "name": "Particle Tracking",
+  "entrypoint": "ParticleTracking.py",
+  "version": "2026.10.4",
+  "updated": "2026-10-04",
+  "host_api": 1,
+  "files": [
+    "ParticleTracking.py",
+    "__init__.py",
+    "particle_agent.py",
+    "particle_movie.py"
+  ]
+}
