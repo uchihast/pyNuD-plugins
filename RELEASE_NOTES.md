@@ -28,6 +28,7 @@ The dedicated AI files are included in the ZIPs. Shared AI connections, numerica
 - `SHA256SUMS.txt` covers all plugin ZIPs and the index.
 - The current distribution uses bundle folders and ZIPs. Old root-level single-file editions are retained unchanged for existing external links; they are not updated or attached to this release.
 - The retired AFM Simulator plugin is replaced by the standalone simulator plus Simulator Bridge.
+- Normal Mode Analysis requires pyNuD running in a Python environment with ProDy. The packaged Mac/Windows application explicitly does not enable this plugin.
 
 プラグインは本体インストーラーには含まれません。更新前にプラグインとAIレビュー画面を閉じ、新しいZIPを読み込んでください。本体を更新した場合は再起動してください。
 
