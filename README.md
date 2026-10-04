@@ -4,7 +4,7 @@ Download **one ZIP per plugin** and import it in **pyNuD 2.13.0 or later** using
 
 必要なプラグインのZIPを個別にダウンロードし、**pyNuD 2.13.0以降 → Plugin → Import Plugin ZIP...** で読み込んでください。解凍は不要です。旧 `.py` 単体ファイルでは必要な専用モジュールが不足します。
 
-- For an extracted bundle, use **Load Plugin Folder...** and select the folder containing `plugin.json`.
+- For an extracted bundle, use **Load Plugin Folder...** and select the folder containing `plugin.json`. Keep that folder in place while using the plugin; folder loading uses it directly, whereas ZIP import installs a copy in pyNuD’s plugin storage.
 - Use the rebuilt v2.13.0 installer from the current application release. If you downloaded v2.13.0 before the plugin-loading fix, download and install it again; the displayed version is unchanged.
 - Close the plugin and its AI review windows before importing an updated ZIP. Restart pyNuD after updating the host application.
 - **Each plugin has its own version**, shown below and in its window title. The `bundles-2026.10.04` release identifies this collection; it is not a shared plugin version or the application version.
@@ -36,4 +36,4 @@ The download links always target the latest collection. Every collection include
 - [pyNuD application installers](https://github.com/uchihast/pyNuD-installer/releases/latest)
 - [D-Lab software page](https://dlab-website-2026.vercel.app/software?section=plugins) (older pages may still describe single-file installation; use the ZIP instructions above).
 - The old AFM Simulator plugin has been retired. Use the standalone pyNuD Simulator with **SimulatorBridge.zip** for Live sync.
-- Normal Mode Analysis additionally needs ProDy to calculate modes; plugin import alone does not install optional dependencies.
+- **Normal Mode Analysis is not available in packaged Mac/Windows applications.** Run pyNuD in a Python environment with ProDy installed to use this plugin. ZIP import does not install optional dependencies.
