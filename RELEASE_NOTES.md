@@ -2,9 +2,13 @@
 
 ## Installation / インストール
 
-Use **pyNuD 2.13.0 or later**. Download one plugin ZIP below and choose **Plugin → Import Plugin ZIP...**. Do not extract it manually, select an internal `.py` file, or import the repository-wide Source code ZIP.
+Use **pyNuD 2.13.0 or later**. Download one plugin ZIP below and choose **Plugin → Import Plugin ZIP...**. Manual extraction is not required. For an already extracted bundle, choose **Plugin → Load Plugin Folder...** and select the folder containing `plugin.json`. Do not select an internal `.py` file or import the repository-wide Source code ZIP.
 
-**pyNuD 2.13.0以降**で、必要なZIPを **Plugin → Import Plugin ZIP...** から読み込んでください。専用AIモジュールを含むフォルダー一式がインストールされます。本体v2.13.0には、PyVistaを使うプラグインの読み込みで再帰エラーになる問題の修正が含まれます。
+**pyNuD 2.13.0以降**で、必要なZIPを **Plugin → Import Plugin ZIP...** から読み込んでください。専用AIモジュールを含むフォルダー一式がインストールされます。解凍済みの場合は **Plugin → Load Plugin Folder...** で `plugin.json` を含むフォルダーを指定できます。
+
+Use the rebuilt v2.13.0 installer from the current application release. Earlier v2.13.0 installers need to be downloaded and installed again to receive the PyVista plugin-loading fix; the displayed version remains 2.13.0.
+
+本体は公開ページにある差し替え後のv2.13.0を使ってください。先にv2.13.0をダウンロードした場合は、PyVistaプラグイン読み込みの修正を反映するため、再ダウンロード・再インストールが必要です。バージョン表記は2.13.0のままです。
 
 Plugin versions are independent of the host version and this collection tag. Changed public plugins below are **2026.10.4**; unchanged bundles retain **2026.10.1**. Every public plugin is included so the latest-download links remain usable.
 
