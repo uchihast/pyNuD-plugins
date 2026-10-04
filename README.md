@@ -5,6 +5,7 @@ Download **one ZIP per plugin** and import it in **pyNuD 2.13.0 or later** using
 必要なプラグインのZIPを個別にダウンロードし、**pyNuD 2.13.0以降 → Plugin → Import Plugin ZIP...** で読み込んでください。解凍は不要です。旧 `.py` 単体ファイルでは必要な専用モジュールが不足します。
 
 - For an extracted bundle, use **Load Plugin Folder...** and select the folder containing `plugin.json`.
+- Use the rebuilt v2.13.0 installer from the current application release. If you downloaded v2.13.0 before the plugin-loading fix, download and install it again; the displayed version is unchanged.
 - Close the plugin and its AI review windows before importing an updated ZIP. Restart pyNuD after updating the host application.
 - **Each plugin has its own version**, shown below and in its window title. The `bundles-2026.10.04` release identifies this collection; it is not a shared plugin version or the application version.
 - Do not import GitHub's repository-wide **Source code (zip)** as a plugin.
