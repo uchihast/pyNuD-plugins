@@ -1,0 +1,1 @@
+"""ReferenceObjectCropper plugin bundle."""

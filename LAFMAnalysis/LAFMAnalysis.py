@@ -73,6 +73,7 @@ PLUGIN_NAME = "L-AFM Analysis"
 
 HELP_HTML_EN = """
 <h1>L-AFM Analysis (Localization AFM)</h1>
+<p>ASD export preserves the reconstruction's minimum-relative numerical range using the common verified writer. NaN or infinite pixels stop the save. A localization density or intensity reconstruction is not an acquired AFM height map.</p>
 
 <h2>Overview</h2>
 <p>Localization Atomic Force Microscopy (L-AFM) builds a super-resolution image by detecting brightness peaks across an AFM time series (movie) and reconstructing those localizations onto a finer grid. This panel runs the workflow step by step: peak detection → reconstruction → final image.</p>
@@ -298,6 +299,7 @@ graph TD
 """
 
 HELP_HTML_JA = """
+<p>ASD保存は共通の保存処理で最小値を基準とした再構成値の範囲を保持し、読み戻して検証します。NaN・無限大の画素があれば保存を中止します。局在密度・強度の再構成像は、取得したAFM高さ像とは異なります。</p>
 <h1>L-AFM Analysis (Localization AFM)</h1>
 
 <h2>概要</h2>
@@ -3195,153 +3197,11 @@ class LAFMPanelWindow(QtWidgets.QWidget):
             self.viewer_3d_window = None
 
     def _save_lafm_as_asd(self, save_path, comment, image_data):
-        """LAFMの2D画像を、輝度を正しく正規化してASD形式で保存する（堅牢版）"""
-        try:
-            # --- ステップ1: ヘッダー情報の準備 ---
-            y_pixels, x_pixels = image_data.shape
-
-            save_x_scan_size = int(self.lafm_image_scan_size['x'])
-            save_y_scan_size = int(self.lafm_image_scan_size['y'])
-
-            
-            # 必須ヘッダー情報の存在をチェックし、なければデフォルト値を使用
-            required_params = {
-                'FileType': 1, 'FrameHeaderSize': 32, 'TextEncoding': 932, 'DataType1ch': 20564,
-                'DataType2ch': 0, 'ScanDirection': 0, 'ScanTryNum': 1, 'AveFlag': 0, 'AveNum': 1,
-                'XRound': 0, 'YRound': 0, 'FrameTime': 1000.0, 'Sensitivity': 1.0, 'PhaseSens': 1.0, 
-                'MachineNo': 0, 'ADRange': 0, 'ADResolution': 0, 'PiezoConstX': 1.0,
-                'PiezoConstY': 1.0, 'PiezoConstZ': 1.0, 'DriverGainZ': 1.0
-            }
-            header_values = {}
-            for param, default in required_params.items():
-                header_values[param] = getattr(gv, param, default)
-
-            header_values['FileType'] = 1
-            header_values['FrameHeaderSize'] = 32
-            header_values['TextEncoding'] = 932
-            if header_values['ADRange'] not in {
-                0x00000001, 0x00000002, 0x00000004,
-                0x00010000, 0x00020000, 0x00040000, 0x00800000,
-            }:
-                header_values['ADRange'] = 0x00040000
-
-            # LAFM 2D保存は高さ[nm]として扱う（DataType1ch=20564）を強制する
-            header_values['DataType1ch'] = 20564
-            header_values['DataType2ch'] = 0
-
-            # LAFM画像のダイナミックレンジに合わせてZ感度を最適化し、
-            # 保存→再読込時に飽和で真っ黒化するのを防ぐ。
-            image_data_f64 = np.asarray(image_data, dtype=np.float64)
-            image_data_f64 = np.nan_to_num(image_data_f64, nan=0.0, posinf=0.0, neginf=0.0)
-            img_min = float(np.min(image_data_f64))
-            img_max = float(np.max(image_data_f64))
-            image_span = max(img_max - img_min, 0.0)
-
-            # raw = (5 - h/(PiezoConstZ*DriverGainZ)) * 4096/10
-            # h in [0, image_span] が raw in [2048, 0] に収まるように設定する。
-            effective_pcz = max(image_span / 5.0, 1e-6)
-            header_values['PiezoConstZ'] = effective_pcz
-            header_values['DriverGainZ'] = 1.0
-
-        
-            max_scan_size_x = getattr(gv, 'MaxScanSizeX', float(save_x_scan_size))
-            max_scan_size_y = getattr(gv, 'MaxScanSizeY', float(save_y_scan_size))
-
-            # 文字列情報のチェック
-            if not hasattr(gv, 'OpeName') or gv.OpeName is None:
-                print("[WARNING] SaveASD: gv.OpeName not available, using default: 'pyNuD'")
-                ope_name = "pyNuD"
-            else:
-                ope_name = gv.OpeName
-
-            # TextEncoding=932 と実際の文字列バイト列を一致させる。
-            ope_name_bytes = ope_name.encode('cp932', errors='replace')
-            comment_bytes = comment.encode('cp932', errors='replace')
-            ope_name_size = len(ope_name_bytes)
-            comment_size_for_save = len(comment_bytes)
-
-            # ASD固定ヘッダーは165 bytes。
-            file_header_size_for_save = 165 + ope_name_size + comment_size_for_save
-            
-            # 時刻情報
-            time_params = ['Year', 'Month', 'Day', 'Hour', 'Minute', 'Second']
-            time_values = {}
-            missing_time_params = []
-
-            for param in time_params:
-                if hasattr(gv, param) and getattr(gv, param) is not None:
-                    time_values[param] = getattr(gv, param)
-                else:
-                    missing_time_params.append(param)
-        
-            # 時刻情報が不完全な場合の処理
-            if missing_time_params:
-                print(f"[WARNING] SaveASD: Missing time parameters: {missing_time_params}, using current time")
-                now = datetime.datetime.now()
-                time_values['Year'] = time_values.get('Year', now.year)
-                time_values['Month'] = time_values.get('Month', now.month)
-                time_values['Day'] = time_values.get('Day', now.day)
-                time_values['Hour'] = time_values.get('Hour', now.hour)
-                time_values['Minute'] = time_values.get('Minute', now.minute)
-                time_values['Second'] = time_values.get('Second', now.second)
-            
-            
-
-            # --- ステップ2: ファイルへの書き込み ---
-            with open(save_path, 'wb') as f:
-                # ファイルヘッダー
-                f.write(struct.pack('<i', header_values['FileType'])); f.write(struct.pack('<i', file_header_size_for_save)); f.write(struct.pack('<i', header_values['FrameHeaderSize']))
-                f.write(struct.pack('<i', header_values['TextEncoding'])); f.write(struct.pack('<i', ope_name_size)); f.write(struct.pack('<i', comment_size_for_save))
-                f.write(struct.pack('<i', header_values['DataType1ch'])); f.write(struct.pack('<i', header_values['DataType2ch']))
-                f.write(struct.pack('<i', 1)); f.write(struct.pack('<i', 1)) # 1フレームのみ
-                f.write(struct.pack('<i', header_values['ScanDirection'])); f.write(struct.pack('<i', header_values['ScanTryNum']))
-                f.write(struct.pack('<i', x_pixels)); f.write(struct.pack('<i', y_pixels))
-                f.write(struct.pack('<i', save_x_scan_size)); f.write(struct.pack('<i', save_y_scan_size))
-                f.write(struct.pack('<B', header_values['AveFlag'])); f.write(struct.pack('<i', header_values['AveNum']))
-                f.write(struct.pack('<i', time_values['Year'])); f.write(struct.pack('<i', time_values['Month'])); f.write(struct.pack('<i', time_values['Day']))
-                f.write(struct.pack('<i', time_values['Hour'])); f.write(struct.pack('<i', time_values['Minute'])); f.write(struct.pack('<i', time_values['Second']))
-                f.write(struct.pack('<i', header_values['XRound'])); f.write(struct.pack('<i', header_values['YRound']))
-                f.write(struct.pack('<f', header_values['FrameTime'])); f.write(struct.pack('<f', header_values['Sensitivity'])); f.write(struct.pack('<f', header_values['PhaseSens']))
-                f.write(struct.pack('<iiii', 0, 0, 0, 0))
-                f.write(struct.pack('<i', header_values['MachineNo'])); f.write(struct.pack('<i', header_values['ADRange'])); f.write(struct.pack('<i', header_values['ADResolution']))
-                f.write(struct.pack('<f', max_scan_size_x)); f.write(struct.pack('<f', max_scan_size_y))
-                f.write(struct.pack('<f', header_values['PiezoConstX'])); f.write(struct.pack('<f', header_values['PiezoConstY']))
-                f.write(struct.pack('<f', header_values['PiezoConstZ'])); f.write(struct.pack('<f', header_values['DriverGainZ']))
-                f.write(ope_name_bytes); f.write(comment_bytes)
-
-                # --- 画像データの変換と書き込み ---
-                # LAFM結果は nm データとして保存する。
-                # 読み込み時にDataType1ch=20564で最小値が0に正規化されるため、
-                # 保存側でも最小値基準（0スタート）で符号化する。
-                height_data = image_data_f64 - img_min
-                converted_data = (
-                    5.0 - height_data / header_values['PiezoConstZ'] / header_values['DriverGainZ']
-                ) * 4096.0 / 10.0
-
-                # 非数値を除去
-                converted_data = np.nan_to_num(converted_data, nan=0.0, posinf=65535.0, neginf=0.0)
-
-                # ASDの標準的な12bit範囲へクリップ
-                normalized_data = np.clip(np.round(converted_data), 0, 4095).astype(np.uint16)
-
-                min_data_int = int(np.min(normalized_data))
-                max_data_int = int(np.max(normalized_data))
-                # フレームヘッダー
-                f.seek(file_header_size_for_save)
-                f.write(struct.pack('<I', 1)); f.write(struct.pack('<H', max_data_int)); f.write(struct.pack('<H', min_data_int))
-                f.write(struct.pack('<h', 0)); f.write(struct.pack('<h', 0)); f.write(struct.pack('<f', 0.0)); f.write(struct.pack('<f', 0.0))
-                f.write(struct.pack('<B', 0)); f.write(struct.pack('<B', 0)); f.write(struct.pack('<h', 0)); f.write(struct.pack('<i', 0)); f.write(struct.pack('<i', 0))
-
-                # 正規化された画像データを書き込み
-                f.write(normalized_data.tobytes())
-            
-            return True
-
-        except Exception as e:
-            print(f"[ERROR] _save_lafm_as_asd failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
+        """Save reconstruction values using the common verified ASD writer."""
+        from fileio import SaveASD
+        return SaveASD(save_path, comment, [np.asarray(image_data, dtype=np.float64)],
+                       save_scan_size_nm=(self.lafm_image_scan_size['x'], self.lafm_image_scan_size['y']),
+                       data_type_1ch='TP')
 
 
 # =============================================================================

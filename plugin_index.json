@@ -48,6 +48,20 @@
   },
   {
     "schema_version": 1,
+    "id": "InteractiveDriftCompensation",
+    "name": "Interactive Drift Compensation",
+    "entrypoint": "InteractiveDriftCompensation.py",
+    "version": "2026.10.20",
+    "updated": "2026-10-20",
+    "host_api": 1,
+    "files": [
+      "InteractiveDriftCompensation.py",
+      "__init__.py"
+    ],
+    "archive": "InteractiveDriftCompensation.zip"
+  },
+  {
+    "schema_version": 1,
     "id": "Kymograph",
     "name": "Kymograph",
     "entrypoint": "Kymograph.py",
@@ -65,8 +79,8 @@
     "id": "LAFMAnalysis",
     "name": "L-AFM Analysis",
     "entrypoint": "LAFMAnalysis.py",
-    "version": "2026.10.1",
-    "updated": "2026-10-01",
+    "version": "2026.10.20",
+    "updated": "2026-10-20",
     "host_api": 1,
     "files": [
       "LAFMAnalysis.py",
@@ -119,6 +133,20 @@
       "particle_movie.py"
     ],
     "archive": "ParticleTracking.zip"
+  },
+  {
+    "schema_version": 1,
+    "id": "ReferenceObjectCropper",
+    "name": "Reference Object Cropper",
+    "entrypoint": "ReferenceObjectCropper.py",
+    "version": "2026.10.20",
+    "updated": "2026-10-20",
+    "host_api": 1,
+    "files": [
+      "ReferenceObjectCropper.py",
+      "__init__.py"
+    ],
+    "archive": "ReferenceObjectCropper.zip"
   },
   {
     "schema_version": 1,

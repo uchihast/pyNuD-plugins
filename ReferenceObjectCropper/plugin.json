@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "id": "ReferenceObjectCropper",
+  "name": "Reference Object Cropper",
+  "entrypoint": "ReferenceObjectCropper.py",
+  "version": "2026.10.20",
+  "updated": "2026-10-20",
+  "host_api": 1,
+  "files": [
+    "ReferenceObjectCropper.py",
+    "__init__.py"
+  ]
+}
