@@ -13,7 +13,7 @@
 3. 各ZIPをダウンロードし、**Plugin → Import Plugin ZIP...**で読み込みます。Import each individual ZIP; extraction is not required. Existing imported copies are preserved in separate folders.
 4. プラグインのウィンドウタイトルで **2026.10.20** を確認します。Confirm the version in the plugin window title.
 
-Interactive Drift: select the original file, then Track → Apply or Save .asd. Both channels use the same shift. Missing channel 2 prevents saving.
+Interactive Drift: select the original file, then Track → Apply or Save .asd. Both channels use the same shift. Missing data in a declared second channel prevents saving.
 Reference Object Cropper: Set Reference → Crop Current, or manual Crop → Save. Acquire crops again after changing the source file.
 L-AFM: use the final result Save. ASD uses a zero minimum; nonfinite values stop saving. Existing 3D TIFF output is unchanged.
 
