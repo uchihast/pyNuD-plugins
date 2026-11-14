@@ -18,7 +18,7 @@
 - **Particle Analysis 2026.11.14.1**: All Framesの結果に作成元ファイルを記録し、別のファイルの結果を使わないようにしました。 / All Frames results record their source file and are discarded for a different file.
 - **Dwell Analysis 2026.11.14.1**: 検出とマーク処理の境界条件を修正しました。 / Detection and marking edge cases are corrected.
 - **Particle Cluster Analysis 2026.11.14**: 楕円フィットでY方向の校正を保持します。 / Ellipse fits keep the Y calibration.
-- **Simulator Bridge 2026.11.14**: pyNuD Simulatorとの通信部分を更新しました。複数のpyNuDからの配信で一時ファイルを消し合わず、窓を閉じた後に配信中へ戻りません。 / Updated the link to pyNuD Simulator: multiple publishers no longer remove each other's files, and closing the window stops publishing for good.
+- **Simulator Bridge 2026.11.14.1**: pyNuD Simulatorとの通信部分を更新しました。複数のpyNuDからの配信で一時ファイルを消し合わず、窓を閉じた後に配信中へ戻りません。pyNuDの表示言語（JPN/ENG）をSimulatorへ送り、Bridgeでつながっている間はSimulatorもpyNuDと同じ言語で表示します（pyNuD Simulator 2.2.0以降の日英切り替えに対応）。 / Updated the link to pyNuD Simulator: multiple publishers no longer remove each other's files, and closing the window stops publishing for good. It also sends pyNuD's display language (JPN/ENG), so a connected pyNuD Simulator follows it (for the language switch in pyNuD Simulator 2.2.0 or later).
 - **Interactive Drift Compensation 2026.11.14 / Reference Object Cropper 2026.11.14.1 / Normal Mode Analysis 2026.11.14**: 日英切り替えへの対応のみ。 / Language switch support only.
 
 このリリースのプラグインには **pyNuD 2.14.0以降** が必要です。These plugin versions require **pyNuD 2.14.0 or later**.

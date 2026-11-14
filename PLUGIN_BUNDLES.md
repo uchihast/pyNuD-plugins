@@ -28,6 +28,6 @@ All plugins, including those with one implementation file, use complete folders.
 | Particle Analysis | 2026.11.14.1 | 2026-11-14 | [ParticleAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/ParticleAnalysis.zip) |
 | Particle Tracking | 2026.11.14.1 | 2026-11-14 | [ParticleTracking.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/ParticleTracking.zip) |
 | Reference Object Cropper | 2026.11.14.1 | 2026-11-14 | [ReferenceObjectCropper.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/ReferenceObjectCropper.zip) |
-| Simulator Bridge | 2026.11.14 | 2026-11-14 | [SimulatorBridge.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/SimulatorBridge.zip) |
+| Simulator Bridge | 2026.11.14.1 | 2026-11-14 | [SimulatorBridge.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/SimulatorBridge.zip) |
 | Spot Analysis | 2026.11.14.1 | 2026-11-14 | [SpotAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/SpotAnalysis.zip) |
 | Particle Cluster Analysis | 2026.11.14 | 2026-11-14 | [particle_cluster_analysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/particle_cluster_analysis.zip) |

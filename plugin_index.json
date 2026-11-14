@@ -153,7 +153,7 @@
     "id": "SimulatorBridge",
     "name": "Simulator Bridge",
     "entrypoint": "SimulatorBridge.py",
-    "version": "2026.11.14",
+    "version": "2026.11.14.1",
     "updated": "2026-11-14",
     "host_api": 1,
     "files": [
