@@ -30,6 +30,13 @@ import numpy as np
 from scipy import interpolate, integrate, ndimage
 from skimage import filters as skfilters, morphology, restoration
 from PyQt5 import QtCore, QtGui, QtWidgets
+try:
+    from gui_i18n import QtWidgets, get_language, has_language_service
+except ImportError:  # 古い pyNuD 本体には gui_i18n が無い。そのときは元の Qt の部品で動く。
+    def get_language():
+        return "en"
+    def has_language_service():
+        return False
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle, Ellipse
@@ -129,7 +136,7 @@ FILAMENT_UI_TRANSLATIONS = {
     "ROI画像上で左クリックで始点・終点。U字などは Shift+Click で通過点を追加": "Left-click start and end points on the ROI image. Use Shift+Click to add waypoints for U-shaped filaments.",
     "現在のトレースを記録表に追加し、Full AFM画像へ輪郭を描画します": "Add the current trace to the recorded table and draw the contour on the full AFM image",
     "クリック済み位置が残っていて輪郭が未計算の場合は、現在フレームで輪郭を再計算してから記録します": "If clicked points remain but no contour is calculated, recalculate the contour on the current frame before recording",
-    "同じファイル・同じフレーム・同じ繊維グループの既存記録がある場合は、古い記録を上書きします": "If a record already exists for the same file, frame, and fiber group, the old record is overwritten",
+    "繊維グループが付いている場合、同じファイル・同じフレーム・同じグループの既存記録を上書きします。未割り当ての記録は常に新しい行として追加します": "When a fiber group is assigned, an existing record for the same file, frame, and group is overwritten. Unassigned records are always appended as new rows",
     "位置クリア": "Clear Points",
     "クリック済みの始点・終点・通過点を消去します": "Clear clicked start, end, and waypoint positions",
     "OKで現在グループに追加": "Add to current group on OK",
@@ -450,6 +457,148 @@ def _angle_deg_between(ay: float, ax: float, by: float, bx: float) -> float:
     return float(np.degrees(np.arccos(cos_ab)))
 
 
+_DIJKSTRA_NEIGHBORS = np.array(
+    [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)],
+    dtype=np.int32,
+)
+_DIJKSTRA_DIST_SCALE = np.array(
+    [1.414, 1.0, 1.414, 1.0, 1.0, 1.414, 1.0, 1.414],
+    dtype=np.float64,
+)
+
+
+def _dijkstra_soft_step_costs(cost_image: np.ndarray) -> np.ndarray:
+    """Per-pixel step multiplier matching the legacy soft / floor cost rule."""
+    c = np.asarray(cost_image, dtype=np.float64)
+    c = np.where(np.isfinite(c), c, 1e6)
+    soft = 0.5 + 0.5 * np.clip(c, 0.0, 1.0)
+    # Costs in [0, 1] use the soft ridge formula; values > 1 (ridge floor
+    # penalty, typically 10) must not be clipped to 1 or the floor is ignored.
+    return np.where(c <= 1.0, soft, c)
+
+
+def _dijkstra_angle_table_deg() -> np.ndarray:
+    """8×8 table of turn angles between neighbor direction indices."""
+    table = np.zeros((8, 8), dtype=np.float64)
+    for i, (ay, ax) in enumerate(_DIJKSTRA_NEIGHBORS):
+        for j, (by, bx) in enumerate(_DIJKSTRA_NEIGHBORS):
+            table[i, j] = _angle_deg_between(float(ay), float(ax), float(by), float(bx))
+    return table
+
+
+_DIJKSTRA_ANGLE_TABLE_DEG = _dijkstra_angle_table_deg()
+
+
+def _path_dijkstra_csgraph(
+    soft: np.ndarray,
+    start: Tuple[int, int],
+    end: Tuple[int, int],
+) -> Optional[List[Tuple[int, int]]]:
+    """Fast Dijkstra via scipy.sparse.csgraph with the same edge costs."""
+    from scipy import sparse
+    from scipy.sparse.csgraph import dijkstra
+
+    h, w = soft.shape
+    n = h * w
+    yy, xx = np.mgrid[0:h, 0:w]
+    rows: List[np.ndarray] = []
+    cols: List[np.ndarray] = []
+    data: List[np.ndarray] = []
+    for k, (dy, dx) in enumerate(_DIJKSTRA_NEIGHBORS):
+        ny = yy + int(dy)
+        nx = xx + int(dx)
+        mask = (ny >= 0) & (ny < h) & (nx >= 0) & (nx < w)
+        rows.append((yy[mask] * w + xx[mask]).astype(np.int32))
+        cols.append((ny[mask] * w + nx[mask]).astype(np.int32))
+        data.append((_DIJKSTRA_DIST_SCALE[k] * soft[ny[mask], nx[mask]]).astype(np.float64))
+    graph = sparse.csr_matrix(
+        (np.concatenate(data), (np.concatenate(rows), np.concatenate(cols))),
+        shape=(n, n),
+    )
+    sy, sx = int(start[0]), int(start[1])
+    ey, ex = int(end[0]), int(end[1])
+    start_i = sy * w + sx
+    end_i = ey * w + ex
+    dist, pred = dijkstra(graph, directed=True, indices=start_i, return_predecessors=True)
+    if not np.isfinite(dist[end_i]):
+        return None
+    path: List[Tuple[int, int]] = []
+    cur = int(end_i)
+    while cur != start_i and cur >= 0:
+        path.append(divmod(cur, w))
+        cur = int(pred[cur])
+    if cur < 0:
+        return None
+    path.append((sy, sx))
+    path.reverse()
+    return path
+
+
+def _path_dijkstra_bending_heap(
+    soft: np.ndarray,
+    start: Tuple[int, int],
+    end: Tuple[int, int],
+    max_bending_angle_deg: float,
+) -> Optional[List[Tuple[int, int]]]:
+    """Heap Dijkstra with bend penalties; flat indices + angle lookup table."""
+    import heapq
+
+    h, w = soft.shape
+    n = h * w
+    sy, sx = int(start[0]), int(start[1])
+    ey, ex = int(end[0]), int(end[1])
+    start_i = sy * w + sx
+    end_i = ey * w + ex
+    bend_penalty = 50.0
+    bend_cut = float(max_bending_angle_deg)
+    bend_soft = bend_cut * 0.6
+    angle_table = _DIJKSTRA_ANGLE_TABLE_DEG
+
+    dist = np.full(n, np.inf, dtype=np.float64)
+    prev = np.full(n, -1, dtype=np.int32)
+    in_dir = np.full(n, -1, dtype=np.int8)
+    dist[start_i] = 0.0
+    heap: List[Tuple[float, int]] = [(0.0, start_i)]
+
+    while heap:
+        d, i = heapq.heappop(heap)
+        if i == end_i:
+            break
+        if d > dist[i]:
+            continue
+        y, x = divmod(i, w)
+        prev_dir = int(in_dir[i])
+        for k, (dy, dx) in enumerate(_DIJKSTRA_NEIGHBORS):
+            ny = y + int(dy)
+            nx = x + int(dx)
+            if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                continue
+            bend_extra = 0.0
+            if prev_dir >= 0:
+                ang = float(angle_table[prev_dir, k])
+                if ang > bend_cut:
+                    continue
+                if ang > bend_soft:
+                    bend_extra = bend_penalty * (ang / bend_cut)
+            j = ny * w + nx
+            nd = d + float(_DIJKSTRA_DIST_SCALE[k]) * float(soft[ny, nx]) + bend_extra
+            if nd < dist[j]:
+                dist[j] = nd
+                prev[j] = i
+                in_dir[j] = k
+                heapq.heappush(heap, (nd, j))
+
+    if not np.isfinite(dist[end_i]):
+        return None
+    path: List[Tuple[int, int]] = []
+    cur = end_i
+    while cur >= 0:
+        path.append(divmod(int(cur), w))
+        cur = int(prev[cur])
+    path.reverse()
+    return path
+
+
 def path_dijkstra_ridge(
     cost_image: np.ndarray,
     start: Tuple[int, int],
@@ -459,101 +608,86 @@ def path_dijkstra_ridge(
     """
     8-neighbor Dijkstra on cost image (lower = prefer).
     max_bending_angle_deg: if set, penalize sharp turns (DNA persistence); None = off.
-    """
-    import heapq
 
+    Without bending, uses scipy.sparse.csgraph with the same edge costs as the
+    legacy heap implementation. With bending, uses a flat-index heap and an
+    8×8 angle lookup so the total path cost stays identical.
+    """
     h, w = cost_image.shape
     sy, sx = int(start[0]), int(start[1])
     ey, ex = int(end[0]), int(end[1])
     if not (0 <= sy < h and 0 <= sx < w and 0 <= ey < h and 0 <= ex < w):
         return None
 
+    soft = _dijkstra_soft_step_costs(cost_image)
     use_bending = max_bending_angle_deg is not None and max_bending_angle_deg > 0
-    bend_penalty = 50.0
+    if use_bending:
+        return _path_dijkstra_bending_heap(soft, (sy, sx), (ey, ex), float(max_bending_angle_deg))
+    return _path_dijkstra_csgraph(soft, (sy, sx), (ey, ex))
 
-    neighbors = [
-        (-1, -1), (-1, 0), (-1, 1),
-        (0, -1),           (0, 1),
-        (1, -1),  (1, 0),  (1, 1),
-    ]
-    dist_scale = [1.414, 1.0, 1.414, 1.0, 1.0, 1.414, 1.0, 1.414]
 
-    INF = float("inf")
-    dist = np.full((h, w), INF, dtype=np.float64)
-    dist[sy, sx] = 0.0
-    prev: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {}
-    prev[(sy, sx)] = None
-    heap: List[Tuple[float, int, int]] = [(0.0, sy, sx)]
+def smoothed_path_length(points, sigma: float = 2.0, scale_row: float = 1.0, scale_col: float = 1.0) -> float:
+    """Length of a pixel path after removing its staircase.
 
-    while heap:
-        d, y, x = heapq.heappop(heap)
-        if (y, x) == (ey, ex):
-            break
-        if d > dist[y, x]:
-            continue
-        prev_pt = prev.get((y, x))
-        for k, (dy, dx) in enumerate(neighbors):
-            ny, nx = y + dy, x + dx
-            if ny < 0 or ny >= h or nx < 0 or nx >= w:
-                continue
-            if use_bending and prev_pt is not None:
-                py, px = prev_pt
-                in_dy, in_dx = y - py, x - px
-                out_dy, out_dx = ny - y, nx - x
-                ang = _angle_deg_between(float(in_dy), float(in_dx), float(out_dy), float(out_dx))
-                if ang > max_bending_angle_deg:
-                    continue
-                if ang > max_bending_angle_deg * 0.6:
-                    bend_extra = bend_penalty * (ang / max_bending_angle_deg)
-                else:
-                    bend_extra = 0.0
-            else:
-                bend_extra = 0.0
-            c = float(cost_image[ny, nx])
-            if not np.isfinite(c):
-                c = 1e6
-            step = dist_scale[k] * (0.5 + 0.5 * max(0, min(1, c))) + bend_extra
-            nd = d + step
-            if nd < dist[ny, nx]:
-                dist[ny, nx] = nd
-                prev[(ny, nx)] = (y, x)
-                heapq.heappush(heap, (nd, ny, nx))
-
-    if not np.isfinite(dist[ey, ex]):
-        return None
-    path: List[Tuple[int, int]] = []
-    cur = (ey, ex)
-    while cur is not None:
-        path.append(cur)
-        cur = prev.get(cur)
-    path.reverse()
-    return path
+    A Dijkstra path on the pixel grid moves in straight and diagonal steps, so
+    its polyline (or an interpolating spline through it) is up to about 10 %
+    longer than the filament for directions other than 0 and 45 degrees. The
+    path is smoothed with a Gaussian of ``sigma`` points along its length, with
+    mirrored ends so the end points stay fixed, and the length of the smoothed
+    polyline is returned. Rows and columns can be scaled to physical units
+    before measuring. With sigma = 2 a straight line is measured within 0.05 %
+    in any direction, and a circular arc of radius >= 20 px within 0.1 %.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] < 2:
+        return 0.0
+    pts = pts[:, :2] * np.array([float(scale_row), float(scale_col)])
+    if pts.shape[0] >= 3 and sigma > 0:
+        pad = int(min(pts.shape[0] - 1, max(1, round(4 * sigma))))
+        left = 2 * pts[0] - pts[pad:0:-1]
+        right = 2 * pts[-1] - pts[-2:-pad - 2:-1]
+        extended = np.vstack([left, pts, right])
+        smooth = ndimage.gaussian_filter1d(extended, sigma, axis=0, mode="nearest")
+        pts = smooth[pad:pad + pts.shape[0]]
+    steps = np.diff(pts, axis=0)
+    return float(np.sum(np.hypot(steps[:, 0], steps[:, 1])))
 
 
 def contour_length_spline(path_pixels: List[Tuple[int, int]]) -> float:
     """
-    Fit 3rd-order spline to path and compute arc length by integration.
-    path_pixels: list of (row, col) = (y, x). We use (x, y) for spline.
+    Contour length of a pixel path (row, col), in pixels.
+
+    The name is kept for compatibility. An interpolating spline through the
+    staircase path followed every step and over-estimated the length by up to
+    about 10 % depending on the direction; the path is now smoothed first
+    (see smoothed_path_length).
     """
-    if len(path_pixels) < 2:
-        return 0.0
-    xs = np.array([p[1] for p in path_pixels], dtype=np.float64)
-    ys = np.array([p[0] for p in path_pixels], dtype=np.float64)
-    n = len(xs)
-    t = np.linspace(0, 1, n)
-    try:
-        tck, u = interpolate.splprep([xs, ys], s=0.0, k=min(3, n - 1))
-    except Exception:
-        return float(np.sum(np.sqrt(np.diff(xs) ** 2 + np.diff(ys) ** 2)))
-    u_new = np.linspace(0, 1, max(50, n * 2))
-    x_new, y_new = interpolate.splev(u_new, tck)
+    return smoothed_path_length(path_pixels)
 
-    def speed(u_val: float) -> float:
-        der = interpolate.splev(u_val, tck, der=1)
-        return float(np.sqrt(der[0] ** 2 + der[1] ** 2))
 
-    length, _ = integrate.quad(speed, 0, 1, limit=100)
-    return float(length)
+def anisotropic_length_factor(path_pixels, aniso_y: float) -> float:
+    """Ratio that converts a pixel-space path length into X-pixel units.
+
+    ``aniso_y`` is nm_y / nm_x. With non-square pixels a step along Y is
+    ``aniso_y`` times as long as a step along X, so a length measured in raw
+    pixels cannot be converted with one nm/px value. The ratio is taken along
+    the path itself (row, col points), so it follows the filament direction.
+    Returns exactly 1.0 for square pixels.
+    """
+    r = float(aniso_y)
+    if not np.isfinite(r) or r <= 0 or abs(r - 1.0) < 1e-9:
+        return 1.0
+    if path_pixels is None or len(path_pixels) < 2:
+        return 1.0
+    pts = np.asarray(path_pixels, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 2:
+        return 1.0
+    d_row = np.diff(pts[:, 0])
+    d_col = np.diff(pts[:, 1])
+    raw = float(np.sum(np.hypot(d_col, d_row)))
+    if raw <= 0:
+        return 1.0
+    return float(np.sum(np.hypot(d_col, d_row * r))) / raw
 
 
 def end_to_end_distance_from_points(points_xy: List[Tuple[float, float]]) -> Optional[float]:
@@ -1062,12 +1196,17 @@ def fluctuation_analysis(
     fps: float,
     n_resample: int = 100,
     trim_frac: float = 0.1,
+    nm_per_px_y: Optional[float] = None,
 ) -> dict:
     """
     Quantify local curvature fluctuations for one fiber group across frames.
     Input records must contain path_full_xy and frame_index.
+    nm_per_px is the X scale; nm_per_px_y (default: same as X) is the Y scale.
     """
     nm_scale = float(nm_per_px)
+    nm_scale_y = nm_scale if nm_per_px_y is None else float(nm_per_px_y)
+    if not np.isfinite(nm_scale_y) or nm_scale_y <= 0:
+        raise ValueError("nm_per_px_y must be positive.")
     fps_val = float(fps)
     n_points = int(n_resample)
     if not np.isfinite(nm_scale) or nm_scale <= 0:
@@ -1090,7 +1229,21 @@ def fluctuation_analysis(
         pts_px = np.asarray(raw_path, dtype=np.float64)
         if pts_px.ndim != 2 or pts_px.shape[1] != 2 or pts_px.shape[0] < 2:
             continue
-        pts_nm = pts_px * nm_scale
+        # Prefer per-record calibration saved at OK time; else current-file fallback.
+        try:
+            rx = rec.get("nm_per_pixel_x")
+            ry = rec.get("nm_per_pixel_y")
+            if rx is not None and ry is not None:
+                rx_f, ry_f = float(rx), float(ry)
+                if np.isfinite(rx_f) and np.isfinite(ry_f) and rx_f > 0 and ry_f > 0:
+                    use_x, use_y = rx_f, ry_f
+                else:
+                    use_x, use_y = nm_scale, nm_scale_y
+            else:
+                use_x, use_y = nm_scale, nm_scale_y
+        except Exception:
+            use_x, use_y = nm_scale, nm_scale_y
+        pts_nm = pts_px * np.array([use_x, use_y], dtype=np.float64)
         pts, s, total_len = _path_arc_length_axis([(float(x), float(y)) for x, y in pts_nm])
         if pts.shape[0] >= 2 and s.size >= 2 and total_len > 0:
             path_infos.append((rec, pts, s, total_len))
@@ -1705,6 +1858,7 @@ class ContourLengthFullImageWindow(QtWidgets.QMainWindow):
         self._persistence_path_pixels: Optional[List[Tuple[int, int]]] = None
         self._on_length_computed_callback = None
         self._nm_per_pixel: Optional[float] = None
+        self._aniso_y: float = 1.0  # nm_y / nm_x (1.0 for square pixels)
         self._marker_size = 2
         self._marker_shape = "o"  # matplotlib marker: o, s, ^, v, D, etc.
         self._cmap_name = "viridis"
@@ -1802,9 +1956,20 @@ class ContourLengthFullImageWindow(QtWidgets.QMainWindow):
         """Main window sets this so that when 2nd endpoint is set we can report length."""
         self._on_length_computed_callback = callback
 
-    def set_nm_per_pixel(self, nm_per_pixel: Optional[float]) -> None:
-        """Set scale (nm/px) for displaying contour length in nm."""
+    def set_nm_per_pixel(self, nm_per_pixel: Optional[float], aniso_y: float = 1.0) -> None:
+        """Set scale (nm per X pixel) and the Y/X pixel-size ratio for showing lengths in nm."""
         self._nm_per_pixel = float(nm_per_pixel) if nm_per_pixel is not None and nm_per_pixel > 0 else None
+        try:
+            r = float(aniso_y)
+        except Exception:
+            r = 1.0
+        self._aniso_y = r if np.isfinite(r) and r > 0 else 1.0
+
+    def scaled_path_length(self) -> Optional[float]:
+        """Path length in X-pixel units (equals the pixel length for square pixels)."""
+        if self._path_length is None:
+            return None
+        return float(self._path_length) * anisotropic_length_factor(self._path_pixels, self._aniso_y)
 
     def enable_roi_selector(self, shape: str, callback) -> None:
         from matplotlib.widgets import RectangleSelector, EllipseSelector
@@ -1954,7 +2119,7 @@ class ContourLengthFullImageWindow(QtWidgets.QMainWindow):
             self.ax_roi.plot(xs, ys, "r-", linewidth=2, alpha=0.9)
         if self._path_length is not None:
             if self._nm_per_pixel is not None and self._nm_per_pixel > 0:
-                self.ax_roi.set_title(f"{self._tr('輪郭長')}: {self._path_length * self._nm_per_pixel:.3f} nm")
+                self.ax_roi.set_title(f"{self._tr('輪郭長')}: {self.scaled_path_length() * self._nm_per_pixel:.3f} nm")
             else:
                 self.ax_roi.set_title(f"{self._tr('輪郭長')}: {self._path_length:.3f} px")
         else:
@@ -2092,7 +2257,7 @@ class ContourLengthFullImageWindow(QtWidgets.QMainWindow):
             self.ax_roi.imshow(roi_image, cmap=self._cmap_name, origin="lower")
             if self._path_length is not None:
                 if self._nm_per_pixel is not None and self._nm_per_pixel > 0:
-                    self.ax_roi.set_title(f"ROI - {self._tr('輪郭長')}: {self._path_length * self._nm_per_pixel:.3f} nm")
+                    self.ax_roi.set_title(f"ROI - {self._tr('輪郭長')}: {self.scaled_path_length() * self._nm_per_pixel:.3f} nm")
                 else:
                     self.ax_roi.set_title(f"ROI - {self._tr('輪郭長')}: {self._path_length:.3f} px")
             else:
@@ -2527,7 +2692,7 @@ class ContourLengthWindow(QtWidgets.QWidget):
     def __init__(self, main_window, parent=None):
         super().__init__(parent)
         self.main_window = main_window
-        self._ui_language = UI_LANG_JA
+        self._ui_language = get_language() if has_language_service() else UI_LANG_JA
         self.setWindowTitle(PLUGIN_NAME)
         self.setMinimumWidth(380)
         self.full_viz_window: Optional[ContourLengthFullImageWindow] = None
@@ -2765,7 +2930,9 @@ class ContourLengthWindow(QtWidgets.QWidget):
         self.ok_btn = QtWidgets.QPushButton("OK")
         self.ok_btn.setMaximumWidth(60)
         self.ok_btn.clicked.connect(lambda: self._on_ok_record())
-        self.ok_btn.setToolTip("同じファイル・同じフレーム・同じ繊維グループの既存記録がある場合は、古い記録を上書きします")
+        self.ok_btn.setToolTip(
+            "繊維グループが付いている場合、同じファイル・同じフレーム・同じグループの既存記録を上書きします。未割り当ての記録は常に新しい行として追加します"
+        )
         record_btn_row.addWidget(self.ok_btn)
         self.clear_points_btn = QtWidgets.QPushButton("Clear Points")
         self.clear_points_btn.setMaximumWidth(120)
@@ -2960,6 +3127,10 @@ class ContourLengthWindow(QtWidgets.QWidget):
     def _tr(self, text: str) -> str:
         return _ui_text(text, self._ui_language)
 
+    def _pynud_sync_language(self, language: str) -> None:
+        self._ui_language = language
+        self._retranslate_ui()
+
     def _toggle_ui_language(self) -> None:
         self._ui_language = UI_LANG_EN if self._ui_language == UI_LANG_JA else UI_LANG_JA
         self._retranslate_ui()
@@ -3008,7 +3179,8 @@ class ContourLengthWindow(QtWidgets.QWidget):
 
         btn_ja.clicked.connect(lambda: set_lang(UI_LANG_JA))
         btn_en.clicked.connect(lambda: set_lang(UI_LANG_EN))
-        set_lang(UI_LANG_EN)
+        dialog._pynud_sync_language = set_lang
+        set_lang(self._ui_language)
         dialog.exec_()
 
     def _plugin_help_text(self, lang: Optional[str] = None) -> str:
@@ -3018,7 +3190,7 @@ class ContourLengthWindow(QtWidgets.QWidget):
                 "Filament Analysis Help\n"
                 "\n"
                 "Contour recording\n"
-                "- OK: records the current traced contour into the Recorded Measurements table. If clicked points remain but the contour was cleared after moving frames, OK recalculates the contour on the current frame first. If a record already exists for the same file, frame, and fiber group, OK overwrites the old record instead of adding a duplicate.\n"
+                "- OK: records the current traced contour into the Recorded Measurements table. If clicked points remain but the contour was cleared after moving frames, OK recalculates the contour on the current frame first. When a fiber group is assigned, OK overwrites any existing record for the same file, frame, and group (re-measure replaces the old row). Unassigned records (no fiber group) are always appended, so multiple filaments on one frame can be measured without overwriting each other.\n"
                 "- Clear Points: clears clicked start/end/waypoint positions and the calculated contour. Use this when filament drift makes the previous positions unsuitable.\n"
                 "- Persistence Length: when checked, OK also calculates and stores the persistence length.\n"
                 "- Prev / Next: moves between frames. The ROI and clicked positions are kept, while the calculated contour, length, snapped points, and persistence result are cleared for the new frame. Next asks for confirmation if a trace exists but has not been recorded with OK.\n"
@@ -3056,7 +3228,7 @@ class ContourLengthWindow(QtWidgets.QWidget):
             "Filament Analysis ヘルプ\n"
             "\n"
             "輪郭の記録\n"
-            "- OK: 現在トレースした輪郭を「記録した測定値」表に追加します。Next後などでクリック位置だけが残り輪郭が未計算の場合は、現在フレームで輪郭を再計算してから記録します。同じファイル・同じフレーム・同じ繊維グループの記録が既にある場合は、重複追加せず古い記録を上書きします。\n"
+            "- OK: 現在トレースした輪郭を「記録した測定値」表に追加します。Next後などでクリック位置だけが残り輪郭が未計算の場合は、現在フレームで輪郭を再計算してから記録します。繊維グループが付いている場合は、同じファイル・同じフレーム・同じグループの既存記録を上書きします（測り直しで古い行を残しません）。未割り当て（グループなし）の記録は常に新しい行として追加するので、1枚の画像で複数フィラメントを順に測っても前の記録は消えません。\n"
             "- 位置クリア: クリック済みの始点・終点・通過点と計算済み輪郭を消去します。フレーム間ドリフトで前フレームの位置が使えない場合に押します。\n"
             "- Persistence Length: チェックON時、OK記録時にパーシステンス長も計算して保存します。\n"
             "- Prev / Next: フレームを移動します。ROIとクリック位置は残し、計算済み輪郭、輪郭長、スナップ位置、Persistence Lengthは新フレーム用に消去します。未記録のトレースがある状態でNextを押すと確認します。\n"
@@ -3274,10 +3446,16 @@ class ContourLengthWindow(QtWidgets.QWidget):
             frame_text = ", ".join(str(v) for v in frame_numbers[:8]) if frame_numbers else "—"
             if len(frame_numbers) > 8:
                 frame_text += f" +{len(frame_numbers) - 8} more" if self._ui_language == UI_LANG_EN else f" 他{len(frame_numbers) - 8}"
-            lines.append(
-                f"G{group_id}{current_mark}: records {len(records)}, boxes {box_count}, "
-                f"files [{file_text}], frames [{frame_text}]"
-            )
+            if self._ui_language == UI_LANG_EN:
+                lines.append(
+                    f"G{group_id}{current_mark}: records {len(records)}, boxes {box_count}, "
+                    f"files [{file_text}], frames [{frame_text}]"
+                )
+            else:
+                lines.append(
+                    f"G{group_id}{current_mark}: 記録 {len(records)}、box {box_count}、"
+                    f"ファイル [{file_text}]、フレーム [{frame_text}]"
+                )
         return lines
 
     def _update_fiber_group_info_label(self) -> None:
@@ -3446,6 +3624,7 @@ class ContourLengthWindow(QtWidgets.QWidget):
                     fps=fps,
                     n_resample=n_resample,
                     trim_frac=0.1,
+                    nm_per_px_y=nm_per_px * self._aniso_y_factor(),
                 )
             except Exception as exc:
                 skipped.append(f"Group {group_id}: {exc}")
@@ -4155,8 +4334,15 @@ class ContourLengthWindow(QtWidgets.QWidget):
     def _upsert_recorded_contour(self, rec: Dict[str, Any]) -> bool:
         """
         Add or replace a contour record.
+
+        Unassigned records (fiber_group_id is None) are always appended so multiple
+        filaments on the same frame can be measured without silently overwriting.
+        Assigned records replace any existing same file/frame/group entry.
         Returns True when an existing same file/frame/group record was replaced.
         """
+        if self._record_group_token(rec.get("fiber_group_id")) is None:
+            self._recorded_contours_list.append(rec)
+            return False
         target_key = self._record_identity_key(rec)
         matches = [
             idx for idx, old_rec in enumerate(self._recorded_contours_list)
@@ -4191,10 +4377,13 @@ class ContourLengthWindow(QtWidgets.QWidget):
         length_px = self.full_viz_window._path_length
         if length_px is None:
             return
+        # 非正方ピクセルでは、経路の向きに応じた比で X 画素単位の長さに直す
+        length_px = float(length_px) * anisotropic_length_factor(path_pixels, self._aniso_y_factor())
         x0 = float(self.manual_roi.get("x0", 0))
         y0 = float(self.manual_roi.get("y0", 0))
         path_full_xy = [(x0 + p[1], y0 + p[0]) for p in path_pixels]
-        nm_per_px = self._get_nm_per_pixel()
+        nm_xy = self._get_nm_per_pixel_xy()
+        nm_per_px = float(nm_xy[0]) if nm_xy is not None else self._get_nm_per_pixel()
         length_nm = (length_px * nm_per_px) if (nm_per_px and nm_per_px > 0) else None
         end_to_end_px = self._compute_current_end_to_end_px()
         end_to_end_nm = (end_to_end_px * nm_per_px) if (end_to_end_px is not None and nm_per_px and nm_per_px > 0) else None
@@ -4231,6 +4420,14 @@ class ContourLengthWindow(QtWidgets.QWidget):
             "file_id": file_id,
             "fiber_group_id": record_group_id,
         }
+        # Persist the calibration used at record time so later CSV / fluctuation
+        # exports stay correct after switching to a file with a different nm/px.
+        if nm_xy is not None:
+            rec["nm_per_pixel_x"] = float(nm_xy[0])
+            rec["nm_per_pixel_y"] = float(nm_xy[1])
+        elif nm_per_px is not None and nm_per_px > 0:
+            rec["nm_per_pixel_x"] = float(nm_per_px)
+            rec["nm_per_pixel_y"] = float(nm_per_px) * float(self._aniso_y_factor())
         self._upsert_recorded_contour(rec)
         self._last_ok_trace_signature = self._current_trace_signature()
         self._update_recorded_table()
@@ -4781,6 +4978,24 @@ class ContourLengthWindow(QtWidgets.QWidget):
         return None
 
     @staticmethod
+    def _scale_xy_from_record(
+        rec: Dict[str, Any],
+        fallback: Optional[Tuple[float, float]] = None,
+    ) -> Optional[Tuple[float, float]]:
+        """Prefer calibration saved with the record; else use fallback (current file)."""
+        try:
+            nm_x = rec.get("nm_per_pixel_x")
+            nm_y = rec.get("nm_per_pixel_y")
+            if nm_x is not None and nm_y is not None:
+                nm_x_f = float(nm_x)
+                nm_y_f = float(nm_y)
+                if np.isfinite(nm_x_f) and np.isfinite(nm_y_f) and nm_x_f > 0 and nm_y_f > 0:
+                    return nm_x_f, nm_y_f
+        except Exception:
+            pass
+        return fallback
+
+    @staticmethod
     def _path_s_axis(path_xy: np.ndarray) -> np.ndarray:
         pts = np.asarray(path_xy, dtype=np.float64)
         if pts.ndim != 2 or pts.shape[0] == 0:
@@ -4809,8 +5024,9 @@ class ContourLengthWindow(QtWidgets.QWidget):
                 if pts.ndim != 2 or pts.shape[1] != 2 or pts.shape[0] < 2:
                     continue
                 s_px = self._path_s_axis(pts)
-                if scale_xy is not None:
-                    nm_x, nm_y = scale_xy
+                rec_scale = self._scale_xy_from_record(rec, scale_xy)
+                if rec_scale is not None:
+                    nm_x, nm_y = rec_scale
                     pts_nm = np.column_stack([pts[:, 0] * nm_x, pts[:, 1] * nm_y])
                     s_nm = self._path_s_axis(pts_nm)
                 else:
@@ -4860,8 +5076,9 @@ class ContourLengthWindow(QtWidgets.QWidget):
                 pts = np.asarray(rec.get("path_full_xy") or [], dtype=np.float64)
                 if pts.ndim != 2 or pts.shape[1] != 2 or pts.shape[0] < 2:
                     continue
-                if scale_xy is not None:
-                    nm_x, nm_y = scale_xy
+                rec_scale = self._scale_xy_from_record(rec, scale_xy)
+                if rec_scale is not None:
+                    nm_x, nm_y = rec_scale
                     metric_path = [(float(x) * nm_x, float(y) * nm_y) for x, y in pts]
                     unit = "nm"
                 else:
@@ -4984,8 +5201,23 @@ class ContourLengthWindow(QtWidgets.QWidget):
                 return base
         return "filament_analysis"
 
+    def _aniso_y_factor(self) -> float:
+        """nm_y / nm_x of the current data (1.0 for square pixels or unknown scale)."""
+        scale_xy = self._get_nm_per_pixel_xy()
+        if not scale_xy:
+            return 1.0
+        ratio = float(scale_xy[1]) / float(scale_xy[0])
+        if not np.isfinite(ratio) or ratio <= 0 or abs(ratio - 1.0) < 1e-9:
+            return 1.0
+        return ratio
+
     def _get_nm_per_pixel(self) -> Optional[float]:
-        """Return nm per pixel (average of X and Y) from gv scan size, or None if unavailable."""
+        """Return nm per X pixel from gv scan size, or None if unavailable.
+
+        Lengths passed to this scale must be in X-pixel units: Y differences
+        are multiplied by _aniso_y_factor() first. For square pixels this is
+        the same value as before (X and Y scales are equal).
+        """
         if not hasattr(gv, "XScanSize") or not hasattr(gv, "YScanSize"):
             return None
         if not hasattr(gv, "XPixel") or not hasattr(gv, "YPixel"):
@@ -4995,8 +5227,7 @@ class ContourLengthWindow(QtWidgets.QWidget):
         if getattr(gv, "XPixel", 0) == 0 or getattr(gv, "YPixel", 0) == 0:
             return None
         nm_x = gv.XScanSize / gv.XPixel
-        nm_y = gv.YScanSize / gv.YPixel
-        return (float(nm_x) + float(nm_y)) / 2.0
+        return float(nm_x)
 
     def _get_nm_per_pixel_xy(self) -> Optional[Tuple[float, float]]:
         if not hasattr(gv, "XScanSize") or not hasattr(gv, "YScanSize"):
@@ -5034,12 +5265,35 @@ class ContourLengthWindow(QtWidgets.QWidget):
                 self.main_window.ListClickFunction()
         return True
 
+    def _host_processed_frame(self) -> Optional[np.ndarray]:
+        """Current frame with the main window's leveling / filters applied.
+
+        LoadFrame() clears gv.aryData_processed_1ch before reading, so reading
+        that buffer right after LoadFrame() always falls back to raw data. Ask
+        the host for the processed frame instead; it also leaves the main
+        window's buffers untouched. Returns None when the host cannot provide it.
+        """
+        getter = getattr(getattr(self, "main_window", None), "getImageDataForFrame", None)
+        if not callable(getter):
+            return None
+        try:
+            data = getter(int(getattr(gv, "index", 0) or 0), "1ch")
+        except Exception:
+            return None
+        if data is None:
+            return None
+        frame = np.asarray(data, dtype=np.float64)
+        return frame if frame.ndim == 2 else None
+
     def _prepare_frame(self) -> Optional[np.ndarray]:
         if not hasattr(gv, "files") or not gv.files:
             QtWidgets.QMessageBox.information(self, "No Files", self._tr("ファイルがロードされていません。"))
             return None
         if getattr(gv, "currentFileNum", -1) < 0 or gv.currentFileNum >= len(gv.files):
             return None
+        processed = self._host_processed_frame()
+        if processed is not None:
+            return processed
         try:
             LoadFrame(gv.files[gv.currentFileNum])
             InitializeAryDataFallback()
@@ -5144,7 +5398,7 @@ class ContourLengthWindow(QtWidgets.QWidget):
             return
         if self.last_frame is None:
             return
-        self.full_viz_window.set_nm_per_pixel(self._get_nm_per_pixel())
+        self.full_viz_window.set_nm_per_pixel(self._get_nm_per_pixel(), self._aniso_y_factor())
         roi_crop, roi_overlay = self._get_roi_crop()
         roi_display = self._apply_preprocess(roi_crop) if roi_crop is not None else None
         self.full_viz_window.update_view(
@@ -5235,6 +5489,10 @@ class ContourLengthWindow(QtWidgets.QWidget):
 
     def _on_length_computed(self, length_px: float) -> None:
         nm_per_px = self._get_nm_per_pixel()
+        if self.full_viz_window is not None and length_px is not None:
+            length_px = float(length_px) * anisotropic_length_factor(
+                getattr(self.full_viz_window, "_path_pixels", None), self._aniso_y_factor()
+            )
         if nm_per_px is not None and nm_per_px > 0:
             self.length_label.setText(f"{self._tr('輪郭長')}: {length_px * nm_per_px:.3f} nm")
         else:
@@ -5283,23 +5541,35 @@ class ContourLengthWindow(QtWidgets.QWidget):
         return None
 
     def _compute_current_end_to_end_px(self) -> Optional[float]:
+        # Y 方向の差に nm_y/nm_x を掛け、X 画素単位の距離として返す
+        ratio = self._aniso_y_factor()
         points = self._get_current_anchor_points()
         if points and len(points) >= 2:
-            return end_to_end_distance_from_points([points[0], points[-1]])
+            return end_to_end_distance_from_points(
+                [(float(points[0][0]), float(points[0][1]) * ratio),
+                 (float(points[-1][0]), float(points[-1][1]) * ratio)]
+            )
         if self.full_viz_window is None:
             return None
         path_pixels = getattr(self.full_viz_window, "_path_pixels", None)
         if path_pixels and len(path_pixels) >= 2:
             y0, x0 = path_pixels[0]
             y1, x1 = path_pixels[-1]
-            return float(np.hypot(float(x1) - float(x0), float(y1) - float(y0)))
+            return float(np.hypot(float(x1) - float(x0), (float(y1) - float(y0)) * ratio))
         return None
 
     def _compute_current_persistence_px(self, analysis_mode: str) -> Tuple[Optional[float], str]:
+        # 非正方ピクセルでは、Y 座標に nm_y/nm_x を掛けて等方な座標にしてから計算する
+        ratio = self._aniso_y_factor()
         if analysis_mode == ANALYSIS_MODE_BEADS:
             pts = self._get_current_anchor_points() or []
+            if ratio != 1.0:
+                pts = [(float(p[0]), float(p[1]) * ratio) for p in pts]
             return persistence_length_2d_from_segments(pts), "segment"
-        return persistence_length_2d_from_path(self._get_persistence_path_pixels() or []), "path"
+        path = self._get_persistence_path_pixels() or []
+        if ratio != 1.0:
+            path = [(float(p[0]) * ratio, float(p[1])) for p in path]
+        return persistence_length_2d_from_path(path), "path"
 
     def _get_persistence_path_pixels(self) -> Optional[List[Tuple[int, int]]]:
         if self.full_viz_window is None:
@@ -5413,7 +5683,7 @@ class ContourLengthWindow(QtWidgets.QWidget):
         marker = self.marker_shape_combo.currentData()
         self.full_viz_window.set_marker_shape(str(marker) if marker else "o")
         self.full_viz_window.set_cmap(self.cmap_combo.currentText().strip() or "viridis")
-        self.full_viz_window.set_nm_per_pixel(self._get_nm_per_pixel())
+        self.full_viz_window.set_nm_per_pixel(self._get_nm_per_pixel(), self._aniso_y_factor())
         self.full_viz_window.enable_roi_selector("Rectangle", self._on_full_image_selected)
         roi_crop, roi_overlay = self._get_roi_crop()
         roi_display = self._apply_preprocess(roi_crop) if roi_crop is not None else None

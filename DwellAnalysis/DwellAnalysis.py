@@ -17,6 +17,15 @@ import math
 import numpy as np
 import cv2
 from PyQt5 import QtWidgets, QtCore, QtGui
+try:
+    from gui_i18n import QtWidgets
+except ImportError:  # 古い pyNuD 本体には gui_i18n が無い。そのときは元の Qt の部品で動く。
+    pass
+try:
+    from gui_i18n import pick_text
+except ImportError:  # 古い本体には pick_text が無い
+    def pick_text(en, ja):
+        return en
 import globalvals as gv
 
 PLUGIN_NAME = "Dwell Analysis"
@@ -85,7 +94,7 @@ Legacy Save/Load Session retains the manual marking editor. No source ASD is alt
 <h2>Overview</h2>
 <p>Dwell Analysis quantifies how long a molecule stays at a location across frames.
 Place marks on the main image, save per frame (Memorize), then run Finalization to
-link marks across frames and compute dwell times.</p>
+link each molecule to the nearest unused mark within Mol Radius in the next frame and compute dwell times.</p>
 <h2>Tabs</h2>
 <ul>
   <li><strong>Dwell Analysis</strong> – Mark molecules and run Finalization.</li>
@@ -136,7 +145,7 @@ Correct ROI...では中心1点で位置修正、複数点で分割します。�
 新しいイベントは未判定となり、追跡が不確かなフレームは滞在時間に含めません。変更前のROI・イベントはJSON履歴に残ります。</p>
 <h2>概要</h2>
 <p>ドウェル解析は、分子が同じ位置に何フレーム存在したかを定量する機能です。
-メイン画像にマークを付け、フレームごとに Memorize して保存し、Finalization でリンク・計算します。</p>
+メイン画像にマークを付け、フレームごとに Memorize して保存し、Finalization で、Mol Radius 内の未使用候補のうち最も近いマークへ連結して計算します。</p>
 <h2>タブ</h2>
 <ul>
   <li><strong>Dwell Analysis</strong> – 分子のマークと Finalization。</li>
@@ -1657,14 +1666,16 @@ class DwellAnalysisWindow(QtWidgets.QMainWindow):
                 if mol['frames'][-1] == frame - 1:
                     lx_px, ly_px = mol['positions'][-1]
                     lx_nm, ly_nm = lx_px * dx_nm, ly_px * dy_nm
-                    for i, (cx_px, cy_px) in enumerate(current_marks):
-                        if not matched[i]:
-                            d = np.sqrt((cx_px * dx_nm - lx_nm)**2 + (cy_px * dy_nm - ly_nm)**2)
-                            if d <= radius:
-                                mol['frames'].append(frame)
-                                mol['positions'].append((cx_px, cy_px))
-                                matched[i] = True
-                                break
+                    candidates = [
+                        (np.hypot(cx * dx_nm - lx_nm, cy * dy_nm - ly_nm), i)
+                        for i, (cx, cy) in enumerate(current_marks) if not matched[i]
+                    ]
+                    if candidates:
+                        distance, i = min(candidates)
+                        if distance <= radius:
+                            mol['frames'].append(frame)
+                            mol['positions'].append(current_marks[i])
+                            matched[i] = True
             for i, ok in enumerate(matched):
                 if not ok:
                     molecules.append({'frames': [frame], 'positions': [current_marks[i]]})
@@ -2238,7 +2249,11 @@ class DwellAnalysisWindow(QtWidgets.QMainWindow):
             pix = QtGui.QPixmap(16, 16)
             pix.fill(QtGui.QColor(*color))
             icon = QtGui.QIcon(pix)
-            item = QtWidgets.QListWidgetItem(icon, f"#{s['id']}  {s['label']}  ({len(s['points'])} pts)")
+            n_pts = len(s['points'])
+            item = QtWidgets.QListWidgetItem(icon, pick_text(
+                f"#{s['id']}  {s['label']}  ({n_pts} pts)",
+                f"#{s['id']}  {s['label']}  ({n_pts} 点)",
+            ))
             self.substrate_list.addItem(item)
 
     # Substrate node editing – called from pyNuD.py image click handlers

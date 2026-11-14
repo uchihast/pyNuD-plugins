@@ -18,6 +18,10 @@ if not __package__:
     adopt_legacy_entry(__name__, __file__)
 
 from PyQt5 import QtWidgets, QtCore, QtGui
+try:
+    from gui_i18n import QtWidgets
+except ImportError:  # 古い pyNuD 本体には gui_i18n が無い。そのときは元の Qt の部品で動く。
+    pass
 import matplotlib
 matplotlib.use('Qt5Agg')
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas

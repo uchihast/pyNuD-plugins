@@ -12,6 +12,10 @@ if not __package__:
 
 import sys
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QDesktopWidget, QPushButton, QFileDialog, QComboBox, QSpinBox, QSlider, QProgressBar, QMessageBox, QMenuBar, QAction, QTextEdit, QDialog, QDialogButtonBox, QTreeWidget, QTreeWidgetItem, QSplitter, QToolBar, QScrollArea
+try:
+    from gui_i18n import QMainWindow, QLabel, QPushButton, QComboBox, QSpinBox, QMessageBox, QMenuBar, QAction, QDialog, QDialogButtonBox
+except ImportError:  # 古い pyNuD 本体には gui_i18n が無い。そのときは元の Qt の部品で動く。
+    pass
 from PyQt5.QtCore import Qt, QDateTime, QSettings
 import os
 import vtk

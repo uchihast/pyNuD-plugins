@@ -5,10 +5,10 @@ Download **one ZIP per plugin** and import it in **pyNuD 2.13.0 or later** using
 必要なプラグインのZIPを個別にダウンロードし、**pyNuD 2.13.0以降 → Plugin → Import Plugin ZIP...** で読み込んでください。解凍は不要です。旧 `.py` 単体ファイルでは必要な専用モジュールが不足します。
 
 - For an extracted bundle, use **Load Plugin Folder...** and select the folder containing `plugin.json`. Keep that folder in place while using the plugin; folder loading uses it directly, whereas ZIP import installs a copy in pyNuD’s plugin storage.
-- **Interactive Drift Compensation, Reference Object Cropper and L-AFM Analysis 2026.10.20 require pyNuD 2.13.1 or later.** Update the host application and restart it before loading these ZIPs.
-- **今回の3プラグインにはpyNuD 2.13.1以降が必要です。** 本体を更新・再起動してから新しいZIPを読み込んでください。
+- **Plugin versions from 2026.11.14 require pyNuD 2.14.0 or later.** Update the host application and restart it before loading these ZIPs.
+- **2026.11.14版のプラグインにはpyNuD 2.14.0以降が必要です。** 本体を更新・再起動してから新しいZIPを読み込んでください。
 - Close the plugin and its AI review windows before importing an updated ZIP. Restart pyNuD after updating the host application.
-- **Each plugin has its own version**, shown below and in its window title. The `bundles-2026.10.20` release identifies this collection; it is not a shared plugin version or the application version.
+- **Each plugin has its own version**, shown below and in its window title. The `bundles-2026.11.14` release identifies this collection; it is not a shared plugin version or the application version.
 - Do not import GitHub's repository-wide **Source code (zip)** as a plugin.
 - Older `.py` downloads remain in [historical releases](https://github.com/uchihast/pyNuD-plugins/releases). Root-level `.py` files are frozen legacy copies retained for existing external links; they do not contain the new bundle updates. Use the ZIP downloads below.
 
@@ -16,19 +16,19 @@ Download **one ZIP per plugin** and import it in **pyNuD 2.13.0 or later** using
 
 | Plugin | Version | Updated | Download |
 |---|---|---|---|
-| AFM Movie Editor | 2026.10.1 | 2026-10-01 | [AFMMovieEditor.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/AFMMovieEditor.zip) |
-| Dwell Analysis | 2026.10.4 | 2026-10-04 | [DwellAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/DwellAnalysis.zip) |
-| Filament Analysis | 2026.10.1 | 2026-10-01 | [FilamentAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/FilamentAnalysis.zip) |
-| Interactive Drift Compensation | 2026.10.20 | 2026-10-20 | [InteractiveDriftCompensation.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/InteractiveDriftCompensation.zip) |
-| Kymograph | 2026.10.1 | 2026-10-01 | [Kymograph.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/Kymograph.zip) |
-| L-AFM Analysis | 2026.10.20 | 2026-10-20 | [LAFMAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/LAFMAnalysis.zip) |
-| Normal Mode Analysis | 2026.10.1 | 2026-10-01 | [NormalModeAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/NormalModeAnalysis.zip) |
-| Particle Analysis | 2026.10.4 | 2026-10-04 | [ParticleAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/ParticleAnalysis.zip) |
-| Particle Tracking | 2026.10.4 | 2026-10-04 | [ParticleTracking.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/ParticleTracking.zip) |
-| Reference Object Cropper | 2026.10.20 | 2026-10-20 | [ReferenceObjectCropper.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/ReferenceObjectCropper.zip) |
-| Simulator Bridge | 2026.10.1 | 2026-10-01 | [SimulatorBridge.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/SimulatorBridge.zip) |
-| Spot Analysis | 2026.10.1 | 2026-10-01 | [SpotAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/SpotAnalysis.zip) |
-| Particle Cluster Analysis | 2026.10.4 | 2026-10-04 | [particle_cluster_analysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/particle_cluster_analysis.zip) |
+| AFM Movie Editor | 2026.11.14.1 | 2026-11-14 | [AFMMovieEditor.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/AFMMovieEditor.zip) |
+| Dwell Analysis | 2026.11.14.1 | 2026-11-14 | [DwellAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/DwellAnalysis.zip) |
+| Filament Analysis | 2026.11.14.1 | 2026-11-14 | [FilamentAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/FilamentAnalysis.zip) |
+| Interactive Drift Compensation | 2026.11.14 | 2026-11-14 | [InteractiveDriftCompensation.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/InteractiveDriftCompensation.zip) |
+| Kymograph | 2026.11.14.1 | 2026-11-14 | [Kymograph.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/Kymograph.zip) |
+| L-AFM Analysis | 2026.11.14.1 | 2026-11-14 | [LAFMAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/LAFMAnalysis.zip) |
+| Normal Mode Analysis | 2026.11.14 | 2026-11-14 | [NormalModeAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/NormalModeAnalysis.zip) |
+| Particle Analysis | 2026.11.14.1 | 2026-11-14 | [ParticleAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/ParticleAnalysis.zip) |
+| Particle Tracking | 2026.11.14.1 | 2026-11-14 | [ParticleTracking.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/ParticleTracking.zip) |
+| Reference Object Cropper | 2026.11.14.1 | 2026-11-14 | [ReferenceObjectCropper.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/ReferenceObjectCropper.zip) |
+| Simulator Bridge | 2026.11.14 | 2026-11-14 | [SimulatorBridge.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/SimulatorBridge.zip) |
+| Spot Analysis | 2026.11.14.1 | 2026-11-14 | [SpotAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/SpotAnalysis.zip) |
+| Particle Cluster Analysis | 2026.11.14 | 2026-11-14 | [particle_cluster_analysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/particle_cluster_analysis.zip) |
 
 [Plugin index](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/plugin_index.json) · [SHA-256 checksums](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/SHA256SUMS.txt) · [Bundle guide](PLUGIN_BUNDLES.md) · [Release notes](RELEASE_NOTES.md)
 

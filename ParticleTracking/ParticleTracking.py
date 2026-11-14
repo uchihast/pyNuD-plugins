@@ -48,6 +48,12 @@ HELP_HTML_EN = """
     the specified 1-based frames and relinks the whole movie, so IDs may change. Click
     <strong>Apply to Particle Tracking</strong> to use the result with Track Editor and Export CSV.
     No ASD is written. AI sees sampled image panels and numerical summaries; its choices still require review.</p>
+    <h2>Local appearance and contact tracking</h2>
+    <p>After Detect All Frames, choose <strong>Appearance + Contact (local)</strong> and Track Particles.
+    Clear isolated observations build multiple appearance references. Contact episodes are checked
+    against isolated observations before and after contact. Yellow observations require review;
+    missing coordinates are never interpolated. This numerical method needs no AI account.
+    The predictive variant adds constant-velocity prediction for suitable motion.</p>
     <h2>Main Features</h2>
     <div class="feature-box">
         <h3>Particle Detection</h3>
@@ -87,8 +93,8 @@ HELP_HTML_EN = """
         <p>Three powerful tracking algorithms:</p>
         <ul>
             <li><strong>Trackpy (Simple Linker):</strong> Simple nearest neighbor linking</li>
-            <li><strong>Simple LAP Tracker (SciPy):</strong> Linear Assignment Problem solver for optimal linking</li>
-            <li><strong>Kalman Filter (filterpy):</strong> Predictive tracking with noise filtering</li>
+            <li><strong>Simple LAP Tracker (SciPy):</strong> Prefer the most links within Max Distance, then minimize their total physical distance.</li>
+            <li><strong>Kalman Filter (filterpy):</strong> Predictive tracking with the same link-count-first assignment.</li>
         </ul>
     </div>
     <div class="feature-box">
@@ -167,6 +173,11 @@ HELP_HTML_JA = """
     <ul>
         <li><strong>プラグイン:</strong> Load Plugin Folder... → <code>plugins/ParticleTracking/</code> を選択し、Plugin → Particle Tracking で開く</li>
     </ul>
+    <h2>外観と接触前後を使うローカルトラッキング</h2>
+    <p>Detect All Framesの後、<strong>Appearance + Contact (local)</strong>を選び、Track Particlesで実行します。
+    明瞭に分離した複数の観測像を参照し、接触前後の区間からIDを再確認します。
+    黄色の観測は要確認です。欠測座標は補間しません。AIアカウントや外部アプリは不要です。
+    Predictive版は等速運動の予測を追加するため、運動に合う場合に選んでください。</p>
     <h2>主な機能</h2>
     <div class="feature-box">
         <h3>粒子検出</h3>
@@ -203,8 +214,8 @@ HELP_HTML_JA = """
         <h3>トラッキングアルゴリズム</h3>
         <ul>
             <li><strong>Trackpy (Simple Linker):</strong> 最近傍リンク</li>
-            <li><strong>Simple LAP Tracker (SciPy):</strong> 線形割り当てで最適リンク</li>
-            <li><strong>Kalman Filter (filterpy):</strong> ノイズフィルタ付き予測トラッキング</li>
+            <li><strong>Simple LAP Tracker (SciPy):</strong> Max Distance 内のリンク本数を優先し、その中で総移動距離を最小化します。</li>
+            <li><strong>Kalman Filter (filterpy):</strong> 予測位置を使い、同じ本数優先の割当てを行います。</li>
         </ul>
     </div>
     <div class="feature-box">
@@ -275,8 +286,18 @@ HELP_HTML_JA = """
 """
 
 
+import helperFunctions as hf
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
+try:
+    from gui_i18n import QtWidgets
+except ImportError:  # 古い pyNuD 本体には gui_i18n が無い。そのときは元の Qt の部品で動く。
+    pass
+try:
+    from gui_i18n import pick_text
+except ImportError:  # 古い本体には pick_text が無い
+    def pick_text(en, ja):
+        return en
 import cv2
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
@@ -811,31 +832,59 @@ class SpotDetector:
             # 2Dガウシアンフィッティング
             from scipy.optimize import curve_fit
             
-            # 座標グリッドの作成
-            y_coords, x_coords = np.mgrid[y_min:y_max, x_min:x_max]
-            data = image[y_min:y_max, x_min:x_max]
+            # 座標グリッドの作成。窓の左上を原点とする相対座標にし、初期値・境界・
+            # 戻り値も同じ座標系にそろえる。curve_fit にはデータと同じ 1 次元で渡す
+            # （2 次元のまま渡すと形状が合わず、毎回例外になって整数座標に戻っていた）。
+            data = np.asarray(image[y_min:y_max, x_min:x_max], dtype=np.float64)
+            if not np.all(np.isfinite(data)):
+                return float(x), float(y)
+            y_coords, x_coords = np.mgrid[0:data.shape[0], 0:data.shape[1]]
+            xy = (x_coords.ravel().astype(np.float64), y_coords.ravel().astype(np.float64))
             
             # 初期パラメータ
-            amplitude = np.max(data)
-            x0, y0 = x - x_min, y - y_min
+            offset = float(np.min(data))
+            amplitude = float(np.max(data)) - offset
+            if amplitude <= 0:
+                return float(x), float(y)
+            x0, y0 = float(x - x_min), float(y - y_min)
             sigma = max(1.0, self.radius / 2.0)  # 粒子半径に基づくsigma
-            offset = np.min(data)
             
             # 2Dガウシアン関数
             def gaussian_2d(xy, amplitude, x0, y0, sigma, offset):
-                x, y = xy
-                return amplitude * np.exp(-((x - x0)**2 + (y - y0)**2) / (2 * sigma**2)) + offset
+                gx, gy = xy
+                return amplitude * np.exp(-((gx - x0)**2 + (gy - y0)**2) / (2 * sigma**2)) + offset
+            
+            # 解析的なヤコビアン（数値微分より速い。粒子数 × フレーム数だけ呼ばれる）
+            def gaussian_2d_jac(xy, amplitude, x0, y0, sigma, offset):
+                gx, gy = xy
+                dx = gx - x0
+                dy = gy - y0
+                shape = np.exp(-(dx**2 + dy**2) / (2 * sigma**2))
+                scaled = amplitude * shape
+                return np.column_stack((
+                    shape,
+                    scaled * dx / sigma**2,
+                    scaled * dy / sigma**2,
+                    scaled * (dx**2 + dy**2) / sigma**3,
+                    np.ones_like(shape),
+                ))
             
             # フィッティング
             try:
-                popt, _ = curve_fit(gaussian_2d, (x_coords, y_coords), data.flatten(),
+                popt, _ = curve_fit(gaussian_2d, xy, data.ravel(),
                                   p0=[amplitude, x0, y0, sigma, offset],
+                                  jac=gaussian_2d_jac,
                                   bounds=([0, 0, 0, 0.5, -np.inf], 
-                                         [np.inf, x_max-x_min, y_max-y_min, np.inf, np.inf]))
+                                         [np.inf, data.shape[1] - 1, data.shape[0] - 1, np.inf, np.inf]))
                 
                 # 精密化された座標
                 refined_x = x_min + popt[1]
                 refined_y = y_min + popt[2]
+                
+                # 検出した整数ピークから大きく離れた解は、フィットの失敗として採用しない
+                if (not np.isfinite(refined_x) or not np.isfinite(refined_y)
+                        or abs(refined_x - x) > window_size or abs(refined_y - y) > window_size):
+                    return float(x), float(y)
                 
                 # 座標が画像範囲内にあることを確認
                 refined_x = max(0, min(image.shape[1]-1, refined_x))
@@ -907,11 +956,11 @@ class SpotDetector:
                 coordinates = coordinates  # そのまま使用
             else:
                 # 従来の強度比チェック
+                mean_intensity = np.mean(processed_image)
                 for coord in coordinates:
                     y, x = coord
                     # 元の画像での強度をチェック（閾値チェックは既にpeak_local_maxで完了）
                     original_intensity = processed_image[y, x]
-                    mean_intensity = np.mean(processed_image)
                     
                     # UIのMin intensity ratioを使用
                     min_intensity_ratio = getattr(self, 'min_intensity_ratio', 1.0)
@@ -1263,6 +1312,24 @@ class SpotDetector:
             print(f"[ERROR] FWHM filtering failed: {e}")
             return particles
 
+def _maximum_cardinality_assignment(costs, max_cost):
+    """Prefer the most gated links, then minimize their total distance."""
+    from scipy.optimize import linear_sum_assignment
+    costs = np.asarray(costs, dtype=float)
+    rows, columns = costs.shape
+    if not rows or not columns:
+        return np.empty(0, int), np.empty(0, int)
+    # Each row has a private unmatched option. One additional valid link saves
+    # more than the largest possible change in the sum of all valid costs.
+    limit = min(rows, columns) + 1.
+    augmented = np.full((rows, columns + rows), limit)
+    valid = np.isfinite(costs) & (costs <= max_cost)
+    augmented[:, :columns] = np.where(valid, costs / max(float(max_cost), 1e-300), np.inf)
+    r, c = linear_sum_assignment(augmented)
+    linked = c < columns
+    return r[linked], c[linked]
+
+
 class ParticleLinker:
     """粒子リンククラス"""
     
@@ -1281,7 +1348,7 @@ class ParticleLinker:
         
         # 各フレームの粒子を処理
         for frame_idx in sorted(particles_by_frame.keys()):
-            current_particles = particles_by_frame[frame_idx]
+            current_particles = list(particles_by_frame[frame_idx])
             
             # 既存のトラックを更新
             for track in tracks:
@@ -1516,7 +1583,12 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
         right_scroll.setWidget(right_panel)
         layout.addWidget(right_scroll)
         
-        top_layout.addWidget(content_widget)
+        top_layout.addWidget(content_widget, 1)
+
+        # These three panes already scroll independently. The application-wide
+        # wrapper clears their width hints and collapses both sidebars to zero.
+        from panel_scrolling import use_existing_scrolling
+        use_existing_scrolling(self)
         
         # ウィンドウがアクティブになった時にキャンバスにフォーカスを設定
         self.focusInEvent = self.onFocusInEvent
@@ -1603,7 +1675,7 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
         self.ai_button.clicked.connect(self.openAIProcessing)
         self.ai_button.setMinimumHeight(30)
         content_layout.addWidget(self.ai_button)
-        
+
         # 前処理グループ（AFMデータ用に簡素化）
         preprocess_group = QtWidgets.QGroupBox("Preprocessing")
         preprocess_group.setStyleSheet("QGroupBox { font-weight: bold; }")
@@ -1879,14 +1951,17 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
             "Trackpy (Simple Linker)", 
             "Simple LAP Tracker (SciPy)",
             "Kalman Filter (filterpy)",
-            "AI LAP (appearance)",
-            "AI Predictive LAP (appearance)",
+            "Appearance + Contact (local)",
+            "Predictive Appearance + Contact (local)",
             "AI Agent result"
         ])
+        self.tracking_algo_combo.setCurrentText("Appearance + Contact (local)")
         self.tracking_algo_combo.setToolTip(
             "Trackpy: Simple nearest neighbor linking / 単純な最近傍リンク\n"
             "LAP Tracker: Linear Assignment Problem solver / 線形割り当て問題ソルバー\n"
-            "Kalman Filter: Predictive tracking with noise filtering / ノイズフィルタリング付き予測トラッキング"
+            "Kalman Filter: Predictive tracking with noise filtering / ノイズフィルタリング付き予測トラッキング\n"
+            "Appearance + Contact: Multiple clear references and contact verification; no AI required / 外観参照と接触前後の照合・AI不要\n"
+            "Predictive Appearance + Contact: Also predicts constant velocity / 等速運動予測も利用"
         )
         algo_layout.addWidget(algo_label)
         algo_layout.addWidget(self.tracking_algo_combo)
@@ -2065,7 +2140,7 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
             from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
             
             # FigureとCanvasの作成
-            self.preview_figure = Figure(figsize=(8, 6))
+            self.preview_figure = Figure(figsize=(8, 6), constrained_layout=True)
             self.preview_canvas = FigureCanvas(self.preview_figure)
             self.preview_axes = self.preview_figure.add_subplot(111)
             
@@ -2094,6 +2169,7 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
         
         # 画像下のナビゲーション
         bottom_nav_layout = QtWidgets.QHBoxLayout()
+        bottom_nav_layout.setSpacing(4)
         
         # 左右矢印ボタン
         self.prev_button = QtWidgets.QPushButton("← Previous")
@@ -2105,9 +2181,11 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
         self.bottom_frame_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.bottom_frame_slider.setMinimum(0)
         self.bottom_frame_slider.setMaximum(0)
-        self.bottom_frame_slider.setFixedWidth(200)
+        self.bottom_frame_slider.setMinimumWidth(0)
+        self.bottom_frame_slider.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+                                              QtWidgets.QSizePolicy.Fixed)
         self.bottom_frame_slider.valueChanged.connect(self.onBottomFrameSliderChanged)
-        bottom_nav_layout.addWidget(self.bottom_frame_slider)
+        bottom_nav_layout.addWidget(self.bottom_frame_slider, 1)
         
         self.next_button = QtWidgets.QPushButton("Next →")
         self.next_button.clicked.connect(self.nextFrame)
@@ -2771,6 +2849,7 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
         
         # 現在のファイル番号を保存
         current_file_num = gv.currentFileNum
+        current_frame = gv.index
         
                 # 各フレームで粒子検出を実行
         for frame_idx in range(gv.FrameNum):
@@ -2789,10 +2868,16 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
             
             # フレームを変更
             gv.index = frame_idx
-            if hasattr(self.main_window, 'frameSlider'):
-                self.main_window.frameSlider.setValue(frame_idx)
-            if hasattr(self.main_window, 'updateFrame'):
-                self.main_window.updateFrame()
+            hidden = getattr(self.main_window, 'updateFrameHidden', None)
+            if callable(hidden):
+                hidden()
+            else:
+                if hasattr(self.main_window, 'frameSlider'):
+                    blocker = QtCore.QSignalBlocker(self.main_window.frameSlider)
+                    self.main_window.frameSlider.setValue(frame_idx)
+                    del blocker
+                if hasattr(self.main_window, 'updateFrame'):
+                    self.main_window.updateFrame()
             
             # データを取得
             if not self.initializeData():
@@ -2899,21 +2984,18 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
         
         # 元のフレームに戻す
         gv.currentFileNum = current_file_num
-        gv.index = 0
+        gv.index = current_frame
         if hasattr(self.main_window, 'frameSlider'):
-            self.main_window.frameSlider.setValue(0)
+            blocker = QtCore.QSignalBlocker(self.main_window.frameSlider)
+            self.main_window.frameSlider.setValue(current_frame)
+            del blocker
         if hasattr(self.main_window, 'updateFrame'):
             self.main_window.updateFrame()
         
-        # 現在のフレームインデックスを0に設定
-        self.current_frame_index = 0
-        
-        # データを再初期化してフレーム0のデータを取得
-        
-        
-        # フレーム0の粒子データを設定
-        if 0 in self.particles_by_frame:
-            particles = self.particles_by_frame[0]
+        self.current_frame_index = current_frame
+        self.initializeData()
+        if current_frame in self.particles_by_frame:
+            particles = self.particles_by_frame[current_frame]
             #print(f"DEBUG: Setting particles for frame 0, found {len(particles)} particles")
             self.detected_particles = particles
         else:
@@ -2969,6 +3051,7 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
         self.track_progress.setRange(0, 100)
         self.track_progress.setValue(0)
 
+        previous_tracks, previous_detections = getattr(self, 'tracks_df', None), self.particles_by_frame
         self.tracks_df = None
         algorithm = self.tracking_algo_combo.currentText()
 
@@ -2982,15 +3065,18 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
                 self._track_with_scipy_lap()
             elif algorithm == "Kalman Filter (filterpy)":
                 self._track_with_kalman()
-            elif algorithm in ("AI LAP (appearance)", "AI Predictive LAP (appearance)"):
+            elif algorithm in ("Appearance + Contact (local)", "Predictive Appearance + Contact (local)"):
                 indices = sorted(self.frame_data_by_frame)
                 if not indices or indices != list(range(len(indices))):
                     raise ValueError('Detect all frames before linking.')
                 frames = [self.frame_data_by_frame[i] for i in indices]
                 px = (self.scan_size_x / frames[0].shape[1], self.scan_size_y / frames[0].shape[0])
-                self.particles_by_frame, self.tracks_df = ai_link_particles(
+                def local_progress(percent):
+                    self.track_progress.setValue(percent)
+                    QtWidgets.QApplication.processEvents()
+                self.particles_by_frame, self.tracks_df = link_particles_with_appearance(
                     frames, self.particles_by_frame, ai_panel_settings(self), px,
-                    lambda: self.tracking_cancelled)
+                    lambda: self.tracking_cancelled or getattr(gv, 'cancel_operation', False), local_progress)
                 self.detected_particles = self.particles_by_frame.get(int(getattr(gv, 'index', 0)), [])
             else:
                 print(f"[ERROR] Unknown algorithm: {algorithm}")
@@ -3002,13 +3088,24 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
                 return
 
             if self.tracks_df is None or self.tracks_df.empty:
-                QtWidgets.QMessageBox.information(self, "Tracking Complete", "Tracking completed, but no valid tracks were found with the current parameters.")
+                QtWidgets.QMessageBox.information(
+                    self,
+                    pick_text("Tracking Complete", "追跡完了"),
+                    pick_text(
+                        "Tracking completed, but no valid tracks were found with the current parameters.",
+                        "追跡は完了しましたが、現在のパラメーターでは有効な軌跡が見つかりませんでした。",
+                    ),
+                )
                 self.tracks_df = None
             else:
-                QtWidgets.QMessageBox.information(
-                    self, "Tracking Complete",
-                    f"Tracking completed. Found {self.tracks_df['particle'].nunique()} tracks using {algorithm}."
-                )
+                n_tracks = self.tracks_df["particle"].nunique()
+                done_en = f"Tracking completed. Found {n_tracks} tracks using {algorithm}."
+                done_ja = f"追跡が完了しました。{algorithm} で {n_tracks} 本の軌跡が見つかりました。"
+                if "review_required" in self.tracks_df:
+                    n_review = int(self.tracks_df.review_required.sum())
+                    done_en += f"\n{n_review} observations require review (yellow)."
+                    done_ja += f"\n確認が必要な観測が {n_review} 件あります（黄）。"
+                QtWidgets.QMessageBox.information(self, pick_text("Tracking Complete", "追跡完了"), pick_text(done_en, done_ja))
 
             self.updateStatistics()
             self.updateTracksTable()
@@ -3018,15 +3115,25 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
 
         except Exception as e:
             # キャンセルによる例外の場合は特別処理
+            if algorithm in ("Appearance + Contact (local)", "Predictive Appearance + Contact (local)"):
+                self.tracks_df, self.particles_by_frame = previous_tracks, previous_detections
             if "cancelled" in str(e).lower():
                 #print(f"DEBUG: Tracking cancelled via exception: {e}")
                 return
-            QtWidgets.QMessageBox.critical(self, "Error", f"An error occurred during tracking with {algorithm}:\n{e}")
+            QtWidgets.QMessageBox.critical(
+                self,
+                pick_text("Error", "エラー"),
+                pick_text(
+                    f"An error occurred during tracking with {algorithm}:\n{e}",
+                    f"{algorithm} による追跡中にエラーが発生しました:\n{e}",
+                ),
+            )
             import traceback
             traceback.print_exc()
         finally:
             # キャンセルされた場合の処理
-            if hasattr(self, 'tracking_cancelled') and self.tracking_cancelled:
+            if (hasattr(self, 'tracking_cancelled') and self.tracking_cancelled and
+                    algorithm not in ("Appearance + Contact (local)", "Predictive Appearance + Contact (local)")):
                 #print("DEBUG: Tracking was cancelled, cleaning up...")
                 self.tracks_df = None  # キャンセル時は結果をクリア
             
@@ -3074,6 +3181,7 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
     
     def _track_with_trackpy(self):
         """Trackpyを使用してトラッキング"""
+        import sys
         if not TRACKPY_AVAILABLE:
             print("Warning: trackpy not available, using fallback tracking method")
             _frozen = getattr(sys, "frozen", False)
@@ -3318,7 +3426,8 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
         
         # フィルタリング済みの粒子のみを使用
         particles = self.detected_particles
-        if getattr(self, '_ai_input_source', None):
+        if (getattr(self, '_ai_input_source', None) or
+                (getattr(self, 'tracks_df', None) is not None and 'identity_status' in self.tracks_df)):
             # Draw reviewed observations without another size-filter pass.
             from matplotlib.patches import Rectangle
             for item in list(self.preview_axes.lines) + list(self.preview_axes.patches) + list(self.preview_axes.texts):
@@ -3328,7 +3437,11 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
             selected = tracks[tracks.frame == int(getattr(gv, 'index', 0))] if tracks is not None else pd.DataFrame()
             flagged = set(selected.loc[selected.review_required, 'particle']) if 'review_required' in selected else set()
             for number, particle in enumerate(particles, 1):
-                color = {'red': 'red', 'green': 'lime', 'yellow': 'yellow'}[ai_observation_color(particle, flagged)]
+                if getattr(self, '_ai_input_source', None):
+                    color = {'red': 'red', 'green': 'lime', 'yellow': 'yellow'}[ai_observation_color(particle, flagged)]
+                else:
+                    color = ('yellow' if particle.size_unresolved or particle.track_id is None or
+                             particle.track_id in flagged else 'lime')
                 x, y = particle.x * px[0], particle.y * px[1]
                 marker, = self.preview_axes.plot(x, y, marker='+', color=color, markersize=8)
                 marker._ai_observation = True
@@ -3869,24 +3982,13 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
         # 全トラックを取得
         all_tracks = sorted(self.tracks_df['particle'].unique())
         
-        # 各トラックの開始時間と終了時間を計算
-        track_times = {}
-        for track_id in all_tracks:
-            track_data = self.tracks_df[self.tracks_df['particle'] == track_id]
-            start_frame = track_data['frame'].min()
-            end_frame = track_data['frame'].max()
-            track_times[track_id] = {
-                'start_frame': start_frame,
-                'end_frame': end_frame,
-                'start_time': start_frame * frame_time,
-                'end_time': end_frame * frame_time
-            }
-        
-        # 全フレーム範囲を計算（すべてのトラックをカバー）
-        all_start_frames = [track_times[track_id]['start_frame'] for track_id in all_tracks]
-        all_end_frames = [track_times[track_id]['end_frame'] for track_id in all_tracks]
-        global_start_frame = min(all_start_frames) if all_start_frames else 0
-        global_end_frame = max(all_end_frames) if all_end_frames else 0
+        # Preserve the first observation for duplicate (frame, particle) keys.
+        observations = {}
+        for observation in self.tracks_df.itertuples(index=False):
+            observations.setdefault((observation.frame, observation.particle), observation)
+        has_identity = 'identity_status' in self.tracks_df
+        global_start_frame = self.tracks_df['frame'].min() if all_tracks else 0
+        global_end_frame = self.tracks_df['frame'].max() if all_tracks else 0
         all_frames = list(range(global_start_frame, global_end_frame + 1))
         
         # ヘッダー行を作成
@@ -3901,7 +4003,8 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
         # 2行目: データ種別ヘッダー
         data_header = ['Time (s)', 'Frame']  # A列、B列
         for track_id in all_tracks:
-            data_header.extend(['X (nm)', 'Y (nm)', ''])  # C,D列とE列（空白）
+            data_header.extend(['X (nm)', 'Y (nm)',
+                                'Identity status' if 'identity_status' in self.tracks_df else ''])
         headers.append(data_header)
         
         # データ行を作成
@@ -3913,21 +4016,22 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
             
             for track_id in all_tracks:
                 # このフレームでこのトラックのデータがあるかチェック
-                track_data = self.tracks_df[
-                    (self.tracks_df['frame'] == frame) & 
-                    (self.tracks_df['particle'] == track_id)
-                ]
+                observation = observations.get((frame, track_id))
                 
-                if not track_data.empty:
+                if observation is not None:
                     # データがある場合（最初のデータを使用）
-                    x_coord = track_data.iloc[0]['x']
-                    y_coord = track_data.iloc[0]['y']
+                    x_coord = observation.x
+                    y_coord = observation.y
                     
                     # ピクセル座標を物理座標（nm）に変換
                     if getattr(self, '_ai_input_source', None):
                         shape = self.frame_data_by_frame[int(frame)].shape
                         x_nm = x_coord * self._ai_scan_size[0] / shape[1]
                         y_nm = y_coord * self._ai_scan_size[1] / shape[0]
+                    elif 'identity_status' in self.tracks_df:
+                        shape = self.frame_data_by_frame[int(frame)].shape
+                        x_nm = x_coord * self.scan_size_x / shape[1]
+                        y_nm = y_coord * self.scan_size_y / shape[0]
                     elif hasattr(gv, 'XScanSize') and hasattr(gv, 'YScanSize') and hasattr(gv, 'XPixel') and hasattr(gv, 'YPixel'):
                         nm_per_pixel_x = gv.XScanSize / gv.XPixel
                         nm_per_pixel_y = gv.YScanSize / gv.YPixel
@@ -3938,7 +4042,10 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
                         x_nm = x_coord
                         y_nm = y_coord
                     
-                    row.extend([f"{x_nm:.2f}", f"{y_nm:.2f}", ''])  # C,D列とE列（空白）
+                    status = (f"{observation.identity_status}; review={int(observation.review_required)}; "
+                              f"corrected={int(observation.identity_corrected)}"
+                              if has_identity else '')
+                    row.extend([f"{x_nm:.2f}", f"{y_nm:.2f}", status])
                 else:
                     # データがない場合
                     row.extend(['', '', ''])  # C,D列とE列（空白）
@@ -4142,7 +4249,7 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
         """ウィンドウ設定の読み込み"""
         if 'ParticleTrackingWindow' in gv.windowSettings:
             settings = gv.windowSettings['ParticleTrackingWindow']
-            self.setGeometry(settings['x'], settings['y'], settings['width'], settings['height'])
+            hf.restore_saved_window_geometry(self, settings, legacy_position='client')
             
             # 表示設定を読み込み
             if 'show_tracks' in settings:
@@ -4155,23 +4262,24 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
         if 'ParticleTrackingWindow' not in gv.windowSettings:
             gv.windowSettings['ParticleTrackingWindow'] = {}
         
-        geometry = self.geometry()
+        geometry = hf.window_frame_rect(self)
         gv.windowSettings['ParticleTrackingWindow'].update({
             'x': geometry.x(),
             'y': geometry.y(),
             'width': geometry.width(),
-            'height': geometry.height(),
+            'height': geometry.height(), 'position_kind': 'frame',
             'show_tracks': self.show_tracks_check.isChecked(),
             'show_track_ids': self.show_track_ids_check.isChecked()
         })
     
     def closeEvent(self, event):
         """ウィンドウが閉じられる時の処理"""
-        dialog = getattr(self, '_particle_ai_dialog', None)
-        if dialog is not None:
-            if dialog.busy:
-                dialog.cancel(); event.ignore(); return
-            dialog.close()
+        for name in ('_particle_ai_dialog',):
+            dialog = getattr(self, name, None)
+            if dialog is not None:
+                if dialog.busy:
+                    dialog.cancel(); event.ignore(); return
+                dialog.close()
         self.saveWindowSettings()
         
         # プラグインとして開いた場合のツールバーアクションのハイライトを解除
@@ -4730,6 +4838,7 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
         frame_data = self.frame_data_by_frame[0]
         pixel_size_x = scan_size_x / frame_data.shape[1]; pixel_size_y = scan_size_y / frame_data.shape[0]
         max_dist_sq_px = (max_distance_nm / min(pixel_size_x, pixel_size_y)) ** 2
+        distance_scale = np.array([pixel_size_x, pixel_size_y]) / min(pixel_size_x, pixel_size_y)
         
         #print(f"[DEBUG] Pixel sizes: x={pixel_size_x:.6f}, y={pixel_size_y:.6f} nm/pixel")
         #print(f"[DEBUG] Max distance squared: {max_dist_sq_px:.2f} pixels²")
@@ -4793,17 +4902,11 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
             current_particle_coords = [[p.x, p.y] for p in current_particles]
             
             # コスト（距離の2乗）マトリックスを作成
-            cost_matrix = cdist(np.array(track_ends), np.array(current_particle_coords), 'sqeuclidean')
+            cost_matrix = cdist(np.array(track_ends) * distance_scale,
+                                np.array(current_particle_coords) * distance_scale, 'sqeuclidean')
             #print(f"[DEBUG] Frame {frame_idx}: Cost matrix shape {cost_matrix.shape}")
 
-            # ▼▼▼▼▼ ここが修正点 ▼▼▼▼▼
-            # 距離が閾値を超えるリンクのコストを、無限大ではなく閾値より少し大きい値に設定
-            # これによりソルバーが常に解を見つけられるようにする
-            cost_matrix[cost_matrix > max_dist_sq_px] = max_dist_sq_px + 1
-            # ▲▲▲▲▲ 修正ここまで ▲▲▲▲▲
-
-            # LAPを解く
-            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            row_ind, col_ind = _maximum_cardinality_assignment(np.sqrt(cost_matrix), np.sqrt(max_dist_sq_px))
             #print(f"[DEBUG] Frame {frame_idx}: LAP solved, {len(row_ind)} assignments found")
 
             # 実際に閾値以下の有効なリンクのみを処理
@@ -4894,12 +4997,15 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
         # ピクセルサイズ計算
         scan_size_x = getattr(gv, 'XScanSize', 1000.0); scan_size_y = getattr(gv, 'YScanSize', 1000.0)
         frame_data = self.frame_data_by_frame[0]
-        pixel_size = min(scan_size_x / frame_data.shape[1], scan_size_y / frame_data.shape[0])
+        pixel_sizes = np.array([scan_size_x / frame_data.shape[1], scan_size_y / frame_data.shape[0]])
+        pixel_size = min(pixel_sizes)
+        distance_scale = pixel_sizes / pixel_size
         max_dist_sq = (max_distance_nm / pixel_size) ** 2
 
         # --- トラッキングロジック ---
         next_track_id = 0
         active_tracks = [] # [ {id, kf, points, age, misses}, ... ]
+        finished_tracks = []  # 見失って追跡を終えた軌跡（結果には残す）
 
         sorted_frames = sorted(self.particles_by_frame.keys())
         total_frames = len(sorted_frames)
@@ -4932,6 +5038,12 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
             # 2. 割り当てステップ
             measurements = self.particles_by_frame.get(frame_idx, [])
             if not active_tracks or not measurements:
+                # 観測が 1 個も無いフレームも「見失い」として数える。
+                # 数えないと Max Frame Gap を超えた空白をまたいで軌跡がつながる。
+                for track in active_tracks:
+                    track['misses'] += 1
+                finished_tracks.extend(t for t in active_tracks if t['misses'] > max_frame_gap)
+                active_tracks = [t for t in active_tracks if t['misses'] <= max_frame_gap]
                 # 新しいトラックを開始
                 for p in measurements:
                     kf = KalmanFilter(dim_x=4, dim_z=2) # 状態(x,y,vx,vy), 観測(x,y)
@@ -4950,10 +5062,10 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
             predicted_pos = np.array([track['kf'].x[:2] for track in active_tracks])
             measured_pos = np.array([[p.x, p.y] for p in measurements])
             
-            cost_matrix = cdist(predicted_pos, measured_pos, 'sqeuclidean')
-            cost_matrix[cost_matrix > max_dist_sq] = max_dist_sq + 1
-
-            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            # Calibrate only the distance metric; keep the existing pixel-space
+            # Kalman state/noise model, and identical behavior for square pixels.
+            cost_matrix = cdist(predicted_pos * distance_scale, measured_pos * distance_scale, 'sqeuclidean')
+            row_ind, col_ind = _maximum_cardinality_assignment(np.sqrt(cost_matrix), np.sqrt(max_dist_sq))
             
             # 3. 更新ステップ
             matched_track_indices = set()
@@ -4974,7 +5086,8 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
                 if i not in matched_track_indices:
                     track['misses'] += 1
             
-            # 見失ったトラックを削除
+            # 見失ったトラックは追跡対象から外すが、それまでの軌跡は結果に残す
+            finished_tracks.extend(t for t in active_tracks if t['misses'] > max_frame_gap)
             active_tracks = [t for t in active_tracks if t['misses'] <= max_frame_gap]
             
             # マッチしなかった観測から新しいトラックを開始
@@ -4987,7 +5100,7 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
 
         # 最終的な後処理
         final_tracks_list = []
-        for track in active_tracks:
+        for track in sorted(finished_tracks + active_tracks, key=lambda t: t['id']):
             if track['age'] >= min_track_length:
                 for point in track['points']:
                     point['particle'] = track['id']
@@ -5050,7 +5163,7 @@ class ParticleTrackingWindow(QtWidgets.QWidget):
     def on_tracks_edited(self, updated_tracks_df):
         """編集された軌跡データを受け取り、UIを更新する"""
         self.tracks_df = updated_tracks_df
-        if getattr(self, '_ai_input_source', None):
+        if getattr(self, '_ai_input_source', None) or 'identity_status' in updated_tracks_df:
             # Keep marker IDs consistent with manual splitting, merging or removal.
             for frame, particles in self.particles_by_frame.items():
                 rows = updated_tracks_df[updated_tracks_df.frame == frame]
@@ -5299,8 +5412,11 @@ class TrackSchemeWindow(QtWidgets.QWidget):
         
         # 確認ダイアログを表示
         reply = QtWidgets.QMessageBox.question(
-            self, "Delete Track", 
-            f"Are you sure you want to delete Track {track_id_to_delete}?",
+            self, pick_text("Delete Track", "軌跡の削除"),
+            pick_text(
+                f"Are you sure you want to delete Track {track_id_to_delete}?",
+                f"軌跡 {track_id_to_delete} を削除しますか？",
+            ),
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.No
         )
@@ -5337,22 +5453,30 @@ class TrackSchemeWindow(QtWidgets.QWidget):
         
         if not available_tracks:
             QtWidgets.QMessageBox.information(
-                self, "No Mergeable Tracks", 
-                f"No tracks available for merging with Track {track_id_to_merge}.\n"
-                "Tracks must not have overlapping frames."
+                self, pick_text("No Mergeable Tracks", "結合できる軌跡がありません"),
+                pick_text(
+                    f"No tracks available for merging with Track {track_id_to_merge}.\n"
+                    "Tracks must not have overlapping frames.",
+                    f"軌跡 {track_id_to_merge} と結合できる軌跡がありません。\n"
+                    "フレームが重なる軌跡は結合できません。",
+                ),
             )
             return
         
         # 結合する軌跡を選択するダイアログ
+        track_names = [f"Track {tid}" for tid in available_tracks]
         track_list, ok = QtWidgets.QInputDialog.getItem(
-            self, "Select Track to Merge", 
-            f"Select a track to merge with Track {track_id_to_merge}:",
-            [f"Track {tid}" for tid in available_tracks], 0, False
+            self, pick_text("Select Track to Merge", "結合する軌跡"),
+            pick_text(
+                f"Select a track to merge with Track {track_id_to_merge}:",
+                f"軌跡 {track_id_to_merge} と結合する軌跡を選んでください:",
+            ),
+            track_names, 0, False
         )
         
         if ok and track_list:
             # 選択された軌跡IDを取得
-            selected_track_id = available_tracks[track_list.index(track_list)]
+            selected_track_id = available_tracks[track_names.index(track_list)]
             
             # 結合実行
             self.tracks_df.loc[self.tracks_df['particle'] == selected_track_id, 'particle'] = track_id_to_merge
@@ -5369,19 +5493,19 @@ class TrackSchemeWindow(QtWidgets.QWidget):
         """ウィンドウ設定の読み込み"""
         if 'TrackSchemeWindow' in gv.windowSettings:
             settings = gv.windowSettings['TrackSchemeWindow']
-            self.setGeometry(settings['x'], settings['y'], settings['width'], settings['height'])
+            hf.restore_saved_window_geometry(self, settings, legacy_position='client')
     
     def saveWindowSettings(self):
         """ウィンドウ設定の保存"""
         if 'TrackSchemeWindow' not in gv.windowSettings:
             gv.windowSettings['TrackSchemeWindow'] = {}
         
-        geometry = self.geometry()
+        geometry = hf.window_frame_rect(self)
         gv.windowSettings['TrackSchemeWindow'].update({
             'x': geometry.x(),
             'y': geometry.y(),
             'width': geometry.width(),
-            'height': geometry.height()
+            'height': geometry.height(), 'position_kind': 'frame'
         })
     
     def closeEvent(self, event):
@@ -5457,7 +5581,7 @@ def ai_panel_settings(owner):
         size_filter_enabled=owner.size_filter_check.isChecked(), size_tolerance=owner.size_tolerance_spin.value(),
         selection_radius=owner.selection_radius_spin.value(), area_method=owner.area_method_combo.currentText(),
         watershed_compactness=owner.watershed_compactness_spin.value(), watershed_threshold=owner.watershed_threshold_spin.value(),
-        link_method='lap' if owner.tracking_algo_combo.currentText() == 'AI LAP (appearance)' else 'predictive_lap',
+        link_method='lap' if owner.tracking_algo_combo.currentText() == 'Appearance + Contact (local)' else 'predictive_lap',
         max_distance_nm=owner.max_distance_spin.value(),
         max_frame_gap=owner.max_frame_gap_spin.value(), min_track_length=owner.min_track_length_spin.value()))
 
@@ -5528,23 +5652,189 @@ def ai_descriptor(image, particle):
 
 
 def ai_link_particles(frames, detections, settings, pixel_size, cancelled=lambda: False):
-    """One-to-one physical-distance/appearance LAP with births and bounded gaps.
+    """Compatibility entry point shared by AI initial detection and local tracking."""
+    return link_particles_with_appearance(frames, detections, settings, pixel_size, cancelled)
 
-    Unobserved frames are never filled with invented coordinates. Similar shapes
-    can still have ambiguous identity, exposed in review_required rather than
-    interpreting a smooth trajectory as proof of molecular identity.
+
+def _appearance_similarity(references, feature):
+    if not references or np.linalg.norm(feature) < .5:
+        return 0.
+    # A lone anomalous reference must not dominate a bank of clear observations.
+    scores = sorted(float(np.dot(reference, feature)) for reference in references)
+    return float(np.clip(np.median(scores[-3:]), -1., 1.))
+
+
+def _particle_footprints_touch(a, b):
+    if np.hypot(a.x - b.x, a.y - b.y) < a.radius + b.radius:
+        return True
+    if a.roi is not None and b.roi is not None:
+        return (min(a.roi[2], b.roi[2]) > max(a.roi[0], b.roi[0]) and
+                min(a.roi[3], b.roi[3]) > max(a.roi[1], b.roi[1]))
+    return False
+
+
+def _isolated_track_segments(rows):
+    groups = {}
+    for row in rows:
+        groups.setdefault(row['particle'], []).append(row)
+    segments = {}
+    for ident, group in groups.items():
+        runs, run = [], []
+        for row in group:
+            if not row['_isolated'] or (run and row['frame'] != run[-1]['frame'] + 1):
+                if len(run) >= 2: runs.append(run)
+                run = []
+            if row['_isolated']: run.append(row)
+        if len(run) >= 2: runs.append(run)
+        segments[ident] = runs
+    return segments
+
+
+def _segment_appearance(segment, features):
+    value = np.median([features[(r['frame'], r['_index'])] for r in segment], axis=0)
+    return value / max(float(np.linalg.norm(value)), 1e-12)
+
+
+def _verify_contact_identities(rows, events, features, settings, px, cancelled, progress):
+    """Compare isolated tracklets across contact, altering only IDs and flags.
+
+    This is an independent numerical implementation inspired by the isolated
+    segment idea in Notomi et al. (2026), Methods: optional identity correction.
+    It uses normalized image patches, not their neural network or source code.
+    """
+    from background_auto import check_cancel
+    episodes = []
+    for frame, ids in events:
+        touching = [e for e in episodes if e['end'] >= frame - 1 and e['ids'] & ids]
+        if touching:
+            episode = touching[0]
+            episode['end'] = frame; episode['ids'].update(ids)
+            for other in touching[1:]:
+                episode['start'] = min(episode['start'], other['start'])
+                episode['ids'].update(other['ids']); episodes.remove(other)
+        else:
+            episodes.append(dict(start=frame, end=frame, ids=set(ids)))
+
+    for number, episode in enumerate(episodes):
+        progress(80 + int(20 * number / max(1, len(episodes))))
+        check_cancel(cancelled)
+        start, end = episode['start'], episode['end']
+        cut = end + 1
+        for row in rows:
+            if row['frame'] >= cut and row['particle'] in episode['ids']:
+                row['review_required'] = True; row['identity_status'] = 'uncertain'
+                row['_trusted'] = False
+        segments = _isolated_track_segments(rows)
+        before = {}
+        for ident in sorted(episode['ids']):
+            candidates = [run for run in segments.get(ident, [])
+                          if run[-1]['frame'] < start and all(r['_trusted'] for r in run[-5:])]
+            if candidates: before[ident] = candidates[-1][-5:]
+        # Larger or incompletely observed cohorts remain explicitly uncertain.
+        if not 2 <= len(before) <= 4:
+            continue
+        after = {}
+        for ident, runs in segments.items():
+            candidates = [run for run in runs if end < run[0]['frame'] <= end + settings['max_frame_gap'] + 1]
+            if not candidates: continue
+            run = candidates[0][:5]
+            first = run[0]
+            if any(np.linalg.norm((np.array([first['x'], first['y']]) -
+                                   np.array([pre[-1]['x'], pre[-1]['y']])) * px)
+                   <= settings['max_distance_nm'] * (first['frame'] - pre[-1]['frame'])
+                   for pre in before.values()):
+                after[ident] = run
+        for row in rows:
+            if row['frame'] >= cut and row['particle'] in after:
+                row['review_required'] = True; row['identity_status'] = 'uncertain'
+                row['_trusted'] = False
+        if len(after) != len(before): continue
+        pre_ids, post_ids = list(before), sorted(after)
+        signatures = [_segment_appearance(before[k], features) for k in pre_ids]
+        post_signatures = [_segment_appearance(after[k], features) for k in post_ids]
+        costs = np.full((len(pre_ids), len(post_ids)), 1e6)
+        similarities = np.zeros_like(costs)
+        for i, ident in enumerate(pre_ids):
+            prior = before[ident][-1]
+            for j, post_id in enumerate(post_ids):
+                first = after[post_id][0]
+                similarity = float(np.clip(np.dot(signatures[i], post_signatures[j]), -1., 1.))
+                similarities[i, j] = similarity
+                # Respect actual missing-observation limits even across contact.
+                previous = [r for r in rows if r['particle'] == ident and r['frame'] < first['frame']]
+                if not previous or first['frame'] - previous[-1]['frame'] > settings['max_frame_gap'] + 1:
+                    continue
+                limit = settings['max_distance_nm'] * (first['frame'] - prior['frame'])
+                distance = np.linalg.norm((np.array([first['x'], first['y']]) -
+                                           np.array([prior['x'], prior['y']])) * px)
+                if distance <= limit and similarity >= .65:
+                    costs[i, j] = 1. - similarity
+        rr, cc = linear_sum_assignment(costs)
+        best = float(costs[rr, cc].sum())
+        if np.any(costs[rr, cc] >= 1e6): continue
+        alternatives = []
+        for i, j in zip(rr, cc):
+            # A barely rejected alternative must not create false confidence.
+            trial = 1. - similarities; trial[i, j] = 1e6
+            ar, ac = linear_sum_assignment(trial)
+            alternatives.append(float(trial[ar, ac].sum()))
+        # Geometry alone cannot resolve identical-looking molecules. Require
+        # a substantial appearance margin over every alternative permutation.
+        if (min(alternatives) - best) / len(pre_ids) < .12: continue
+        mapping = {post_ids[j]: pre_ids[i] for i, j in zip(rr, cc)}
+        pairs = [(r['frame'], mapping.get(r['particle'], r['particle']) if r['frame'] >= cut else r['particle'])
+                 for r in rows]
+        if len(set(pairs)) != len(pairs): continue
+        changed = {old for old, new in mapping.items() if old != new}
+        for row in rows:
+            if row['frame'] >= cut and row['particle'] in mapping:
+                old = row['particle']; row['particle'] = mapping[old]
+                if old in changed: row['identity_corrected'] = True
+                row['review_required'] = row['_original_review']
+                if row['_isolated']:
+                    row['identity_status'] = 'reconnected' if old in changed else 'verified'
+                    row['_trusted'] = not row['_original_review']
+        for j, post_id in enumerate(post_ids):
+            for row in after[post_id]:
+                row['_trusted'] = True
+                row['identity_status'] = 'reconnected' if post_id in changed else 'verified'
+                # Corrections remain visible for human review; verification of
+                # an unchanged ID does not erase earlier measurement warnings.
+                row['review_required'] = bool(post_id in changed or row['_original_review'])
+        for later in episodes[number + 1:]:
+            if later['start'] >= cut:
+                later['ids'] = {mapping.get(k, k) for k in later['ids']}
+
+
+def link_particles_with_appearance(frames, detections, settings, pixel_size,
+                                   cancelled=lambda: False, progress=lambda percent: None):
+    """Local LAP, clear-frame reference banks and retrospective contact checks.
+
+    Coordinates/ROIs are copied unchanged. No missing observations are filled,
+    and neither an external application nor an AI provider is used.
     """
     from background_auto import check_cancel
     from copy import deepcopy
-    detections = deepcopy(detections)
-    histories, descriptors, rows = {}, {}, []
-    next_id = 0
     px = np.asarray(pixel_size, float)
+    if px.shape != (2,) or not np.isfinite(px).all() or (px <= 0).any():
+        raise ValueError('Pixel sizes must be finite and positive.')
+    if set(detections) != set(range(len(frames))):
+        raise ValueError('Detect all frames before appearance linking.')
+    detections = deepcopy(detections)
+    histories, references, birth_features, rows, features_by_frame, events = {}, {}, {}, [], {}, []
+    contact_quarantine = {}
+    next_id = 0
     for frame in range(len(frames)):
+        progress(int(80 * frame / max(1, len(frames))))
         check_cancel(cancelled)
         particles = detections[frame]
         features = [ai_descriptor(frames[frame], p) for p in particles]
+        features_by_frame.update({(frame, j): feature for j, feature in enumerate(features)})
+        touching_pairs = [(j, k) for j, p in enumerate(particles) for k in range(j + 1, len(particles))
+                          if _particle_footprints_touch(p, particles[k])]
+        crowded = {j for pair in touching_pairs for j in pair}
         active = [k for k, hist in histories.items() if frame - hist[-1]['frame'] <= settings['max_frame_gap'] + 1]
+        previous = {k: histories[k][-1] for k in active}
         positions = np.array([[p.x, p.y] for p in particles], float).reshape(-1, 2) * px
         costs = np.full((len(active), len(particles)), 1e6)
         similarities = np.zeros_like(costs)
@@ -5560,10 +5850,16 @@ def ai_link_particles(frames, detections, settings, pixel_size, cancelled=lambda
             for j, feature in enumerate(features):
                 distance = np.linalg.norm(positions[j] - prediction)
                 actual_distance = np.linalg.norm(positions[j] - last_pos)
-                similarity = float(np.clip(np.dot(descriptors[ident], feature), -1, 1))
+                bank = references[ident]
+                similarity = _appearance_similarity(bank or [birth_features[ident]], feature)
                 similarities[i, j] = similarity
-                if actual_distance <= limit and distance <= limit and similarity >= .05:
-                    costs[i, j] = .65 * distance / limit + .35 * (1 - similarity)
+                if actual_distance <= limit and distance <= limit:
+                    # During contact, appearance is mixed; do not teach from it
+                    # or reject all candidates using an isolated-object gate.
+                    informative = len(bank) >= 2 and j not in crowded and not particles[j].size_unresolved
+                    if informative and similarity < .05: continue
+                    weight = .35 if informative else .10
+                    costs[i, j] = (1 - weight) * distance / limit + weight * (1 - similarity)
         assigned = {}
         if len(active) and len(particles):
             # Explicit unmatched choices prevent forced assignments outside gates.
@@ -5573,7 +5869,8 @@ def ai_link_particles(frames, detections, settings, pixel_size, cancelled=lambda
                 if j >= len(particles) or costs[i, j] >= 1.01: continue
                 alternatives = np.r_[np.delete(costs[i], j), np.delete(costs[:, j], i)]
                 ambiguous = bool(len(alternatives) and np.min(alternatives) - costs[i, j] < .15)
-                assigned[j] = (active[i], ambiguous or similarities[i, j] < .45, float(similarities[i, j]))
+                assigned[j] = (active[i], ambiguous, float(similarities[i, j]))
+        frame_rows = []
         for j, p in enumerate(particles):
             if j in assigned:
                 ident, review, similarity = assigned[j]
@@ -5581,20 +5878,67 @@ def ai_link_particles(frames, detections, settings, pixel_size, cancelled=lambda
                 ident, review, similarity = next_id, False, None
                 next_id += 1
                 histories[ident] = []
-            # Overlapping detection footprints are inherently hard to identify,
-            # even if assignment costs happen to have a distinct minimum.
-            crowded = any(k != j and np.hypot(p.x - other.x, p.y - other.y) < p.radius + other.radius
-                          for k, other in enumerate(particles))
+                references[ident] = []; birth_features[ident] = features[j]
+            bank = references[ident]
+            informative = np.linalg.norm(features[j]) >= .5
+            gap = ident in previous and frame - previous[ident]['frame'] > 1
+            warning = bool(review or j in crowded or p.size_unresolved or not informative or
+                           (similarity is not None and similarity < .45) or gap)
             row = dict(frame=frame, x=float(p.x), y=float(p.y), particle=ident,
-                       review_required=bool(review or crowded or p.size_unresolved), match_similarity=similarity)
+                       review_required=warning, match_similarity=similarity, reference_frames=len(bank),
+                       identity_corrected=False, identity_status='contact' if j in crowded else 'uncertain' if warning else 'linked',
+                       _index=j, _radius=p.radius, _isolated=bool(j not in crowded and not p.size_unresolved and informative),
+                       _trusted=False, _original_review=warning)
             histories[ident].append(row); rows.append(row); p.track_id = ident
-            # Preserve the birth appearance to reduce gradual identity switching.
-            descriptors.setdefault(ident, features[j])
-    valid = {k for k, hist in histories.items() if len(hist) >= settings['min_track_length']}
-    for group in detections.values():
-        for p in group:
-            if p.track_id not in valid: p.track_id = None
-    columns = ['frame', 'x', 'y', 'particle', 'review_required', 'match_similarity']
+            frame_rows.append(row)
+        for j, k in touching_pairs:
+            ids = {frame_rows[j]['particle'], frame_rows[k]['particle']}
+            events.append((frame, ids))
+            contact_quarantine.update({ident: 0 for ident in ids})
+        present = {r['particle'] for r in frame_rows}
+        for ident in active:
+            if ident in present: continue
+            last = previous[ident]
+            for row in frame_rows:
+                if np.hypot(row['x'] - last['x'], row['y'] - last['y']) < row['_radius'] + last['_radius']:
+                    events.append((frame, {ident, row['particle']}))
+                    contact_quarantine.update({ident: 0, row['particle']: 0})
+                    row['_isolated'] = False; row['review_required'] = True
+                    row['_original_review'] = True; row['identity_status'] = 'contact'
+        # Only clear, unambiguous observations enter the bank. Contact images
+        # and gap recoveries never replace an individual's appearance reference.
+        for row in frame_rows:
+            bank = references[row['particle']]
+            similarity = row['match_similarity']
+            assigned_review = assigned.get(row['_index'], (None, False, None))[1]
+            gap = row['particle'] in previous and frame - previous[row['particle']]['frame'] > 1
+            trusted = (row['_isolated'] and not assigned_review and not gap and
+                       (similarity is None or len(bank) < 2 or similarity >= .45))
+            ident = row['particle']
+            if ident in contact_quarantine:
+                # Do not learn a swapped ID immediately after contact. Require
+                # repeated agreement with the original clear references first.
+                strong = trusted and similarity is not None and similarity >= .75
+                contact_quarantine[ident] = contact_quarantine[ident] + 1 if strong else 0
+                trusted = strong and contact_quarantine[ident] >= 3
+                if trusted: del contact_quarantine[ident]
+            row['_trusted'] = bool(trusted)
+            if trusted:
+                bank.append(features[row['_index']])
+                # Keep early anchors and a bounded recent sample, preventing
+                # unbounded memory use on long AFM movies.
+                references[row['particle']] = bank[:2] + bank[-6:] if len(bank) > 8 else bank
+    _verify_contact_identities(rows, events, features_by_frame, settings, px, cancelled, progress)
+    check_cancel(cancelled)
+    counts = {}
+    for row in rows: counts[row['particle']] = counts.get(row['particle'], 0) + 1
+    valid = {k for k, count in counts.items() if count >= settings['min_track_length']}
+    for row in rows:
+        detections[row['frame']][row['_index']].track_id = row['particle'] if row['particle'] in valid else None
+    columns = ['frame', 'x', 'y', 'particle', 'review_required', 'match_similarity',
+               'reference_frames', 'identity_status', 'identity_corrected']
+    progress(100)
+    check_cancel(cancelled)
     return detections, pd.DataFrame([r for r in rows if r['particle'] in valid], columns=columns)
 
 
@@ -5637,17 +5981,33 @@ def ai_apply_warnings(selected, original=None):
               'incomplete': 'the final AI review did not complete',
               'revision_requested': 'the AI asked for further correction',
               'pending': 'no AI review has run'}
-    if status in labels: lines.append(f'AI review status "{status}": {labels[status]}.')
+    if status in labels:
+        lines.append(pick_text(
+            f'AI review status "{status}": {labels[status]}.',
+            {
+                "timed_out": f'AI確認の状態 "{status}": 制限時間内にAIの確認が終わりませんでした。',
+                "incomplete": f'AI確認の状態 "{status}": 最後のAI確認が完了していません。',
+                "revision_requested": f'AI確認の状態 "{status}": AIが追加の修正を求めています。',
+                "pending": f'AI確認の状態 "{status}": AI確認がまだ実行されていません。',
+            }[status],
+        ))
     tracks = selected['tracks']; red = 0
     for frame, particles in selected['detections'].items():
         rows = tracks[tracks.frame == frame] if not tracks.empty else tracks
         flagged = set(rows.loc[rows.review_required, 'particle']) if not rows.empty else set()
         red += sum(ai_observation_color(p, flagged) == 'red' for p in particles)
-    if red: lines.append(f'{red} red (review required) observation(s) will be applied.')
+    if red:
+        lines.append(pick_text(
+            f"{red} red (review required) observation(s) will be applied.",
+            f"確認が必要な赤い観測を {red} 件適用します。",
+        ))
     bad = [int(a['frame']) + 1 for a in selected.get('frame_assessments', []) if a.get('status') != 'ok']
     if bad:
         shown = ', '.join(map(str, bad[:12])) + (' …' if len(bad) > 12 else '')
-        lines.append(f'{len(bad)} frame(s) have a non-ok acquisition assessment: {shown}.')
+        lines.append(pick_text(
+            f"{len(bad)} frame(s) have a non-ok acquisition assessment: {shown}.",
+            f"取得状態が正常でないフレームが {len(bad)} 枚あります: {shown}。",
+        ))
     return lines
 
 
@@ -6050,7 +6410,14 @@ class ParticleAIDialog(QtWidgets.QDialog):
         try: self.settings = load_provider_settings()
         except Exception: self.settings = {}
         self.consent.configure(self.source_path, self.settings)
-        self.source_label.setText('Source: ' + (os.path.basename(self.source_path) if self.source_path else 'Open an ASD in the main window.'))
+        if self.source_path:
+            source_name = os.path.basename(self.source_path)
+            self.source_label.setText(pick_text(f"Source: {source_name}", f"元ファイル: {source_name}"))
+        else:
+            self.source_label.setText(pick_text(
+                "Source: Open an ASD in the main window.",
+                "元ファイル: メイン画面で ASD を開いてください。",
+            ))
         self.source_label.setToolTip(str(self.source_path or ''))
         self.refresh_controls()
 
@@ -6299,18 +6666,31 @@ class ParticleAIDialog(QtWidgets.QDialog):
         selected = self.selected_result()
         warnings = ai_apply_warnings(selected, self.result)
         if warnings and not self.confirm_apply(warnings):
-            self.status.setText('Apply cancelled. Review or exclude the flagged observations, or run Refine, then Apply again.')
+            self.status.setText(pick_text(
+                "Apply cancelled. Review or exclude the flagged observations, or run Refine, then Apply again.",
+                "適用をキャンセルしました。印の付いた観測を確認するか除外するか、Refine を実行してから、もう一度適用してください。",
+            ))
             return
         try: install_particle_ai_result(self.owner, selected)
         except (ValueError, OSError) as exc:
             self.status.setText(str(exc)); return
-        self.status.setText('Applied to Particle Tracking. Use Track Editor for manual changes and Export CSV to save trajectories.')
+        self.status.setText(pick_text(
+            "Applied to Particle Tracking. Use Track Editor for manual changes and Export CSV to save trajectories.",
+            "Particle Tracking に適用しました。手修正は Track Editor、軌跡の保存は Export CSV を使ってください。",
+        ))
 
     def confirm_apply(self, warnings):
         """Human review is required before Apply; ask explicitly when flags remain."""
-        text = ('This AI result still needs human review:\n\n• ' + '\n• '.join(warnings) +
-                '\n\nApply it to Particle Tracking anyway? Red observations can be left out with "Exclude red" above.')
-        answer = QtWidgets.QMessageBox.question(self, 'Apply AI result?', text,
+        body = "\n• ".join(warnings)
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            pick_text("Apply AI result?", "AIの結果を適用しますか？"),
+            pick_text(
+                "This AI result still needs human review:\n\n• " + body +
+                "\n\nApply it to Particle Tracking anyway? Red observations can be left out with Exclude red above.",
+                "このAIの結果は、まだ人が確認する必要があります:\n\n• " + body +
+                "\n\nそれでも Particle Tracking に適用しますか？ 赤い観測は上の「赤（不確か）を除外」で外せます。",
+            ),
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
         return answer == QtWidgets.QMessageBox.Yes
 
@@ -6322,9 +6702,15 @@ class ParticleAIDialog(QtWidgets.QDialog):
         if not path: return
         try:
             export_analysis(self.selected_result(), path, original=self.result)
-            self.status.setText('Analysis exported: input snapshot, code, measured results and review exclusions.')
+            self.status.setText(pick_text(
+                "Analysis exported: input snapshot, code, measured results and review exclusions.",
+                "解析を書き出しました。入力スナップショット、コード、計測結果、確認時の除外を含みます。",
+            ))
         except (OSError, ValueError) as exc:
-            self.status.setText('Analysis export failed: ' + str(exc))
+            self.status.setText(pick_text(
+                "Analysis export failed: " + str(exc),
+                "解析の書き出しに失敗しました: " + str(exc),
+            ))
 
     def cancel(self):
         if self.worker: self.worker.requestInterruption(); self.activity.cancel()
@@ -6384,7 +6770,7 @@ def install_particle_ai_result(owner, result):
     owner.particles_by_frame = deepcopy(result['detections'])
     with QtCore.QSignalBlocker(owner.tracking_algo_combo):
         owner.tracking_algo_combo.setCurrentText('AI Agent result' if result.get('engine') == 'agent' else
-            'AI LAP (appearance)' if params['link_method'] == 'lap' else 'AI Predictive LAP (appearance)')
+            'Appearance + Contact (local)' if params['link_method'] == 'lap' else 'Predictive Appearance + Contact (local)')
     owner.frame_data_by_frame = {i: data.copy() for i, data in enumerate(result['frames'])}
     owner.tracks_df = result['tracks'].copy(deep=True)
     owner.ai_tracking_result = result

@@ -33,6 +33,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
+try:
+    from gui_i18n import QtWidgets, get_language
+except ImportError:  # 古い pyNuD 本体には gui_i18n が無い。そのときは元の Qt の部品で動く。
+    def get_language():
+        return "en"
+try:
+    from gui_i18n import pick_text
+except ImportError:  # 古い本体には pick_text が無い
+    def pick_text(en, ja):
+        return en
 
 try:
     import cv2
@@ -1157,7 +1167,8 @@ class AFMMovieEditorWindow(QtWidgets.QWidget):
 
         btn_ja.clicked.connect(lambda: set_lang(True))
         btn_en.clicked.connect(lambda: set_lang(False))
-        set_lang(False)
+        dialog._pynud_sync_language = lambda language: set_lang(language == "ja")
+        set_lang(get_language() == "ja")
 
         dialog.exec_()
 
@@ -3201,18 +3212,22 @@ class AFMMovieEditorWindow(QtWidgets.QWidget):
         if self._thumbnail_cursor >= self.total_frames:
             self._stop_thumbnail_timer()
             self.thumb_status_label.setText(f"{self.total_frames} frames ready")
-            self._restore_main_frame(self._thumbnail_restore_index)
+            # Only restore if a fallback render mutated gv (host path leaves it alone).
+            if gv is not None and int(getattr(gv, "index", 0) or 0) != int(self._thumbnail_restore_index):
+                self._restore_main_frame(self._thumbnail_restore_index)
 
     def _make_frame_pixmap(self, frame_index: int) -> Optional[QtGui.QPixmap]:
         try:
             size = max(self._source_thumb_min, min(self._source_thumb_max, int(self._source_thumb_max)))
-            bgr = self._render_pynud_display_frame(frame_index)
-            if bgr is None:
-                array = self._get_frame_array(frame_index)
-                if array is None:
-                    return None
+            # Prefer host getImageDataForFrame so thumbnail builds do not leave
+            # gv.index / gv.aryData pointing at the last thumbnail frame (B13).
+            array = self._get_frame_array(frame_index)
+            if array is not None:
                 bgr = self._array_to_bgr(array, size, size, for_thumbnail=True)
             else:
+                bgr = self._render_pynud_display_frame(frame_index)
+                if bgr is None:
+                    return None
                 bgr = cv2.resize(bgr, (size, size), interpolation=cv2.INTER_AREA)
             bgr = np.ascontiguousarray(bgr)
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -4443,18 +4458,21 @@ class AFMMovieEditorWindow(QtWidgets.QWidget):
         return value if value % 2 == 0 else value + 1
 
     def _get_frame_array(self, frame_index: int) -> Optional[np.ndarray]:
+        """Return processed frame data without permanently changing main gv state."""
         channel = self.channel_combo.currentText() if hasattr(self, "channel_combo") else "1ch"
         if self.main_window is not None and hasattr(self.main_window, "getImageDataForFrame"):
             getter = getattr(self.main_window, "getImageDataForFrame")
             try:
-                return getter(int(frame_index), channel=channel)
+                data = getter(int(frame_index), channel=channel)
             except TypeError:
                 try:
-                    return getter(int(frame_index))
+                    data = getter(int(frame_index))
                 except Exception:
-                    pass
+                    data = None
             except Exception:
-                pass
+                data = None
+            if data is not None:
+                return np.asarray(data)
 
         if gv is None or LoadFrame is None:
             return None
@@ -4464,6 +4482,8 @@ class AFMMovieEditorWindow(QtWidgets.QWidget):
             original_index = int(getattr(gv, "index", 0) or 0)
             if not files or not (0 <= file_idx < len(files)):
                 return None
+            saved_ary = None if getattr(gv, "aryData", None) is None else np.asarray(gv.aryData).copy()
+            saved_ary2 = None if getattr(gv, "aryData2ch", None) is None else np.asarray(gv.aryData2ch).copy()
             gv.index = int(frame_index)
             LoadFrame(files[file_idx])
             if InitializeAryDataFallback is not None:
@@ -4472,19 +4492,59 @@ class AFMMovieEditorWindow(QtWidgets.QWidget):
                 array = np.asarray(gv.aryData2ch).copy()
             else:
                 array = np.asarray(gv.aryData).copy()
+            # Restore main frame buffers (index alone is not enough).
             gv.index = original_index
+            LoadFrame(files[file_idx])
+            if InitializeAryDataFallback is not None:
+                InitializeAryDataFallback()
+            if saved_ary is not None:
+                gv.aryData = saved_ary
+            if saved_ary2 is not None:
+                gv.aryData2ch = saved_ary2
             return array
         except Exception:
             return None
 
     def _render_pynud_display_frame(self, frame_index: int) -> Optional[np.ndarray]:
-        """Render one source frame through pyNuD's main display pipeline.
+        """Render one source frame as BGR without leaving main gv on that frame.
 
-        This keeps Color/Tone, gamma, LUT, display aspect ratio, and active
-        preprocessing consistent with the main Image View / Movie output.
+        Prefers ``main_window.getImageDataForFrame`` (processed data, state-safe).
+        Falls back to the legacy LoadFrame / display pipeline only when the host
+        path is unavailable, and restores gv afterwards.
         """
-        if cv2 is None or gv is None or LoadFrame is None or self.main_window is None:
+        if cv2 is None:
             return None
+
+        channel = self.channel_combo.currentText() if hasattr(self, "channel_combo") else "1ch"
+        array = None
+        if self.main_window is not None and hasattr(self.main_window, "getImageDataForFrame"):
+            getter = getattr(self.main_window, "getImageDataForFrame")
+            try:
+                array = getter(int(frame_index), channel=channel)
+            except TypeError:
+                try:
+                    array = getter(int(frame_index))
+                except Exception:
+                    array = None
+            except Exception:
+                array = None
+
+        if array is not None:
+            arr = np.asarray(array)
+            if arr.size == 0:
+                return None
+            height = int(arr.shape[0])
+            width = int(arr.shape[1]) if arr.ndim >= 2 else int(arr.shape[0])
+            try:
+                return np.ascontiguousarray(self._array_to_bgr(arr, width, height, for_thumbnail=False))
+            except Exception as exc:
+                print(f"[WARNING] Failed to colorize processed frame {frame_index}: {exc}")
+                return None
+
+        # Legacy fallback: mutate gv temporarily, then restore.
+        if gv is None or LoadFrame is None or self.main_window is None:
+            return None
+        original_index = int(getattr(gv, "index", 0) or 0)
         try:
             files = getattr(gv, "files", None)
             file_idx = int(getattr(gv, "currentFileNum", 0) or 0)
@@ -4508,7 +4568,6 @@ class AFMMovieEditorWindow(QtWidgets.QWidget):
             if hasattr(self.main_window, "applyImageProcessing"):
                 self.main_window.applyImageProcessing(hidden=True)
 
-            channel = self.channel_combo.currentText() if hasattr(self, "channel_combo") else "1ch"
             if channel == "2ch":
                 if hasattr(self.main_window, "UpdateDisplayImage2ch"):
                     if getattr(gv, "dspsize", None) is None and hasattr(self.main_window, "UpdateDisplayImage"):
@@ -4526,6 +4585,11 @@ class AFMMovieEditorWindow(QtWidgets.QWidget):
         except Exception as exc:
             print(f"[WARNING] Failed to render pyNuD display frame {frame_index}: {exc}")
             return None
+        finally:
+            try:
+                self._restore_main_frame(original_index)
+            except Exception:
+                pass
 
     def _restore_main_frame(self, frame_index: Optional[int] = None) -> None:
         if gv is None:
@@ -7689,7 +7753,8 @@ class AFMMovieEditorWindow(QtWidgets.QWidget):
             self.preview_slider.setValue(next_index)
 
     def _preview_source_frame(self, frame_index: int) -> None:
-        original_index = int(getattr(gv, "index", 0) or 0) if gv is not None else None
+        # Render path preserves main gv (getImageDataForFrame or self-restore);
+        # do not redraw the main window on every source click (P4).
         width, height = self._output_size()
         try:
             img = self._render_pynud_display_frame(frame_index)
@@ -7705,9 +7770,6 @@ class AFMMovieEditorWindow(QtWidgets.QWidget):
             self._set_preview_image(img)
         except Exception:
             pass
-        finally:
-            if original_index is not None:
-                self._restore_main_frame(original_index)
 
     def _focus_source_frame_for_output(self, output_index: int) -> None:
         frame_index = self._source_frame_for_output_index(output_index)
@@ -7739,15 +7801,13 @@ class AFMMovieEditorWindow(QtWidgets.QWidget):
             return
         idx = max(0, min(duration - 1, int(self.preview_slider.value())))
         self.preview_frame_label.setText(f"{idx + 1} / {duration}")
-        original_index = int(getattr(gv, "index", 0) or 0) if gv is not None else None
+        # Frame render uses getImageDataForFrame (or restores itself). Skipping
+        # per-frame main redraw here roughly halves preview cost (P4).
         try:
             img = self._render_timeline_frame(idx)
             self._set_preview_image(img)
         except Exception as exc:
             self.preview_label.setText(f"Preview failed:\n{exc}")
-        finally:
-            if original_index is not None:
-                self._restore_main_frame(original_index)
         transition_status = self._transition_status_for_output(idx)
         if transition_status:
             self._update_split_status(transition_status)

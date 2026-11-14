@@ -29,6 +29,10 @@ from typing import Optional
 
 import numpy as np
 from PyQt5 import QtCore, QtWidgets
+try:
+    from gui_i18n import QtWidgets
+except ImportError:  # 古い pyNuD 本体には gui_i18n が無い。そのときは元の Qt の部品で動く。
+    pass
 
 try:
     import globalvals as gv
@@ -37,63 +41,76 @@ except ModuleNotFoundError:
 
 _PLUGIN_DIR = Path(__file__).resolve().parent
 _EMBEDDED_SIMULATOR_BRIDGE_B64 = (
-(
-    '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'
-    'SxitPvkfocMwmw=='
-)
+    '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'
 )
 
 
@@ -143,9 +160,12 @@ class SimulatorBridgeWindow(QtWidgets.QWidget):
     """Lightweight pyNuD plugin that feeds Real AFM frames to pyNuD Simulator."""
 
     def __init__(self, main_window, parent=None):
+        import uuid
         super().__init__(parent)
         self.main_window = main_window
         self._bridge_seq = 0
+        self._publisher_id = uuid.uuid4().hex
+        self._closed = False
         self._frame_signal_connected = False
         self._processed_signal_connected = False
         self._pending_frame_index: Optional[int] = None
@@ -161,7 +181,8 @@ class SimulatorBridgeWindow(QtWidgets.QWidget):
 
         self._heartbeat_timer = QtCore.QTimer(self)
         self._heartbeat_timer.setInterval(2000)
-        self._heartbeat_timer.timeout.connect(touch_state)
+        self._heartbeat_timer.timeout.connect(
+            lambda: touch_state(publisher_id=self._publisher_id))
         self._heartbeat_timer.start()
 
         QtCore.QTimer.singleShot(0, self.refresh_current_frame)
@@ -233,6 +254,8 @@ class SimulatorBridgeWindow(QtWidgets.QWidget):
             return 0
 
     def refresh_current_frame(self, frame_index=None) -> bool:
+        if self._closed:
+            return False
         if not self._has_real_source():
             self._set_status("Status: pyNuD image API is unavailable.")
             return False
@@ -264,6 +287,7 @@ class SimulatorBridgeWindow(QtWidgets.QWidget):
                 label=label,
                 frame_index=index,
                 seq=self._bridge_seq,
+                publisher_id=self._publisher_id,
             )
         except Exception as exc:
             self._set_status(f"Status: publish failed: {exc}")
@@ -328,6 +352,8 @@ class SimulatorBridgeWindow(QtWidgets.QWidget):
         self._processed_signal_connected = False
 
     def _on_main_window_frame_changed(self, frame_index) -> None:
+        if self._closed:
+            return
         if not self._has_real_source():
             return
         try:
@@ -341,7 +367,7 @@ class SimulatorBridgeWindow(QtWidgets.QWidget):
         self._refresh_timer.start(70)
 
     def _perform_refresh(self) -> None:
-        if self._pending_frame_index is None:
+        if self._closed or self._pending_frame_index is None:
             return
         self.refresh_current_frame(frame_index=self._pending_frame_index)
 
@@ -360,8 +386,9 @@ class SimulatorBridgeWindow(QtWidgets.QWidget):
         )
 
     def closeEvent(self, event) -> None:
+        _bridge.stop_publishing(self)
         self._disconnect_main_window_signals()
-        mark_inactive()
+        mark_inactive(publisher_id=self._publisher_id)
         if (
             self.main_window is not None
             and hasattr(self.main_window, "plugin_actions")

@@ -16,6 +16,10 @@ import numpy as np
 import cv2
 import traceback
 from PyQt5 import QtWidgets, QtCore, QtGui
+try:
+    from gui_i18n import QtWidgets
+except ImportError:  # 古い pyNuD 本体には gui_i18n が無い。そのときは元の Qt の部品で動く。
+    pass
 import globalvals as gv
 from scipy.signal import find_peaks
 from scipy import ndimage
@@ -34,6 +38,23 @@ try:
     from matplotlib.patches import Ellipse
 except ImportError:
     FigureCanvas = NavigationToolbar = Figure = cm = mcolors = Ellipse = None
+
+
+def _named_colormap(name, lut=None):
+    """Colormap by name (optionally resampled to ``lut`` colours) on old and new Matplotlib.
+
+    ``matplotlib.cm.get_cmap`` was deprecated in 3.7 and removed in 3.11 (the
+    Windows build failed with "module matplotlib.cm has no attribute get_cmap").
+    The replacement ``matplotlib.colormaps[name]`` exists from 3.5 and
+    ``Colormap.resampled`` from 3.6; older versions fall back to cm.get_cmap.
+    """
+    try:
+        from matplotlib import colormaps
+        cmap = colormaps[name]
+        return cmap if lut is None else cmap.resampled(int(lut))
+    except (ImportError, AttributeError):
+        from matplotlib import cm
+        return cm.get_cmap(name, lut)
 
 
 HELP_HTML_EN = """
@@ -343,10 +364,11 @@ class EllipseFittingWorker(QtCore.QThread):
     finished = QtCore.pyqtSignal(list)
     error = QtCore.pyqtSignal(str)
 
-    def __init__(self, labels, px_size_nm, r1_nm, v1_nm, v2_nm):
+    def __init__(self, labels, px_size_nm, r1_nm, v1_nm, v2_nm, px_size_y_nm=None):
         super().__init__()
         self.labels = labels
         self.px_size_nm = px_size_nm
+        self.px_size_y_nm = px_size_nm if px_size_y_nm is None else px_size_y_nm
         self.r1_nm = r1_nm
         self.v1_nm = v1_nm
         self.v2_nm = v2_nm
@@ -364,7 +386,8 @@ class EllipseFittingWorker(QtCore.QThread):
             for pid in particle_ids:
                 mask = (self.labels == pid)
                 a, b, ang, rmse, x0, y0 = fit_ellipse_to_mask(
-                    mask, self.px_size_nm, self.r1_nm, self.v1_nm, self.v2_nm
+                    mask, self.px_size_nm, self.r1_nm, self.v1_nm, self.v2_nm,
+                    px_size_y_nm=self.px_size_y_nm
                 )
                 results.append({
                     'id': int(pid),
@@ -1641,7 +1664,7 @@ class ParticleClusterWindow(QtWidgets.QMainWindow):
                     z_max = int(np.nanmax(data)) if not np.all(np.isnan(data)) else 10
                     if z_max <= z_min: z_max = z_min + 1
                     n_steps = z_max - z_min + 1
-                    cmap = cm.get_cmap(cmap_name, n_steps)
+                    cmap = _named_colormap(cmap_name, n_steps)
                     norm = mcolors.BoundaryNorm(np.arange(z_min, z_max + 2) - 0.5, n_steps)
                     kwargs.update({'cmap': cmap, 'norm': norm})
                 elif key == 'fit_aspect':
@@ -1781,8 +1804,11 @@ class ParticleClusterWindow(QtWidgets.QMainWindow):
             
         h, w = gv.aryData.shape[:2]
         px_size = gv.XScanSize / w
+        px_size_y = gv.YScanSize / h
         
-        self._fit_worker = EllipseFittingWorker(self.seg_labels, px_size, r1, v1, v2)
+        self._fit_worker = EllipseFittingWorker(
+            self.seg_labels, px_size, r1, v1, v2, px_size_y_nm=px_size_y
+        )
         self._fit_worker.finished.connect(self.on_ellipse_fitting_finished)
         self._fit_worker.error.connect(self.on_segmentation_error) # Reuse error handler
         self._fit_worker.start()
@@ -2987,7 +3013,7 @@ def filter_by_confidence(labels, confidence_map, threshold=0.75, seeds_px=None):
     
     return filtered
 
-def fit_ellipse_to_mask(mask, px_size_nm, r1_nm, v1_nm, v2_nm):
+def fit_ellipse_to_mask(mask, px_size_nm, r1_nm, v1_nm, v2_nm, px_size_y_nm=None):
     """
     Fits a 2D ellipse to the segmentation mask points.
     / セグメンテーションマスクポイントに2D楕円をフィットさせます。
@@ -2997,7 +3023,9 @@ def fit_ellipse_to_mask(mask, px_size_nm, r1_nm, v1_nm, v2_nm):
     mask : ndarray
         Binary mask for the particle.
     px_size_nm : float
-        Pixel size in nanometers.
+        X pixel size in nanometers.
+    px_size_y_nm : float, optional
+        Y pixel size in nanometers; defaults to the X size for square pixels.
     r1_nm : float
         Initial a-axis semi-length (nm).
     v1_nm : float
@@ -3015,8 +3043,10 @@ def fit_ellipse_to_mask(mask, px_size_nm, r1_nm, v1_nm, v2_nm):
     if len(y_idx) < 5: # Need at least 5 points for an ellipse
         return 0, 0, 0, 0, 0, 0
     
+    if px_size_y_nm is None:
+        px_size_y_nm = px_size_nm
     x = x_idx * px_size_nm
-    y = y_idx * px_size_nm
+    y = y_idx * px_size_y_nm
     
     # 2. Initial Guess
     x0_init = np.mean(x)
@@ -3051,7 +3081,7 @@ def fit_ellipse_to_mask(mask, px_size_nm, r1_nm, v1_nm, v2_nm):
     if contours:
         cnt = contours[0].reshape(-1, 2)
         x_cnt = cnt[:, 0] * px_size_nm
-        y_cnt = cnt[:, 1] * px_size_nm
+        y_cnt = cnt[:, 1] * px_size_y_nm
         
         def res_cnt(p):
             a, b, x0, y0, phi = p

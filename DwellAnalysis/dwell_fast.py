@@ -14,9 +14,9 @@ from skimage.morphology import h_maxima
 from skimage.segmentation import watershed
 
 try:
-    from .dwell_detection import register, episodes, level_for_detection
+    from .dwell_detection import register, episodes, level_for_detection, aperture_grid
 except ImportError:  # Same helper is copied into the isolated analysis workspace.
-    from dwell_detection import register, episodes, level_for_detection
+    from dwell_detection import register, episodes, level_for_detection, aperture_grid
 
 
 def prepare(frames, *, plane=True, block_frames=10, baseline_percentile=25., check=lambda: None):
@@ -214,13 +214,14 @@ thresholds. AI may revise them or replace this method after checking the data.
     density = ndi.gaussian_filter(np.mean(np.maximum(response-high, 0)*support, axis=0), 1)
     points = peak_local_max(density, min_distance=max(2, int(separation_px)), threshold_abs=density_floor,
                             exclude_border=7)
-    sites = []; events = []; yy, xx = np.indices(response.shape[1:])
+    sites = []; events = []
     for y, x in sorted(points, key=lambda p: -density[tuple(p)]):
         check()
         if len(sites) >= 2000: raise ValueError('Too many candidate sites; revise detection parameters.')
+        box, yy, xx = aperture_grid(response.shape[1:], x, y, radius_px)
         disk = (yy-y)**2+(xx-x)**2 <= radius_px**2
-        signal = np.percentile(response[:, disk], 80, axis=1)
-        raw_peak = np.percentile(compact[:, disk], 90, axis=1)
+        signal = np.percentile(response[(slice(None),)+box][:, disk], 80, axis=1)
+        raw_peak = np.percentile(compact[(slice(None),)+box][:, disk], 90, axis=1)
         positions = np.array([x, y])[None, :]+lo[::-1]-shifts[:, ::-1]
         # Require support for the actual aperture even if AI increases its radius.
         valid = support[:, y, x] & (quality >= registration_min)
@@ -346,7 +347,6 @@ def measure(prepared, *, high_nm=None, low_nm=None, radius_px=2.5, separation_px
         remaining.append([p for i, p in enumerate(detected) if i not in used])
     tracks = presence_tracks(prepared, remaining, separation_px, check, registration_min)
     shifts = prepared['shifts']; lo = prepared['origin_yx']
-    yy, xx = np.indices(prepared['response'].shape[1:])
     for track in tracks:
         check()
         if len(sites) >= 2000: raise ValueError('Too many particle sites; revise spatial detection parameters.')
@@ -356,8 +356,9 @@ def measure(prepared, *, high_nm=None, low_nm=None, radius_px=2.5, separation_px
         present = np.zeros(n, bool); flags = [[] for _ in range(n)]
         for i, point in track['observations'].items():
             positions[i] = [point['x'], point['y']]; bounds[i] = point['bounds']; present[i] = True; flags[i] = point['flags']
+        box, yy, xx = aperture_grid(prepared['response'].shape[1:], x, y, radius_px)
         disk = (xx-x)**2+(yy-y)**2 <= radius_px**2
-        signal = np.percentile(prepared['response'][:, disk], 80, axis=1)
+        signal = np.percentile(prepared['response'][(slice(None),)+box][:, disk], 80, axis=1)
         valid = prepared['support'][:, y, x] & (prepared['quality'] >= registration_min)
         valid &= ((aperture[:, 0] >= radius_px+1) & (aperture[:, 0] < w-radius_px-1)
                   & (aperture[:, 1] >= radius_px+1) & (aperture[:, 1] < h-radius_px-1))

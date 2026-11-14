@@ -3,8 +3,8 @@
   "id": "particle_cluster_analysis",
   "name": "Particle Cluster Analysis",
   "entrypoint": "particle_cluster_analysis.py",
-  "version": "2026.10.4",
-  "updated": "2026-10-04",
+  "version": "2026.11.14",
+  "updated": "2026-11-14",
   "host_api": 1,
   "files": [
     "__init__.py",

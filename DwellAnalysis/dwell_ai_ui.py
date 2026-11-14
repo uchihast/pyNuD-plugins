@@ -7,6 +7,15 @@ import time
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
+try:
+    from gui_i18n import QtWidgets
+except ImportError:  # 古い pyNuD 本体には gui_i18n が無い。そのときは元の Qt の部品で動く。
+    pass
+try:
+    from gui_i18n import pick_text
+except ImportError:  # 古い本体には pick_text が無い
+    def pick_text(en, ja):
+        return en
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 
@@ -74,16 +83,34 @@ class ROICorrectionDialog(QtWidgets.QDialog):
     def __init__(self, session, site, frame, parent):
         super().__init__(parent); self.session=session; self.site=site; self.frame=frame; self.centers=[]
         adding = site is None
-        self.setWindowTitle(('Add ROIs' if adding else 'Correct ROI')+' — click particle centers'); self.resize(850,740)
+        self.setWindowTitle(pick_text(
+            ("Add ROIs" if adding else "Correct ROI") + " — click particle centers",
+            ("ROIを追加" if adding else "ROIを修正") + " — 粒子の中心をクリック",
+        )); self.resize(850,740)
         self.setMinimumSize(520,480); layout=QtWidgets.QVBoxLayout(self)
-        instructions = (f'Add missed particles · Frame {frame}\n'
-            'Click each missed particle center. Each point creates a new ROI; existing ROIs stay unchanged. '
-            'Check the existing boxes to avoid adding the same particle twice. ' if adding else
-            f'ROI {site["id"]} · Frame {frame}\n'
-            'Click one center to move the ROI, or multiple centers to split it. '
-            'Clicks replace this ROI only, from this frame through the chosen last frame. ')
-        text=QtWidgets.QLabel(instructions+'Local tracking and height measurement run from this frame through the chosen last frame '
-            'without AI; new events require review.')
+        if adding:
+            instructions = pick_text(
+                f"Add missed particles · Frame {frame}\n"
+                "Click each missed particle center. Each point creates a new ROI; existing ROIs stay unchanged. "
+                "Check the existing boxes to avoid adding the same particle twice. ",
+                f"見落とした粒子を追加 · フレーム {frame}\n"
+                "見落とした粒子の中心をそれぞれクリックします。1点ごとに新しいROIができます。既存のROIはそのままです。"
+                "同じ粒子を二度追加しないよう、既存の枠を確認してください。",
+            )
+        else:
+            instructions = pick_text(
+                f"ROI {site['id']} · Frame {frame}\n"
+                "Click one center to move the ROI, or multiple centers to split it. "
+                "Clicks replace this ROI only, from this frame through the chosen last frame. ",
+                f"ROI {site['id']} · フレーム {frame}\n"
+                "中心を1つクリックするとROIを移動し、複数クリックすると分割します。"
+                "クリックはこのROIだけを、このフレームから指定した最終フレームまで置き換えます。",
+            )
+        text=QtWidgets.QLabel(instructions + pick_text(
+            "Local tracking and height measurement run from this frame through the chosen last frame "
+            "without AI; new events require review.",
+            "このフレームから指定した最終フレームまで、AIを使わずに局所追跡と高さ計測を行います。新しいイベントは確認が必要です。",
+        ))
         text.setWordWrap(True); layout.addWidget(text)
         self.preview=DwellImage(); self.preview.clicked.connect(self.add_center); layout.addWidget(self.preview,1)
         row=QtWidgets.QHBoxLayout(); self.count=QtWidgets.QLabel(); row.addWidget(self.count,1)
@@ -125,8 +152,18 @@ class ROICorrectionDialog(QtWidgets.QDialog):
             draw.line((cx-5,cy,cx+5,cy),fill='white',width=2); draw.line((cx,cy-5,cx,cy+5),fill='white',width=2)
             draw.text((cx+5,cy+5),str(i),fill='white')
         self.preview.set_image(image,snap.image.shape)
-        overlap=any(np.linalg.norm(np.array(a)-b)<=2*self.radius.value() for i,a in enumerate(self.centers) for b in self.centers[i+1:])
-        self.count.setText(f'{len(self.centers)} center(s)'+(' — circles overlap; reduce radius' if overlap else ''))
+        overlap = any(np.linalg.norm(np.array(a) - b) <= 2 * self.radius.value() for i, a in enumerate(self.centers) for b in self.centers[i + 1:])
+        n_centers = len(self.centers)
+        if overlap:
+            self.count.setText(pick_text(
+                f"{n_centers} center(s) — circles overlap; reduce radius",
+                f"中心 {n_centers} 点 — 円が重なっています。半径を小さくしてください",
+            ))
+        else:
+            self.count.setText(pick_text(
+                f"{n_centers} center(s)",
+                f"中心 {n_centers} 点",
+            ))
         self.ok.setEnabled(bool(self.centers) and not overlap)
 
 
@@ -134,10 +171,17 @@ class DwellRefineDialog(QtWidgets.QDialog):
     def __init__(self, frame, site, parent):
         super().__init__(parent); self.setWindowTitle('Refine Dwell Analysis with AI'); self.resize(650, 330)
         layout = QtWidgets.QVBoxLayout(self)
-        context = QtWidgets.QLabel(f'Context: Frame {frame}'+(f' · ROI {site}' if site else '')+
-            '\nAI receives the current movie, detections, traces and review choices. Describe false detections, '
-            'missed particles, wrong ROI positions or event boundaries. It can revise detections and measurements '
-            'throughout this movie; the displayed frame is the starting point for inspection.')
+        roi_en = f" · ROI {site}" if site else ""
+        roi_ja = f" · ROI {site}" if site else ""
+        context = QtWidgets.QLabel(pick_text(
+            f"Context: Frame {frame}{roi_en}\n"
+            "AI receives the current movie, detections, traces and review choices. Describe false detections, "
+            "missed particles, wrong ROI positions or event boundaries. It can revise detections and measurements "
+            "throughout this movie; the displayed frame is the starting point for inspection.",
+            f"対象: フレーム {frame}{roi_ja}\n"
+            "AIには現在の動画、検出、軌跡、確認の選択が渡されます。誤検出、見落とし、ROIの位置、イベントの境界を書いてください。"
+            "この動画全体の検出と計測を直せます。表示中のフレームは確認の起点です。",
+        ))
         context.setWordWrap(True); layout.addWidget(context)
         self.instructions = QtWidgets.QPlainTextEdit(); self.instructions.setObjectName('dwell_refine_instructions')
         self.instructions.setPlaceholderText('Example: In this frame, background texture and horizontal streaks are '
@@ -238,8 +282,13 @@ class FrameMarksDialog(QtWidgets.QDialog):
                     for col, value in enumerate(values): self.table.setItem(k, col, QtWidgets.QTableWidgetItem(str(value)))
         self.frame_changed(self.frame.value())
         self.undo.setEnabled(bool(self.draft.history)); self.save.setEnabled(bool(self.draft.changed))
-        self.feedback.setText(f'{len(self.draft.changed)} edited IDs. Only edited IDs will be remeasured; '
-            'their events return to pending. Cancel discards these edits. Restore copies proposals; Memorize confirms the displayed states.')
+        n_edited = len(self.draft.changed)
+        self.feedback.setText(pick_text(
+            f"{n_edited} edited IDs. Only edited IDs will be remeasured; "
+            "their events return to pending. Cancel discards these edits. Restore copies proposals; Memorize confirms the displayed states.",
+            f"編集した ID は {n_edited} 件です。編集した ID だけを測り直します。"
+            "そのイベントは未確認に戻ります。キャンセルするとこの編集は破棄されます。復元は提案をコピーし、記憶は表示中の状態を確定します。",
+        ))
 
     def select_id(self):
         self.selected = self.ids.currentData(); self.refresh()

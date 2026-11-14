@@ -3,8 +3,8 @@
   "id": "ReferenceObjectCropper",
   "name": "Reference Object Cropper",
   "entrypoint": "ReferenceObjectCropper.py",
-  "version": "2026.10.20",
-  "updated": "2026-10-20",
+  "version": "2026.11.14.1",
+  "updated": "2026-11-14",
   "host_api": 1,
   "files": [
     "ReferenceObjectCropper.py",

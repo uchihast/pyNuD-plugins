@@ -28,6 +28,15 @@ from dataclasses import dataclass
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
+try:
+    from gui_i18n import QtWidgets
+except ImportError:  # 古い pyNuD 本体には gui_i18n が無い。そのときは元の Qt の部品で動く。
+    pass
+try:
+    from gui_i18n import pick_text
+except ImportError:  # 古い本体には pick_text が無い
+    def pick_text(en, ja):
+        return en
 
 try:
     import cv2
@@ -1440,13 +1449,17 @@ class ReferenceObjectCropperWindow(QtWidgets.QWidget):
         self.reference_preview.setPixmap(scaled)
         self.reference_preview.setText("")
         x, y, w, h = self.reference_roi or (0, 0, 0, 0)
-        median_text = ""
+        n_mask = int(np.count_nonzero(self.reference_mask))
+        median_en = median_ja = ""
         if self.reference_intensity_median is not None:
-            median_text = f" | median={self.reference_intensity_median:.4g}"
-        self.reference_meta_label.setText(
+            median_en = f" | median={self.reference_intensity_median:.4g}"
+            median_ja = f" | 中央値={self.reference_intensity_median:.4g}"
+        self.reference_meta_label.setText(pick_text(
             f"Frame {self.reference_frame_index} | ROI x={x}, y={y}, w={w}, h={h} | "
-            f"Mask pixels={int(np.count_nonzero(self.reference_mask))} | center=I²-weighted{median_text}"
-        )
+            f"Mask pixels={n_mask} | center=I²-weighted{median_en}",
+            f"フレーム {self.reference_frame_index} | ROI x={x}, y={y}, w={w}, h={h} | "
+            f"マスク画素={n_mask} | 中心=I²加重{median_ja}",
+        ))
 
     def _sync_match_rects_overlay(self) -> None:
         """Redraw detection boxes from saved records for the current frame and channel."""
@@ -1519,7 +1532,10 @@ class ReferenceObjectCropperWindow(QtWidgets.QWidget):
             self.current_frame_index = int(frame_index_override or 0)
         self.current_channel = self._get_active_channel()
         self.current_image = self._get_current_image_from_globals()
-        self.frame_info_label.setText(f"Frame: {self.current_frame_index} | Channel: {self.current_channel}")
+        self.frame_info_label.setText(pick_text(
+            f"Frame: {self.current_frame_index} | Channel: {self.current_channel}",
+            f"フレーム: {self.current_frame_index} | チャンネル: {self.current_channel}",
+        ))
         self.image_viewer.set_image(self.current_image)
         self._update_roi_label()
         self._sync_match_rects_overlay()

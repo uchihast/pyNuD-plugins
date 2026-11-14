@@ -1,3 +1,39 @@
+# Plugin ZIP bundles — 2026-11-14
+
+## 更新内容 / Changes
+
+公開中の13プラグインすべてを更新しました。All 13 public plugins are updated.
+
+**全プラグイン共通 / All plugins**
+- pyNuD 2.14.0の国旗スイッチ（JPN/ENG）に合わせて、画面と操作メッセージを日本語だけ、または英語だけで表示します。グラフの軸名は英語のままです。 / Screens and operation messages follow the JPN/ENG flag switch in pyNuD 2.14.0 and appear in one language only. Graph axis labels stay in English.
+- ウィンドウを開き直すたびに位置がずれる問題を修正しました（Windows/macOS）。 / Windows no longer drift each time they are reopened (Windows/macOS).
+
+**個別の修正 / Plugin-specific fixes**
+- **Particle Tracking 2026.11.14.1**: Kalman追跡で終了した軌跡を結果に残し、サブピクセル補正を正しく適用します。LAP / Kalmanは有効なリンクの数を優先します。非正方ピクセルでの探索範囲を修正しました。 / Kalman tracking keeps finished tracks, sub-pixel refinement is applied correctly, LAP / Kalman keep the maximum number of valid links, and gating respects non-square pixels.
+- **Filament Analysis 2026.11.14.1**: 本体の処理済みフレーム（背景補正・フィルタ後）を解析に使います。非正方ピクセルの長さ、階段状にならない輪郭長、校正値の記録を修正し、グループ未割り当ての記録を置き換えずに残します。経路探索を高速化しました。 / Uses the host's processed frames, corrects lengths for non-square pixels with staircase-free contour lengths, records the calibration, keeps unassigned records, and traces paths faster.
+- **Kymograph 2026.11.14.1**: 1列あたりのnmを作成時に保持して距離換算と基準位置に使い、本体の処理済みフレームから作成します。 / Keeps nm per column for distance conversion and reference positions, and builds kymographs from the host's processed frames.
+- **AFM Movie Editor 2026.11.14.1**: 本体の処理済みフレームを使い、メイン画面の状態を変更しません。 / Uses the host's processed frames without changing the main window state.
+- **Spot Analysis 2026.11.14.1**: 本体の処理済みフレームを使います。CSV保存の失敗を一覧で示し、成功通知と区別します。 / Uses the host's processed frames; CSV save failures are listed and no longer reported as success.
+- **L-AFM Analysis 2026.11.14.1**: 3D再構成で最上段の高さの検出を保持します。 / 3D reconstruction keeps detections at the top height level.
+- **Particle Analysis 2026.11.14.1**: All Framesの結果に作成元ファイルを記録し、別のファイルの結果を使わないようにしました。 / All Frames results record their source file and are discarded for a different file.
+- **Dwell Analysis 2026.11.14.1**: 検出とマーク処理の境界条件を修正しました。 / Detection and marking edge cases are corrected.
+- **Particle Cluster Analysis 2026.11.14**: 楕円フィットでY方向の校正を保持します。 / Ellipse fits keep the Y calibration.
+- **Simulator Bridge 2026.11.14**: pyNuD Simulatorとの通信部分を更新しました。複数のpyNuDからの配信で一時ファイルを消し合わず、窓を閉じた後に配信中へ戻りません。 / Updated the link to pyNuD Simulator: multiple publishers no longer remove each other's files, and closing the window stops publishing for good.
+- **Interactive Drift Compensation 2026.11.14 / Reference Object Cropper 2026.11.14.1 / Normal Mode Analysis 2026.11.14**: 日英切り替えへの対応のみ。 / Language switch support only.
+
+このリリースのプラグインには **pyNuD 2.14.0以降** が必要です。These plugin versions require **pyNuD 2.14.0 or later**.
+
+## インストール / Installation
+1. 本体を2.14.0以降へ更新し、pyNuDを再起動します。Update the host to 2.14.0 or later and restart pyNuD.
+2. 更新するプラグインとそのAIレビュー画面を閉じます。Close the plugin and any of its AI review windows.
+3. 各ZIPをダウンロードし、**Plugin → Import Plugin ZIP...** で読み込みます。Import each individual ZIP; extraction is not required. Existing imported copies are preserved in separate folders.
+4. プラグインのウィンドウタイトルで版（2026.11.14 または 2026.11.14.1）を確認します。Confirm the version in the plugin window title.
+
+## Verification
+All 13 ZIPs were imported with the pyNuD 2.14.0 importer and every entry point loaded. ZIP contents match the files declared in each plugin.json, and SHA-256 digests are listed in SHA256SUMS.txt. The 1,639-test regression suite passes for the plugin source snapshot. These checks validate packaging and imports; they do not validate every scientific workflow.
+
+---
+
 # Plugin ZIP bundles — 2026-10-20
 
 ## 更新内容 / Changes

@@ -35,6 +35,7 @@ if not __package__:
         ) from exc
     adopt_legacy_entry(__name__, __file__)
 
+import helperFunctions as hf
 import sys
 import time
 import os # <<< osモジュールをインポート
@@ -43,6 +44,15 @@ import datetime
 import struct
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
+try:
+    from gui_i18n import QtWidgets
+except ImportError:  # 古い pyNuD 本体には gui_i18n が無い。そのときは元の Qt の部品で動く。
+    pass
+try:
+    from gui_i18n import pick_text
+except ImportError:  # 古い本体には pick_text が無い
+    def pick_text(en, ja):
+        return en
 from scipy.ndimage import maximum_filter, gaussian_filter, zoom, rotate, shift
 import cv2
 import tifffile
@@ -710,12 +720,7 @@ class LAFMPanelWindow(QtWidgets.QWidget):
         # 【重要】'visible'のチェックを削除し、設定が存在すれば必ず位置を復元する
         if saved_settings:
             try:
-                self.setGeometry(
-                    saved_settings.get('x', 150),
-                    saved_settings.get('y', 150),
-                    saved_settings.get('width', 600),
-                    saved_settings.get('height', 420)
-                )
+                hf.restore_saved_window_geometry(self, saved_settings, 150, 150, 600, 420)
             except Exception as e:
                 print(f"Failed to set geometry from saved settings: {e}")
         else:
@@ -1017,6 +1022,7 @@ class LAFMPanelWindow(QtWidgets.QWidget):
             "height enters only via the colour-level binning. The two are different quantities.\n"
             "pyNuD: フレーム毎の 確率x高さ の積。Heath: 全フレームをプールした局在密度。"
         )
+        self.render_mode_combo.currentTextChanged.connect(self._on_render_mode_changed)
         tol_layout.addRow("Rendering mode:", self.render_mode_combo)
 
         # Z範囲の自動設定ボタン（他のコントロールと同じ左の位置に配置）
@@ -1576,8 +1582,11 @@ class LAFMPanelWindow(QtWidgets.QWidget):
             self._update_status(f"Saved successfully!", color="green")
             QtWidgets.QMessageBox.information(
                 self,
-                "Success",
-                f"LAFMデータを保存しました:\n{filepath}\n\nParameters JSON:\n{params_json_path}"
+                pick_text("Success", "保存完了"),
+                pick_text(
+                    f"Saved the LAFM data:\n{filepath}\n\nParameters JSON:\n{params_json_path}",
+                    f"LAFMデータを保存しました:\n{filepath}\n\nパラメーター JSON:\n{params_json_path}",
+                ),
             )
 
             if self.main_window and hasattr(self.main_window, 'rescan_and_load'):
@@ -2343,8 +2352,41 @@ class LAFMPanelWindow(QtWidgets.QWidget):
                 display_img = np.max(self.reconstruction, axis=2)
             self._display_image(display_img, target='bottom')
 
+    def _needs_prep2_for_pynud_render(self, render_mode=None, mode=None):
+        """True when pyNuD rendering is selected but Heath Prep2 left no intensity stack."""
+        mode = mode if mode is not None else (self.params.get('mode', '2D') if getattr(self, 'params', None) else '2D')
+        text = render_mode if render_mode is not None else (
+            self.render_mode_combo.currentText() if hasattr(self, 'render_mode_combo') else ''
+        )
+        if str(text).startswith('Heath'):
+            return False
+        if str(mode) != '2D':
+            return False
+        return self.reconstruction is not None and self.reconstruction_image is None
+
+    def _warn_prep2_required_for_pynud(self):
+        QtWidgets.QMessageBox.warning(
+            self,
+            "LAFM Analysis",
+            "Heath モードで Prep2 したため再構成強度画像がありません。\n"
+            "pyNuD 方式で作るには Preprocessing 2 をやり直してください。\n\n"
+            "No reconstruction intensity image (Prep2 was run in Heath mode).\n"
+            "Re-run Preprocessing 2 before using pyNuD rendering."
+        )
+        self._update_status("Need Prep2 again for pyNuD mode.", color="red")
+
+    def _on_render_mode_changed(self, text):
+        if self._needs_prep2_for_pynud_render(render_mode=text):
+            self._warn_prep2_required_for_pynud()
+
     def run_make_lafm_image(self):
         self._collect_params()
+        if self._needs_prep2_for_pynud_render(
+            render_mode=self.params.get('render_mode'),
+            mode=self.params.get('mode', '2D'),
+        ):
+            self._warn_prep2_required_for_pynud()
+            return
         self._update_status("Step 3: Making final LAFM image...", color="darkorange")
         self.btn_save.setEnabled(False)
         self.progress_bar.setRange(0, 100)
@@ -2830,6 +2872,7 @@ class LAFMPanelWindow(QtWidgets.QWidget):
         # --- ステップ2: 再構成用グリッドの作成 ---
         reconstruction_grid = None
         reconstruction_image = None # 2Dモードで使う、強度重み付け用の画像
+        heath_2d = (not is_3d_mode) and str(params.get('render_mode', '')).startswith('Heath')
 
         if is_3d_mode:
             # 3Dモード：ボクセルグリッドを作成
@@ -2839,10 +2882,16 @@ class LAFMPanelWindow(QtWidgets.QWidget):
             
             num_z_bins = 1
             if z_res > 0 and (z_max > z_min):
-                num_z_bins = int(np.ceil((z_max - z_min) / z_res))
+                # Include the largest mapped index, also at an exact Z endpoint.
+                num_z_bins = int(np.floor((z_max - z_min) / z_res)) + 1
             
             reconstruction_grid = np.zeros((reconst_h, reconst_w, num_z_bins))
-        else: # 2Dモードの場合
+        elif heath_2d:
+            # Heath density render only needs hz_grid. Keep one 2D plane for Prep2
+            # preview and skip the (H×W×frames) float64 stacks (tens of GiB).
+            reconstruction_grid = np.zeros((reconst_h, reconst_w, 1), dtype=np.float64)
+            reconstruction_image = None
+        else: # 2Dモードの場合（pyNuD probability×height）
             reconstruction_grid = np.zeros((reconst_h, reconst_w, total_frames))
             # 強度計算用に、処理済みの画像スタックをそのまま代入する (forループは不要)
             reconstruction_image = np.zeros((reconst_h, reconst_w, total_frames))
@@ -2887,6 +2936,8 @@ class LAFMPanelWindow(QtWidgets.QWidget):
                     voxel_z = int((z_abs_nm - z_min) / z_res)
                 if 0 <= voxel_z < num_z_bins:
                     reconstruction_grid[pixel_y, pixel_x, voxel_z] += 1
+            elif heath_2d:
+                reconstruction_grid[pixel_y, pixel_x, 0] += 1
             else: # 2Dモード
                 if 0 <= frame_idx < total_frames:
                     reconstruction_grid[pixel_y, pixel_x, frame_idx] = 1
@@ -3120,35 +3171,47 @@ class LAFMPanelWindow(QtWidgets.QWidget):
         """「3D Display」チェックボックスの状態に応じてウィンドウを開閉する"""
         if not PYVISTA_AVAILABLE:
             self.show_3d_check.setChecked(False)
-            detail = f"\n\n詳細: {PV_IMPORT_ERROR}" if PV_IMPORT_ERROR else ""
+            detail = f"\n\nDetail: {PV_IMPORT_ERROR}" if PV_IMPORT_ERROR else ""
+            detail_ja = f"\n\n詳細: {PV_IMPORT_ERROR}" if PV_IMPORT_ERROR else ""
             _frozen = getattr(sys, "frozen", False)
             if _frozen:
-                msg = (
-                    "3D Display requires PyVista, PyVistaQt, and VTK.\n"
+                msg = pick_text(
+                    "3D Display requires PyVista, PyVistaQt, and VTK.\n\n"
+                    "These modules are not installed. They are not bundled with this installation."
+                    + detail,
                     "3D表示には PyVista、PyVistaQt、VTK が必要です。\n\n"
-                    "These modules are not installed. They are not bundled with this installation.\n"
-                    "これらはインストールされていません。このパッケージに含まれていません。" + detail
+                    "これらはインストールされていません。このパッケージに含まれていません。"
+                    + detail_ja,
                 )
             else:
-                msg = (
-                    "3D Display requires PyVista, PyVistaQt, and VTK.\n"
-                    "3D表示には PyVista、PyVistaQt、VTK が必要です。\n\n"
+                msg = pick_text(
+                    "3D Display requires PyVista, PyVistaQt, and VTK.\n\n"
                     "Install with: pip install pyvista pyvistaqt\n"
-                    "(VTK is installed automatically as a dependency of PyVista.)\n"
+                    "(VTK is installed automatically as a dependency of PyVista.)\n\n"
+                    "After installing, try enabling 3D Display again."
+                    + detail,
+                    "3D表示には PyVista、PyVistaQt、VTK が必要です。\n\n"
                     "インストール: pip install pyvista pyvistaqt\n"
                     "（VTK は PyVista の依存関係として自動でインストールされます。）\n\n"
-                    "After installing, try enabling 3D Display again.\n"
-                    "インストール後、再度 3D Display を有効にしてください。" + detail
+                    "インストール後、再度 3D Display を有効にしてください。"
+                    + detail_ja,
                 )
             QtWidgets.QMessageBox.critical(
-                self, "Library Not Found / ライブラリが見つかりません", msg
+                self, pick_text("Library Not Found", "ライブラリが見つかりません"), msg
             )
             return
 
         if checked:
             if self.final_lafm_image is None or self.params.get('mode') != '3D':
                 self.show_3d_check.setChecked(False)
-                QtWidgets.QMessageBox.warning(self, "No 3D Data", "表示する3D LAFMデータがありません。\n先に3Dモードで「Make LAFM Image」を実行してください。")
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    pick_text("No 3D Data", "3Dデータがありません"),
+                    pick_text(
+                        "There is no 3D LAFM data to display.\nRun Make LAFM Image in 3D mode first.",
+                        "表示する3D LAFMデータがありません。\n先に3Dモードで「Make LAFM Image」を実行してください。",
+                    ),
+                )
                 return
 
             try:

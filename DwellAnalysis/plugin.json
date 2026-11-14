@@ -3,8 +3,8 @@
   "id": "DwellAnalysis",
   "name": "Dwell Analysis",
   "entrypoint": "DwellAnalysis.py",
-  "version": "2026.10.4",
-  "updated": "2026-10-04",
+  "version": "2026.11.14.1",
+  "updated": "2026-11-14",
   "host_api": 1,
   "files": [
     "DwellAnalysis.py",

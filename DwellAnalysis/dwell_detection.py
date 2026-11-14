@@ -12,6 +12,17 @@ from scipy.optimize import least_squares
 from skimage.feature import peak_local_max
 
 
+def aperture_grid(shape, x, y, radius):
+    """Return a clipped aperture box and global pixel coordinates within it."""
+    h, w = shape
+    x0 = min(w, max(0, int(np.floor(x-radius))))
+    x1 = min(w, max(0, int(np.ceil(x+radius))+1))
+    y0 = min(h, max(0, int(np.floor(y-radius))))
+    y1 = min(h, max(0, int(np.ceil(y+radius))+1))
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    return (slice(y0, y1), slice(x0, x1)), yy, xx
+
+
 # Numerical protocol used for the original reviewed trial. Field boundaries are
 # deliberately NOT part of the protocol: they must be measured on each movie.
 # Optional reference settings in nm/pixels, not universal molecular thresholds.
@@ -158,13 +169,13 @@ def analyze(frames, *, segments=None, plane=True, block_frames=25,
         points = peak_local_max(density, min_distance=max(2, int(separation_px)),
                                 threshold_abs=max(.001, high*.0044) if density_floor is None else density_floor,
                                 exclude_border=4)
-        yy, xx = np.indices((h, w))
         segment_records.append(dict(id=seg_id, first_frame=first, last_frame=last,
                                     registration_median=float(np.median(quality))))
         for y, x in sorted(points, key=lambda point: (-point[0], point[1])):
             check()
+            box, yy, xx = aperture_grid((h, w), x, y, radius_px)
             disk = (yy-y)**2+(xx-x)**2 <= radius_px**2
-            signal = np.percentile(response[:, disk], 80, axis=1)
+            signal = np.percentile(response[(slice(None),)+box][:, disk], 80, axis=1)
             positions = np.array([x, y])[None, :]-shifts[:, ::-1]
             margin = radius_px+2
             valid = ((positions[:, 0] >= margin) & (positions[:, 0] < w-margin)
@@ -176,7 +187,7 @@ def analyze(frames, *, segments=None, plane=True, block_frames=25,
             site = dict(id=ident, first_frame=first, last_frame=last, radius_px=float(radius_px),
                         display_radius_px=float(radius_px*1.5),
                         positions_px=positions.tolist(), response_nm=signal.tolist(), valid=valid.tolist(),
-                        low_nm=low, high_nm=high, noise_nm=float(np.median(noise[disk])))
+                        low_nm=low, high_nm=high, noise_nm=float(np.median(noise[box][disk])))
             sites.append(site)
             for start, end, bridged in detected:
                 left = start == 0 or not valid[start-1]

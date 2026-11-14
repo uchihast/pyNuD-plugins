@@ -5,6 +5,15 @@ import tempfile
 import threading
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+try:
+    from gui_i18n import QtWidgets
+except ImportError:  # 古い pyNuD 本体には gui_i18n が無い。そのときは元の Qt の部品で動く。
+    pass
+try:
+    from gui_i18n import pick_text
+except ImportError:  # 古い本体には pick_text が無い
+    def pick_text(en, ja):
+        return en
 
 from ai_data_sharing import AISharingConsent, AISharingCheckBox, current_background_source
 from ai_progress import AIProgress
@@ -540,11 +549,29 @@ class ParticleAnalysisDialog(QtWidgets.QDialog):
         result['selected_ids']=set(self.selected)
         self.details.clear()
         snapshot=result['snapshot'];m=snapshot.metadata
-        first='first analyzed appearance' if has_skipped_frames(self.session) else 'first appearance'
-        scope=(f'Movie-global IDs • Statistics: {first} only' if self.session['id_scope']=='movie-global' else 'Frame-local IDs')
-        approach=DETECTION_APPROACHES.get(result.get('audit',{}).get('detection_start_mode'),'')
-        approach_text=(' • '+approach) if approach else ''
-        self.result_label.setText(f'Result: {Path(m.get("source_path","input")).name} • Frame {m["frame_0based"]+1} • Channel 1 • {result.get("origin","ai")} • {scope}{approach_text}')
+        first_en = "first analyzed appearance" if has_skipped_frames(self.session) else "first appearance"
+        first_ja = "最初に解析した出現" if has_skipped_frames(self.session) else "最初の出現"
+        if self.session["id_scope"] == "movie-global":
+            scope_en = f"Movie-global IDs • Statistics: {first_en} only"
+            scope_ja = f"動画全体の ID • 統計: {first_ja}のみ"
+        else:
+            scope_en = "Frame-local IDs"
+            scope_ja = "フレーム内の ID"
+        mode = result.get("audit", {}).get("detection_start_mode")
+        approach_en = DETECTION_APPROACHES.get(mode, "")
+        approach_ja = {
+            "default_detection": "既定の検出と AI による確認・修正",
+            "ai_from_scratch": "AI が検出を一から設計",
+        }.get(mode, "")
+        approach_text_en = (" • " + approach_en) if approach_en else ""
+        approach_text_ja = (" • " + approach_ja) if approach_ja else ""
+        source_name = Path(m.get("source_path", "input")).name
+        frame_no = m["frame_0based"] + 1
+        origin = result.get("origin", "ai")
+        self.result_label.setText(pick_text(
+            f"Result: {source_name} • Frame {frame_no} • Channel 1 • {origin} • {scope_en}{approach_text_en}",
+            f"結果: {source_name} • フレーム {frame_no} • チャンネル 1 • {origin} • {scope_ja}{approach_text_ja}",
+        ))
         revisions=result.get('audit',{}).get('detection_linking',{}).get('revisions',[])
         revision_text=''.join(f'\nLocal detection repair (NumPy y/x bounds {r["bbox_yx"]}): {r["reason"]}' for r in revisions)
         self.summary.setPlainText(result['algorithm']+'\n'+result['summary']+'\n'+'\n'.join(result['warnings'])+revision_text)

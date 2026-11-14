@@ -7,6 +7,7 @@ from PIL import ImageDraw
 from analysis_input import source_unchanged
 from background_auto import check_cancel
 from . import dwell_ai as ai
+from .dwell_detection import aperture_grid
 
 STATES = ('present', 'absent', 'unknown')
 
@@ -155,7 +156,7 @@ def commit_marks(draft, progress=lambda p, m: None, cancelled=lambda: False):
     if not draft.changed: return draft.session
     session = draft.session; snapshots = session['snapshots']; n = len(snapshots); dt = session['frame_time_s']
     result = ai.validate_result(session['result'], snapshots, dt, decisions=True)
-    original_sites = {s['id']: s for s in result['sites']}; h, w = draft.shape; yy, xx = np.indices((h, w))
+    original_sites = {s['id']: s for s in result['sites']}; h, w = draft.shape
     # Retain unrelated IDs, event choices and their exact numerical method.
     retained_events = [e for e in result['events'] if e['site'] not in draft.changed]
     used_ids = {e['id'] for e in result['events']}; assessed = set(result['assessed_frames'])
@@ -174,6 +175,8 @@ def commit_marks(draft, progress=lambda p, m: None, cancelled=lambda: False):
         signal = []; valid = []; flags = []
         for k, (snap, (x, y)) in enumerate(zip(snapshots, record['positions'])):
             check_cancel(cancelled); source_unchanged(snap)
+            box, yy, xx = aperture_grid((h, w), x, y, radius*2.5)
+            image = snap.image[box]
             d2 = (xx-x)**2+(yy-y)**2; disk = d2 <= radius**2; ring = (d2 >= (radius*1.5)**2) & (d2 <= (radius*2.5)**2)
             distances = np.sum((all_positions[:, k]-[x, y])**2, axis=1)
             neighbours = all_present[:, k] & (distances <= (2.5*radius+1.5*all_radii)**2)
@@ -181,8 +184,8 @@ def commit_marks(draft, progress=lambda p, m: None, cancelled=lambda: False):
             for other in np.flatnonzero(neighbours):
                 ox, oy = all_positions[other, k]
                 ring &= (xx-ox)**2+(yy-oy)**2 > (all_radii[other]*1.5)**2
-            baseline = float(np.median(snap.image[ring])) if ring.any() else 0.
-            signal.append(float(np.percentile(snap.image[disk], 80)-baseline) if disk.any() else 0.)
+            baseline = float(np.median(image[ring])) if ring.any() else 0.
+            signal.append(float(np.percentile(image[disk], 80)-baseline) if disk.any() else 0.)
             oi = k+1-old['first_frame'] if old else -1
             supported_before = old is not None and 0 <= oi < len(old['valid']) and old['valid'][oi]
             measured = (reviewed[k] or supported_before) and radius <= x < w-radius and radius <= y < h-radius and ring.sum() >= 8 and disk.any()

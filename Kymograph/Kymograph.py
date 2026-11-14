@@ -19,8 +19,18 @@ if not __package__:
     adopt_legacy_entry(__name__, __file__)
 
 
+import helperFunctions as hf
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
+try:
+    from gui_i18n import QtWidgets
+except ImportError:  # 古い pyNuD 本体には gui_i18n が無い。そのときは元の Qt の部品で動く。
+    pass
+try:
+    from gui_i18n import pick_text
+except ImportError:  # 古い本体には pick_text が無い
+    def pick_text(en, ja):
+        return en
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
@@ -198,6 +208,7 @@ class KymographWindow(QtWidgets.QWidget):
         self.image_stack = []
         self.current_frame = 0
         self.roi_line = None
+        self._kymo_nm_per_column = None
         self.roi_rect = None
         self.kymograph_data = None
         
@@ -956,6 +967,7 @@ class KymographWindow(QtWidgets.QWidget):
         
         # ROIデータをクリア
         self.roi_line = None
+        self._kymo_nm_per_column = None
         self.roi_rect = None
         self.drawn_box = None  # 描画された矩形もクリア
         
@@ -1506,6 +1518,8 @@ class KymographWindow(QtWidgets.QWidget):
     def loadImageStack(self):
         """画像スタックを読み込み"""
         self.image_stack = []
+        self._kymo_source_frame_indices = []
+        self._kymo_frame_time_s = float(getattr(gv, 'FrameTime', 1000.)) / 1000.
         
         # グローバル変数の安全性チェック
         if gv is None:
@@ -1526,27 +1540,46 @@ class KymographWindow(QtWidgets.QWidget):
             
         # 元のインデックスを保存
         original_index = gv.index if hasattr(gv, 'index') else 0
+        # メイン画面の処理（レベリング、フィルタ、ドリフト補正）を反映したフレームを
+        # ホストから受け取る。LoadFrame を直接呼ぶと生データになり、メイン側の
+        # 処理済みバッファも消してしまう。ホストが渡せないときだけ従来の読み込みに戻る。
+        host_frame = getattr(getattr(self, 'main_window', None), 'getImageDataForFrame', None)
+        raw_load_used = False
         
         try:
             # メモリ使用量を制限するために、最大フレーム数を制限
             max_frames = min(gv.FrameNum, 1000)  # 最大1000フレームまで
             
             for frame_idx in range(max_frames):
-                # インデックスを設定
-                gv.index = frame_idx
-                
-                # 安全なフレーム読み込み
-                if not safe_load_frame(gv.files[gv.currentFileNum], frame_idx):
-                    print(f"Warning: Failed to load frame {frame_idx}")
-                    continue
-                
-                # 安全なデータ取得
-                frame_data = safe_get_ary_data()
+                frame_data = None
+                if callable(host_frame):
+                    try:
+                        frame_data = host_frame(frame_idx, "1ch")
+                    except Exception:
+                        frame_data = None
+                    if frame_data is not None:
+                        frame_data = np.asarray(frame_data)
+                        if frame_data.ndim != 2:
+                            frame_data = None
+
+                if frame_data is None:
+                    raw_load_used = True
+                    # インデックスを設定
+                    gv.index = frame_idx
+
+                    # 安全なフレーム読み込み
+                    if not safe_load_frame(gv.files[gv.currentFileNum], frame_idx):
+                        print(f"Warning: Failed to load frame {frame_idx}")
+                        continue
+
+                    # 安全なデータ取得
+                    frame_data = safe_get_ary_data()
                 if frame_data is not None:
                     # メモリ使用量を削減するために、データ型を最適化
                     if frame_data.dtype != np.float32:
                         frame_data = frame_data.astype(np.float32)
                     self.image_stack.append(frame_data)
+                    self._kymo_source_frame_indices.append(frame_idx)
                 else:
                     print(f"Warning: No data for frame {frame_idx}")
                     
@@ -1559,12 +1592,14 @@ class KymographWindow(QtWidgets.QWidget):
             self.image_stack = []
             
         finally:
-            # 元のフレームに戻す
-            try:
-                gv.index = original_index
-                safe_load_frame(gv.files[gv.currentFileNum], original_index)
-            except Exception as e:
-                print(f"Error restoring original frame: {e}")
+            # 元のフレームに戻す（生データの読み込みを使ったときだけ。ホスト経由のときは
+            # gv の状態が変わっていないので、読み直すとかえって処理済みバッファを消す）
+            if raw_load_used:
+                try:
+                    gv.index = original_index
+                    safe_load_frame(gv.files[gv.currentFileNum], original_index)
+                except Exception as e:
+                    print(f"Error restoring original frame: {e}")
         
          #print(f"Loaded {len(self.image_stack)} frames out of {gv.FrameNum}")
         
@@ -1630,6 +1665,19 @@ class KymographWindow(QtWidgets.QWidget):
         
         # 実際のフレーム高さを記録（追加）
         self.actual_frame_height = crop_height
+
+        # 矩形方式では回転後の画像の 1 画素が 1 列になる。矩形の長軸方向へ
+        # 1 画素進んだときの物理長を、列あたりの nm として保持する。
+        self._kymo_nm_per_column = None
+        try:
+            if gv.XScanSize > 0 and gv.YScanSize > 0:
+                _px = gv.XScanSize / image_width
+                _py = gv.YScanSize / image_height
+                self._kymo_nm_per_column = float(
+                    np.hypot(np.cos(box_angle) * _px, np.sin(box_angle) * _py)
+                )
+        except Exception:
+            self._kymo_nm_per_column = None
         
         #print(f"DEBUG: Fixed crop region: ({crop_min_row}, {crop_min_col}) to ({crop_max_row}, {crop_max_col})")
         #print(f"DEBUG: Fixed crop size: {crop_height} x {crop_width}")
@@ -1745,11 +1793,15 @@ class KymographWindow(QtWidgets.QWidget):
         pixel_size_x = gv.XScanSize / image_width  # nm/pixel
         pixel_size_y = gv.YScanSize / image_height  # nm/pixel
         
-        # 線の物理的な長さを計算（nm）
-        line_length_nm = line_length_pixels * np.sqrt(pixel_size_x**2 + pixel_size_y**2)
+        # 線の物理的な長さを計算（nm）。X と Y で画素サイズが違ってもよいように
+        # 各成分を nm に直してから長さを取る。
+        line_length_nm = float(np.hypot((end_x - start_x) * pixel_size_x,
+                                        (end_y - start_y) * pixel_size_y))
         
         # 物理サイズに基づいてサンプリング点数を決定（1nmあたり1点程度）
         num_points = max(int(line_length_nm), 10)
+        # kymograph の 1 列が何 nm にあたるか（距離・速度の換算に使う）
+        self._kymo_nm_per_column = line_length_nm / (num_points - 1)
         
         #print(f"DEBUG: Line length: {line_length:.1f} pixels, Sampling points: {num_points}")
         
@@ -1761,66 +1813,52 @@ class KymographWindow(QtWidgets.QWidget):
         #print(f"DEBUG: First 3 points: x={seg_x[:3]}, y={seg_y[:3]}")
         #print(f"DEBUG: Last 3 points: x={seg_x[-3:]}, y={seg_y[-3:]}")
         
-        # kymographデータを初期化
-        if len(self.image_stack) == 1:
-            kymograph = np.zeros((1, num_points))
-        else:
-            kymograph = np.zeros((len(self.image_stack), num_points))
-        
-        # 各フレームで線に沿ったデータを抽出
-        for frame_idx, frame_data in enumerate(self.image_stack):
-            #print(f"DEBUG: Processing frame {frame_idx}")
-            #print(f"DEBUG: Frame shape: {frame_data.shape}")
-            #print(f"DEBUG: Frame data range: {frame_data.min():.2f} to {frame_data.max():.2f}")
-            
-            # 各点でのデータ値を取得
-            extracted_data = []
-            for i in range(num_points):
-                x, y = seg_x[i], seg_y[i]
-                
-                # 境界チェック
-                if 0 <= x < frame_data.shape[1] and 0 <= y < frame_data.shape[0]:
-                    # 双線形補間
-                    x0, y0 = int(x), int(y)
-                    x1, y1 = min(x0 + 1, frame_data.shape[1] - 1), min(y0 + 1, frame_data.shape[0] - 1)
-                    
-                    # 補間係数
-                    fx, fy = x - x0, y - y0
-                    
-                    # 4つの隣接ピクセルの値
-                    v00 = frame_data[y0, x0]
-                    v01 = frame_data[y0, x1] if x1 != x0 else v00
-                    v10 = frame_data[y1, x0] if y1 != y0 else v00
-                    v11 = frame_data[y1, x1] if (x1 != x0 and y1 != y0) else v00
-                    
-                    # 双線形補間
-                    interpolated_value = (1-fx)*(1-fy)*v00 + fx*(1-fy)*v01 + (1-fx)*fy*v10 + fx*fy*v11
-                    extracted_data.append(interpolated_value)
+        return KymographWindow._sampleLineStack(self, seg_x, seg_y)
+
+    def _sampleLineStack(self, seg_x, seg_y, scalar_weights=False):
+        """Sample a path with the existing bilinear and out-of-bounds rules."""
+        result = np.zeros((len(self.image_stack), len(seg_x)), dtype=float)
+        geometry = {}
+        for i, frame in enumerate(self.image_stack):
+            shape = frame.shape
+            if shape not in geometry:
+                valid = ((seg_x >= 0) & (seg_x < shape[1]) & (seg_y >= 0) & (seg_y < shape[0]))
+                x, y = seg_x[valid], seg_y[valid]
+                x0, y0 = x.astype(int), y.astype(int)
+                x1, y1 = np.minimum(x0+1, shape[1]-1), np.minimum(y0+1, shape[0]-1)
+                fx, fy = x-x0, y-y0
+                weights = [(1-fx)*(1-fy), fx*(1-fy), (1-fx)*fy, fx*fy]
+                geometry[shape] = (valid, x0, y0, x1, y1, weights)
+            valid, x0, y0, x1, y1, weights = geometry[shape]
+            v00 = frame[y0, x0]
+            v01 = np.where(x1 != x0, frame[y0, x1], v00)
+            v10 = np.where(y1 != y0, frame[y1, x0], v00)
+            v11 = np.where((x1 != x0) & (y1 != y0), frame[y1, x1], v00)
+            row = result[i]
+            if scalar_weights is not False:
+                # The old polyline loop used Python scalar coordinates. NumPy
+                # can then perform each product/addition in float32, whereas
+                # the straight-line loop uses float64 np.linspace scalars.
+                dtype = np.asarray(frame.flat[0] * 1.0).dtype
+                weak = np.asarray(scalar_weights)
+                if weak.ndim:
+                    weak = weak[valid]
+                low_precision = [weight.astype(dtype) for weight in weights]
+                low_values = (low_precision[0]*v00 + low_precision[1]*v01
+                              + low_precision[2]*v10 + low_precision[3]*v11)
+                if np.all(weak):
+                    row[valid] = low_values
                 else:
-                    # 境界外の場合は0
-                    extracted_data.append(0)
-            
-            extracted_data = np.array(extracted_data)
-            
-            # 正規化を適用
-            if self.normalize_enabled:
-                extracted_data = self.normalizeFrame(extracted_data)
-            
-            if len(self.image_stack) == 1:
-                kymograph[0, :] = extracted_data
+                    high_values = weights[0]*v00 + weights[1]*v01 + weights[2]*v10 + weights[3]*v11
+                    row[valid] = np.where(weak, low_values, high_values)
             else:
-                kymograph[frame_idx, :] = extracted_data
-            
-            #print(f"DEBUG: Frame {frame_idx} - Extracted data range: {extracted_data.min():.2f} to {extracted_data.max():.2f}")
-            
-            # 線の両端のデータ値を確認
-            #print(f"DEBUG: Frame {frame_idx} - Start value: {extracted_data[0]:.2f}, End value: {extracted_data[-1]:.2f}")
-        
-        #print(f"DEBUG: Final kymograph shape: {kymograph.shape}")
-        #print(f"DEBUG: Final kymograph range: {kymograph.min():.2f} to {kymograph.max():.2f}")
-        
-        return kymograph
-    
+                row[valid] = weights[0]*v00 + weights[1]*v01 + weights[2]*v10 + weights[3]*v11
+            if self.normalize_enabled:
+                values = (row.astype(dtype) if scalar_weights is not False
+                          and np.all(weak) and np.all(valid) else row)
+                result[i] = self.normalizeFrame(values)
+        return result
+
     def createMultiPointKymograph(self):
         """複数点ラインに沿ったkymograph作成"""
         if not self.multi_point_line or not self.image_stack:
@@ -1857,82 +1895,46 @@ class KymographWindow(QtWidgets.QWidget):
         pixel_size_x = gv.XScanSize / image_width  # nm/pixel
         pixel_size_y = gv.YScanSize / image_height  # nm/pixel
         
-        # 複数点ラインの物理的な総長を計算（nm）
-        total_length_nm = total_length_pixels * np.sqrt(pixel_size_x**2 + pixel_size_y**2)
+        # 複数点ラインの物理的な総長を計算（nm）。線分ごとに各成分を nm に
+        # 直して長さを取り、サンプリングも物理長で等間隔にする。
+        segment_lengths_nm = [
+            float(np.hypot((points[i + 1][0] - points[i][0]) * pixel_size_x,
+                           (points[i + 1][1] - points[i][1]) * pixel_size_y))
+            for i in range(len(points) - 1)
+        ]
+        total_length_nm = float(sum(segment_lengths_nm))
         
         # 物理サイズに基づいてサンプリング点数を決定（1nmあたり1点程度）
         num_points = max(int(total_length_nm), 10)
+        # kymograph の 1 列が何 nm にあたるか（距離・速度の換算に使う）
+        self._kymo_nm_per_column = total_length_nm / (num_points - 1)
         
-        # kymographデータを初期化
-        if len(self.image_stack) == 1:
-            kymograph = np.zeros((1, num_points))
-        else:
-            kymograph = np.zeros((len(self.image_stack), num_points))
-        
-        # 各フレームで複数点ラインに沿ったデータを抽出
-        for frame_idx, frame_data in enumerate(self.image_stack):
-            extracted_data = []
-            
-            # 各サンプリング点でのデータ値を取得
-            for i in range(num_points):
-                # サンプリング点の位置を計算（0から1の範囲）
-                t = i / (num_points - 1) if num_points > 1 else 0
-                
-                # 対応する線分と位置を特定
-                current_length = 0
-                target_length = t * total_length_pixels
-                
-                for seg_idx, seg_length in enumerate(segment_lengths_pixels):
-                    if current_length + seg_length >= target_length:
-                        # この線分内の位置を計算
-                        local_t = (target_length - current_length) / seg_length
-                        p1 = points[seg_idx]
-                        p2 = points[seg_idx + 1]
-                        
-                        # 線形補間で座標を計算
-                        x = p1[0] + local_t * (p2[0] - p1[0])
-                        y = p1[1] + local_t * (p2[1] - p1[1])
-                        break
-                    current_length += seg_length
-                else:
-                    # 最後の点
-                    x, y = points[-1]
-                
-                # 境界チェック
-                if 0 <= x < frame_data.shape[1] and 0 <= y < frame_data.shape[0]:
-                    # 双線形補間
-                    x0, y0 = int(x), int(y)
-                    x1, y1 = min(x0 + 1, frame_data.shape[1] - 1), min(y0 + 1, frame_data.shape[0] - 1)
-                    
-                    # 補間係数
-                    fx, fy = x - x0, y - y0
-                    
-                    # 4つの隣接ピクセルの値
-                    v00 = frame_data[y0, x0]
-                    v01 = frame_data[y0, x1] if x1 != x0 else v00
-                    v10 = frame_data[y1, x0] if y1 != y0 else v00
-                    v11 = frame_data[y1, x1] if (x1 != x0 and y1 != y0) else v00
-                    
-                    # 双線形補間
-                    interpolated_value = (1-fx)*(1-fy)*v00 + fx*(1-fy)*v01 + (1-fx)*fy*v10 + fx*fy*v11
-                    extracted_data.append(interpolated_value)
-                else:
-                    # 境界外の場合は0
-                    extracted_data.append(0)
-            
-            extracted_data = np.array(extracted_data)
-            
-            # 正規化を適用
-            if self.normalize_enabled:
-                extracted_data = self.normalizeFrame(extracted_data)
-            
-            if len(self.image_stack) == 1:
-                kymograph[0, :] = extracted_data
-            else:
-                kymograph[frame_idx, :] = extracted_data
-        
-        return kymograph
-    
+        # Match the old segment traversal (left segment wins at vertices),
+        # including zero-length segments and an all-identical-point path.
+        cumulative = np.cumsum(segment_lengths_nm)
+        targets = np.arange(num_points) / (num_points-1) * total_length_nm
+        indices = np.minimum(np.searchsorted(cumulative, targets, side='left'), len(cumulative)-1)
+        starts = np.concatenate(([0.], cumulative[:-1]))
+        lengths = np.asarray(segment_lengths_nm)[indices]
+        # Keep each point's scalar type: NumPy float64 vertices and Python
+        # float vertices had different float32 rounding in the original loop.
+        coordinates = []
+        weak = []
+        for i, index in enumerate(indices):
+            target = i / (num_points-1) * total_length_nm
+            fraction = ((target-float(starts[index])) / float(lengths[i])
+                        if lengths[i] > 0 else 0.)
+            p1, p2 = points[index], points[index+1]
+            x = p1[0] + fraction*(p2[0]-p1[0])
+            y = p1[1] + fraction*(p2[1]-p1[1])
+            if target > cumulative[-1]:
+                x, y = points[-1]
+            coordinates.append((x, y))
+            weak.append(not isinstance(x, np.float64) and not isinstance(y, np.float64))
+        coords = np.asarray(coordinates)
+        return KymographWindow._sampleLineStack(self, coords[:, 0], coords[:, 1],
+                                               scalar_weights=np.asarray(weak))
+
     def createRectangleMask(self, height, width):
         """矩形マスクを作成"""
         if not hasattr(self, 'drawn_box') or self.drawn_box is None:
@@ -2888,19 +2890,24 @@ class KymographWindow(QtWidgets.QWidget):
         except ImportError:
             _frozen = getattr(sys, "frozen", False)
             if _frozen:
-                msg = (
-                    f"{feature_name} requires scikit-image.\n"
-                    "この機能には scikit-image が必要です。モジュールがインストールされていません。\n\n"
-                    "scikit-image is not bundled with this installation.\n"
-                    "このモジュールはこのパッケージに含まれていません。"
+                msg = pick_text(
+                    f"{feature_name} requires scikit-image.\n\n"
+                    "scikit-image is not bundled with this installation.",
+                    f"{feature_name} には scikit-image が必要です。\n"
+                    "モジュールがインストールされていません。\n\n"
+                    "このパッケージには scikit-image が含まれていません。",
                 )
             else:
-                msg = (
-                    f"{feature_name} requires scikit-image.\n"
-                    "この機能には scikit-image が必要です。モジュールがインストールされていません。\n\n"
-                    "Install with: pip install scikit-image"
+                msg = pick_text(
+                    f"{feature_name} requires scikit-image.\n\n"
+                    "Install with: pip install scikit-image",
+                    f"{feature_name} には scikit-image が必要です。\n"
+                    "モジュールがインストールされていません。\n\n"
+                    "次のコマンドでインストールしてください: pip install scikit-image",
                 )
-            QtWidgets.QMessageBox.warning(self, "Package required", msg)
+            QtWidgets.QMessageBox.warning(
+                self, pick_text("Package required", "必要なパッケージ"), msg
+            )
             return False
         
     def optimizeContrastCLAHE(self):
@@ -3208,7 +3215,7 @@ class KymographWindow(QtWidgets.QWidget):
                 settings = gv.windowSettings['KymographWindow']
                 if 'geometry' in settings:
                     x, y, width, height = settings['geometry']
-                    self.setGeometry(x, y, width, height)
+                    hf.set_window_geometry(self, x, y, width, height, position_kind=settings.get('position_kind', 'client'))
                 if 'visible' in settings and settings['visible']:
                     self.show()
                 if 'normalize_enabled' in settings:
@@ -3234,7 +3241,7 @@ class KymographWindow(QtWidgets.QWidget):
             if not hasattr(gv, 'windowSettings'):
                 gv.windowSettings = {}
             gv.windowSettings['KymographWindow'] = {
-                'geometry': self.geometry().getRect(),
+                'geometry': hf.window_frame_rect(self).getRect(), 'position_kind': 'frame',
                 'visible': self.isVisible(),
                 'normalize_enabled': self.normalize_enabled,
                 'dh_nm': self.dh_nm,
@@ -4733,7 +4740,7 @@ class KymographWindow(QtWidgets.QWidget):
             
             try:
                 # 時間間隔を取得（デフォルト値1.0）
-                time_interval = 1.0
+                time_interval = getattr(self, '_kymo_frame_time_s', float(getattr(gv, 'FrameTime', 1000.)) / 1000.)
                 #print(f"DEBUG: time_interval = {time_interval}, detection_method = {detection_method}")
                 #print(f"DEBUG: rectangular_mode = {is_rectangular_mode}")
                 
@@ -4780,41 +4787,6 @@ class KymographWindow(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Error", "Invalid detection type.")
             return
         
-        # Execute the following processing only for Fibril end mode
-        try:
-            # 時間間隔を取得（デフォルト値1.0）
-            time_interval = 1.0
-            #print(f"DEBUG: time_interval = {time_interval}, detection_method = {detection_method}")
-            #print(f"DEBUG: rectangular_mode = {is_rectangular_mode}")
-            
-            # Execute fiber growth analysis
-            #print("DEBUG: calling analyzeFiberGrowth with rectangular support")
-            growth_data = self.analyzeFiberGrowthImproved(self.kymograph_data, time_interval, detection_method)
-            
-            if growth_data is None:
-                #print("DEBUG: analyzeFiberGrowth returned None")
-                QtWidgets.QMessageBox.warning(self, "Error", "Fiber growth analysis failed.")
-                return
-            
-            #print("DEBUG: analyzeFiberGrowth successful")
-            
-            # Save analysis results
-            self.fiber_growth_data = growth_data
-            
-            # Display analysis results
-            #print("DEBUG: calling displayFiberGrowthAnalysis")
-            self.displayFiberGrowthAnalysis(growth_data)
-            
-            # Redraw kymograph with detection results
-            #print("DEBUG: updating kymograph display with detection results")
-            self.displayKymograph()
-            
-        except Exception as e:
-            #print(f"DEBUG: Exception in analyzeFiberGrowthFromUI: {e}")
-            import traceback
-            traceback.print_exc()
-            QtWidgets.QMessageBox.critical(self, "Error", f"An error occurred during fiber growth analysis:\n{e}")
-    
     def createFiberGrowthReport(self, growth_data):
         """Create fiber growth analysis report"""
         #print("DEBUG: createFiberGrowthReport called")
@@ -5007,7 +4979,9 @@ class KymographWindow(QtWidgets.QWidget):
         #print(f"DEBUG: edge_positions shape: {edge_positions.shape}")
         
         # Generate time axis
-        time_points = np.arange(len(edge_positions)) * time_interval
+        indices = getattr(self, '_kymo_source_frame_indices', [])
+        time_points = (np.asarray(indices) if len(indices) == len(edge_positions)
+                       else np.arange(len(edge_positions))) * time_interval
         
         # Fit growth trajectory
         growth_params = self._fitGrowthTrajectory(time_points, edge_positions)
@@ -5638,8 +5612,13 @@ class KymographWindow(QtWidgets.QWidget):
             return np.array(positions)
 
     def getPixelToNmConversion(self):
-        """ピクセルからnmへの変換係数を取得"""
+        """kymograph の 1 列（位置の 1 単位）あたりの nm を取得"""
         try:
+            # kymograph 作成時に求めた「1 列あたりの nm」を優先する。
+            # 列は線に沿った再サンプリング点で、元画像の X 画素とは一致しない。
+            nm_per_column = getattr(self, '_kymo_nm_per_column', None)
+            if nm_per_column is not None and np.isfinite(nm_per_column) and nm_per_column > 0:
+                return float(nm_per_column)
             # 画像の物理サイズ情報から変換係数を計算
             if (hasattr(gv, 'XScanSize') and hasattr(gv, 'YScanSize') and 
                 hasattr(gv, 'aryData') and gv.aryData is not None and
@@ -5680,7 +5659,7 @@ class KymographWindow(QtWidgets.QWidget):
                 if hasattr(self, 'graph_window') and self.graph_window is not None:
                     try:
                         # 現在の位置とサイズを保存
-                        self.graph_window_geometry = self.graph_window.geometry()
+                        self.graph_window_geometry = hf.window_frame_rect(self.graph_window)
                         print(f"DEBUG: Saving window geometry: {self.graph_window_geometry}")
                         self.graph_window.close()
                     except:
@@ -5812,7 +5791,7 @@ class KymographWindow(QtWidgets.QWidget):
         """グラフウィンドウが移動された時の処理"""
         if hasattr(self, 'graph_window') and self.graph_window is not None:
             # 新しい位置とサイズを保存
-            self.graph_window_geometry = self.graph_window.geometry()
+            self.graph_window_geometry = hf.window_frame_rect(self.graph_window)
             #print(f"DEBUG: Window moved, saving geometry: {self.graph_window_geometry}")
         event.accept()
         
@@ -5820,7 +5799,7 @@ class KymographWindow(QtWidgets.QWidget):
         """グラフウィンドウの位置を復元"""
         if (hasattr(self, 'graph_window') and self.graph_window is not None and 
             hasattr(self, 'graph_window_geometry') and self.graph_window_geometry is not None):
-            self.graph_window.setGeometry(self.graph_window_geometry)
+            hf.set_window_geometry(self.graph_window, *self.graph_window_geometry.getRect())
             #print(f"DEBUG: Restored window geometry: {self.graph_window_geometry}")
         
     def saveGraphData(self):
@@ -7001,6 +6980,14 @@ class KymographWindow(QtWidgets.QWidget):
         """選択された始点に基づいて参照位置を取得"""
         if not hasattr(self, 'selected_start_point'):
             self.selected_start_point = "Blue"
+
+        # 検出位置は kymograph の列番号で、列 0 が線の始点（Blue）、最後の列が
+        # 終点（Red）にあたる。元画像上の x 座標とは座標系が違うので使わない。
+        kymo = getattr(self, 'kymograph_data', None)
+        if kymo is not None and getattr(kymo, 'ndim', 0) == 2 and kymo.shape[1] > 0:
+            if self.selected_start_point == "Red":
+                return kymo.shape[1] - 1
+            return 0
         
         # 直線の色に基づいて参照位置を決定
         if self.selected_start_point == "Blue":

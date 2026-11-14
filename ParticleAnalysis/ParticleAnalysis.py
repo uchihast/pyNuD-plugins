@@ -21,6 +21,15 @@ if not __package__:
 
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
+try:
+    from gui_i18n import QtWidgets
+except ImportError:  # 古い pyNuD 本体には gui_i18n が無い。そのときは元の Qt の部品で動く。
+    pass
+try:
+    from gui_i18n import pick_text
+except ImportError:  # 古い本体には pick_text が無い
+    def pick_text(en, ja):
+        return en
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -30,6 +39,7 @@ import sys
 import json
 from scipy import ndimage
 from skimage import measure, morphology, filters
+from skimage.segmentation import relabel_sequential
 try:
     from skimage.feature import peak_local_max
 except ImportError:
@@ -96,6 +106,7 @@ HELP_HTML_EN = """
     <ul>
         <li><strong>Min Particle Size:</strong> 1–1000 pixels (default: 10). Exclude smaller regions. Recommended: 5–50.</li>
         <li><strong>Max Particle Size:</strong> 1–10000 pixels (default: 1000). Exclude larger regions. Recommended: 100–5000.</li>
+        <li><strong>Max Hole Area:</strong> Threshold hole filling area limit in px² (default 1000); 0 disables filling. This is separate from the particle area limit.</li>
         <li><strong>Exclude particles touching image edges:</strong> Recommended: enabled. Excludes incomplete particles at image borders.</li>
     </ul>
 
@@ -222,6 +233,7 @@ HELP_HTML_JA = """
     <ul>
         <li><strong>Min Particle Size（最小粒子サイズ）:</strong> 1–1000 ピクセル（デフォルト 10）。これより小さい領域を除外。推奨: 5–50。</li>
         <li><strong>Max Particle Size（最大粒子サイズ）:</strong> 1–10000 ピクセル（デフォルト 1000）。これより大きい領域を除外。推奨: 100–5000。</li>
+        <li><strong>Max Hole Area:</strong> Threshold の穴埋め面積上限（px²、初期値1000）。0で無効。粒子面積上限とは別の設定です。</li>
         <li><strong>Exclude particles touching image edges（エッジ粒子除外）:</strong> 推奨: 有効。画像端に接する不完全な粒子を除外。</li>
     </ul>
 
@@ -390,6 +402,7 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
         self.roi_rect = None
         self.roi_shape = "Rectangle"
         self.roi_data = None  # ROI内の拡大画像データ
+        self._roi_image_bounds = None
         self.analysis_mode = "All Particles"  # 解析モード: "All Particles" or "Single Particle"
         self.roi_scale_info = None  # ROIの物理サイズとピクセル情報
         self.ring_last_avg_info = None
@@ -981,6 +994,19 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
         max_size_row.addWidget(self.max_size_spin)
         max_size_row.addStretch()
         self.detection_layout.addLayout(max_size_row)
+
+        hole_row = QtWidgets.QHBoxLayout()
+        hole_row.addWidget(QtWidgets.QLabel("Max Hole Area (pixels):"))
+        self.hole_fill_spin = QtWidgets.QSpinBox()
+        self.hole_fill_spin.setRange(0, 10000)
+        self.hole_fill_spin.setValue(1000)
+        self.hole_fill_spin.setFixedWidth(80)
+        self.hole_fill_spin.setToolTip("Threshold の穴埋め面積上限（px²）。0 で穴埋めなし。\n"
+                                      "Threshold hole filling area limit (px²); 0 disables filling.")
+        self.hole_fill_spin.valueChanged.connect(self.onParticleSizeChanged)
+        hole_row.addWidget(self.hole_fill_spin)
+        hole_row.addStretch()
+        self.detection_layout.addLayout(hole_row)
         
         # Edge particle exclusion
         edge_exclusion_row = QtWidgets.QHBoxLayout()
@@ -1469,6 +1495,7 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
         # deleting them with the legacy size and border filters.
         self.min_size_spin.setEnabled(not adaptive)
         self.max_size_spin.setEnabled(not adaptive)
+        self.hole_fill_spin.setEnabled(method == 'Threshold')
         self.exclude_edge_check.setEnabled(not adaptive)
         
         # Particle detection status labelをリセット（メソッド変更時は一旦非表示）
@@ -1647,6 +1674,7 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
         """ピーク検出パラメーターが変更された時の処理"""
         if getattr(self, '_applied_analysis_result', None) is not None:
             return
+        self.peak_markers = None
         try:
             # Peak Detectionが選択されている場合のみ更新
             if self.method_combo.currentText() == "Peak Detection":
@@ -1918,11 +1946,13 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
         self.roi_rect = None
         self.roi_data = None
         self.roi_scale_info = None
+        self._roi_image_bounds = None
     
     def onROISelected(self, roi_data):
         """ROIが選択された時の処理（全検出方法共通）"""
         if getattr(self, '_applied_analysis_result', None) is not None:
             return
+        self.peak_markers = None
         try:
             # ROIデータを保存
             if isinstance(roi_data, dict):
@@ -2007,6 +2037,9 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
                         }
 
                         # ROI内の画像を抽出
+                        self._roi_image_bounds = (roi_x, roi_y, roi_w, roi_h)
+                        self._roi_source_file = self._currentSourceFile()
+                        self._roi_source_shape = self.current_data.shape
                         self.roi_data = self.current_data[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w].copy()
                         
                         # ROI内の画像をfiltered_dataとして設定（拡大表示）
@@ -3288,32 +3321,12 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
         if np.max(labels) == 0:
             return labels
         
-        labels = labels.copy()
-        mask = labels > 0
-        from skimage import measure
-        labeled_mask = measure.label(mask)
-        if labeled_mask.max() == 0:
-            return np.zeros_like(labels)
-        
-        keep_mask = np.zeros_like(mask, dtype=bool)
-        nrows, ncols = mask.shape
-        for region in measure.regionprops(labeled_mask):
-            minr, minc, maxr, maxc = region.bbox
-            if minr == 0 or minc == 0 or maxr == nrows or maxc == ncols:
-                continue
-            keep_mask[labeled_mask == region.label] = True
-        
-        if not np.any(keep_mask):
-            return np.zeros_like(labels)
-        
-        new_labels = measure.label(keep_mask).astype(labels.dtype)
-        # Map back onto original labels to preserve label order if needed
-        final_labels = np.zeros_like(labels)
-        unique_new = np.unique(new_labels)
-        unique_new = unique_new[unique_new != 0]
-        for idx, lbl in enumerate(unique_new, start=1):
-            final_labels[new_labels == lbl] = idx
-        return final_labels
+        # Watershed labels can touch without sharing the same particle ID.
+        # Relabeling their binary union merges particles and removes neighbours.
+        edge = np.unique(np.concatenate((labels[0], labels[-1], labels[:, 0], labels[:, -1])))
+        result = labels.copy()
+        result[np.isin(result, edge[edge != 0])] = 0
+        return relabel_sequential(result)[0]
         
     def detectParticles(self):
         """粒子検出を実行"""
@@ -3384,122 +3397,84 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
                 f"Error during particle detection: {str(e)}\n粒子検出中にエラーが発生しました: {str(e)}")
                 
     def detectAllFrames(self):
-        """全フレームで粒子検出を実行"""
+        """Detect processed frames without repeated host/preview redraws."""
         if self._showAppliedAnalysis():
             return
         self._clearAppliedAnalysis()
+        if not getattr(gv, 'files', None) or getattr(gv, 'FrameNum', 0) <= 0:
+            QtWidgets.QMessageBox.warning(self, "Warning", "No frames available.\nフレームが利用できません。")
+            return
+        current_file_num, current_frame = gv.currentFileNum, gv.index
+        total_frames = gv.FrameNum
+        self.all_frame_results = {}
+        self._manual_analysis_frames = {}
+        self._all_frames_source_file = self._currentSourceFile()
+        progress = QtWidgets.QProgressDialog("Processing all frames...", "Cancel", 0, total_frames, self)
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        self._all_frames_running = True
         try:
-            if not hasattr(gv, 'files') or not gv.files:
-                QtWidgets.QMessageBox.warning(self, "Warning", 
-                    "No files loaded.\nファイルが読み込まれていません。")
-                return
-                
-            if not hasattr(gv, 'FrameNum') or gv.FrameNum <= 0:
-                QtWidgets.QMessageBox.warning(self, "Warning", 
-                    "No frames available.\nフレームが利用できません。")
-                return
-                
-            # 現在のファイルとフレームを保存
-            current_file_num = gv.currentFileNum
-            current_frame = gv.index
-            
-            # 全フレームの結果を保存する辞書
-            self.all_frame_results = {}
-            self._manual_analysis_frames = {}
-            
-            # プログレスダイアログを作成
-            progress = QtWidgets.QProgressDialog("Processing all frames...", "Cancel", 0, gv.FrameNum, self)
-            progress.setWindowModality(QtCore.Qt.WindowModal)
-            progress.setAutoClose(True)
-            progress.setAutoReset(True)
-            
-            for frame_idx in range(gv.FrameNum):
-                progress.setValue(frame_idx)
-                if progress.wasCanceled():
-                    break
-                    
-                # フレームを変更
-                gv.index = frame_idx
-                self.main.frameSlider.setValue(frame_idx)
-                self.main.updateFrame()
-                
-                # データを取得
-                if not self.getCurrentData():
-                    continue
-                    
-                # 各フレームでPeak Detectionを実行
-                if hasattr(gv, 'aryData') and gv.aryData is not None:
-                    # 1. Peak Detectionを実行
-                    if self.method_combo.currentText() == "Peak Detection":
-                        # ピーク検出を実行
-                        peak_result = self.peakDetection(gv.aryData)
-                        if peak_result is not None:
-                            self.peak_markers = peak_result
-                        else:
-                            self.peak_markers = None
-                    
-                    # 2. Detectと同じ処理を実行
-                    # 前処理を実行
-                    processed_data = self.preprocessData(self.current_data)
-                    self.filtered_data = processed_data.copy()
-                    
-                    # 粒子検出
-                    detected_particles = self.detectParticlesFromData(processed_data)
-                    
-                    # 粒子の特性を計算
-                    if detected_particles is not None and np.max(detected_particles) > 0:
-                        self.detected_particles = detected_particles
-                        particle_properties = self.calculateParticleProperties()
-                        self.all_frame_results[frame_idx] = {
-                            'detected_particles': detected_particles,
-                            'particle_properties': particle_properties,
-                            'original_data': self.current_data.copy(),
-                            'processed_data': processed_data.copy(),
-                            'adaptive_candidates': list(getattr(self, 'adaptive_candidates', [])),
-                            'adaptive_parameters': dict(getattr(self, 'adaptive_parameters', {})),
-                            'filtered_data': processed_data.copy()  # 前処理されたデータも保存
-                        }
+            try:
+                for frame_idx in range(total_frames):
+                    progress.setValue(frame_idx)
+                    if progress.wasCanceled():
+                        break
+                    gv.index = frame_idx
+                    hidden = getattr(self.main, 'updateFrameHidden', None)
+                    if callable(hidden):
+                        hidden()  # Includes the host's leveling, filters and drift correction.
                     else:
-                        self.detected_particles = (detected_particles if detected_particles is not None
-                                                   else np.zeros(processed_data.shape, dtype=np.int32))
-                        self.calculateParticleProperties()  # Retain zero-particle frames in portable JSON.
-                        self.all_frame_results[frame_idx] = {
-                            'detected_particles': None,
-                            'particle_properties': [],
-                            'original_data': self.current_data.copy(),
-                            'processed_data': processed_data.copy(),
-                            'adaptive_candidates': list(getattr(self, 'adaptive_candidates', [])),
-                            'adaptive_parameters': dict(getattr(self, 'adaptive_parameters', {})),
-                            'filtered_data': processed_data.copy()  # 前処理されたデータも保存
-                        }
-                else:
-                    print(f"[ERROR] No original data available for frame {frame_idx}")
-                    continue
-                    
-            progress.setValue(gv.FrameNum)
-            
-            # 元のフレームに戻す
-            gv.currentFileNum = current_file_num
-            gv.index = current_frame
-            self.main.frameSlider.setValue(current_frame)
-            self.main.updateFrame()
-            
-            # 現在のフレームの結果を表示
+                        blocker = QtCore.QSignalBlocker(self.main.frameSlider)
+                        self.main.frameSlider.setValue(frame_idx)
+                        del blocker
+                        self.main.updateFrame()
+                    if not self.getCurrentData():
+                        continue
+                    data = (self.roi_data if self.analysis_mode == 'Single Particle'
+                            and self.roi_data is not None else self.current_data)
+                    processed_data = self.preprocessData(data)
+                    self.filtered_data = processed_data.copy()
+                    # getCurrentData cleared the markers: detection seeds must come
+                    # from the same preprocessed image as the single-frame Detect.
+                    labels = self.detectParticlesFromData(processed_data)
+                    found = labels is not None and np.max(labels) > 0
+                    self.detected_particles = (labels if labels is not None
+                                               else np.zeros(processed_data.shape, dtype=np.int32))
+                    properties = self.calculateParticleProperties()
+                    saved = processed_data.copy()
+                    self.all_frame_results[frame_idx] = {
+                        'detected_particles': labels if found else None,
+                        'particle_properties': properties if found else [],
+                        'original_data': self.current_data.copy(),
+                        'processed_data': saved,
+                        'filtered_data': saved,
+                        'adaptive_candidates': list(getattr(self, 'adaptive_candidates', [])),
+                        'adaptive_parameters': dict(getattr(self, 'adaptive_parameters', {}))
+                    }
+            finally:
+                gv.currentFileNum, gv.index = current_file_num, current_frame
+                try:
+                    blocker = QtCore.QSignalBlocker(self.main.frameSlider)
+                    self.main.frameSlider.setValue(current_frame)
+                    del blocker
+                    self.main.updateFrame()
+                finally:
+                    self._all_frames_running = False
+                    progress.close()
             if current_frame in self.all_frame_results:
                 self.displayFrameResults(current_frame)
-                
-            # ボタンを有効化
+            else:
+                self.updateFromMainWindow()
             self.export_button.setEnabled(True)
             self.prev_frame_button.setEnabled(True)
             self.next_frame_button.setEnabled(True)
-            
-            QtWidgets.QMessageBox.information(self, "Success", 
-                f"Particle detection completed for all {gv.FrameNum} frames.\n全{gv.FrameNum}フレームの粒子検出が完了しました。")
-                
+            count = len(self.all_frame_results)
+            QtWidgets.QMessageBox.information(self, "Success",
+                f"Particle detection completed for {count} of {total_frames} frames.\n"
+                f"{total_frames}フレーム中{count}フレームの粒子検出が完了しました。")
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Error", 
-                f"Error during all frames detection: {str(e)}\n全フレーム検出中にエラーが発生しました: {str(e)}")
-                
+            QtWidgets.QMessageBox.critical(self, "Error",
+                f"Error during all frames detection: {e}\n全フレーム検出中にエラーが発生しました: {e}")
+
     def previousFrame(self):
         """前のフレームに移動"""
         try:
@@ -4406,7 +4381,7 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
         elif threshold_method == "Manual":
             threshold = self.manual_thresh_spin.value()
         elif threshold_method == "Adaptive":
-            threshold = filters.threshold_adaptive(data)
+            threshold = filters.threshold_local(data, block_size=35)
         else:
             return None
             
@@ -4418,10 +4393,16 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
         max_size = self.max_size_spin.value()
         
         binary = morphology.remove_small_objects(binary, min_size=min_size)
-        binary = morphology.remove_small_holes(binary, area_threshold=max_size)
+        hole_limit = getattr(self, 'hole_fill_spin', None)
+        hole_limit = hole_limit.value() if hole_limit is not None else 1000
+        binary = morphology.remove_small_holes(binary, area_threshold=hole_limit)
         
         # 最終的なラベリング
         labels = measure.label(binary)
+        sizes = np.bincount(labels.ravel())
+        keep = (sizes >= min_size) & (sizes <= max_size)
+        keep[0] = False
+        labels = np.where(keep[labels], labels, 0)
         
         # 画像端の粒子を除外（チェックボックスが有効な場合）
         labels = self._apply_edge_exclusion(labels)
@@ -4589,22 +4570,11 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
             #print(f"[DEBUG] Hessian - size filtering: min={min_size}, max={max_size}")
             
             # 各ラベルのサイズをチェック
-            unique_labels = np.unique(labels)
-            filtered_labels = np.zeros_like(labels)
-            
-            valid_particles = 0
-            size_distribution = []
-            for label in unique_labels:
-                if label == 0:  # 背景
-                    continue
-                    
-                # ラベルのサイズを計算
-                label_size = np.sum(labels == label)
-                size_distribution.append(label_size)
-                
-                if min_size <= label_size <= max_size:
-                    filtered_labels[labels == label] = label
-                    valid_particles += 1
+            sizes = np.bincount(labels.ravel())
+            keep = (sizes > 0) & (sizes >= min_size) & (sizes <= max_size)
+            keep[0] = False
+            filtered_labels = np.where(keep[labels], labels, 0)
+            valid_particles = int(np.count_nonzero(keep))
             
             #print(f"[DEBUG] Hessian - size distribution: min={min(size_distribution) if size_distribution else 0}, max={max(size_distribution) if size_distribution else 0}, mean={np.mean(size_distribution) if size_distribution else 0:.1f}")
             #print(f"[DEBUG] Hessian - after size filtering: {valid_particles} particles")
@@ -5368,19 +5338,20 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
                 self.particle_status_label.setVisible(True)
             _frozen = getattr(sys, "frozen", False)
             if _frozen:
-                msg = (
+                msg = pick_text(
                     f"Required module for ring detection is missing:\n{ie}\n\n"
-                    "リング検出に必要なモジュールがインストールされていません。\n\n"
-                    "This module is not bundled with this installation.\n"
-                    "このモジュールはこのパッケージに含まれていません。"
+                    "This module is not bundled with this installation.",
+                    f"リング検出に必要なモジュールがありません:\n{ie}\n\n"
+                    "このモジュールはこのパッケージに含まれていません。",
                 )
             else:
-                msg = (
+                msg = pick_text(
                     f"Required module for ring detection is missing:\n{ie}\n\n"
-                    "リング検出に必要なモジュールがインストールされていません。\n\n"
-                    "Please install scipy and opencv-python (pip install scipy opencv-python)."
+                    "Please install scipy and opencv-python (pip install scipy opencv-python).",
+                    f"リング検出に必要なモジュールがインストールされていません:\n{ie}\n\n"
+                    "scipy と opencv-python をインストールしてください（pip install scipy opencv-python）。",
                 )
-            QtWidgets.QMessageBox.warning(self, "Module Not Found", msg)
+            QtWidgets.QMessageBox.warning(self, pick_text("Module Not Found", "モジュールがありません"), msg)
             return None
         except Exception as e:
             print(f"[ERROR] Ring detection failed: {e}")
@@ -5493,7 +5464,8 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
         try:
             
             
-            if not hasattr(self, 'peak_markers') or self.peak_markers is None:
+            if (getattr(self, 'peak_markers', None) is None
+                    or self.peak_markers.shape != data.shape):
                 peak_result = self.peakDetection(data)
                 if peak_result is None:
                     return None
@@ -5550,24 +5522,13 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
             
             #print(f"[DEBUG] Watershed - size filtering: min={min_size}, max={max_size}")
             
-            # 各ラベルのサイズをチェック
-            unique_labels = np.unique(labels)
-            filtered_labels = np.zeros_like(labels)
-            
-            valid_particles = 0
-            size_distribution = []
-            for label in unique_labels:
-                if label == 0:  # 背景
-                    continue
-                    
-                # ラベルのサイズを計算
-                label_size = np.sum(labels == label)
-                size_distribution.append(label_size)
-                
-                if min_size <= label_size <= max_size:
-                    filtered_labels[labels == label] = label
-                    valid_particles += 1
-            
+            sizes = np.bincount(labels.ravel())
+            unique_labels = np.flatnonzero(sizes)
+            keep = (sizes > 0) & (sizes >= min_size) & (sizes <= max_size)
+            keep[0] = False
+            filtered_labels = np.where(keep[labels], labels, 0)
+            valid_particles = int(np.count_nonzero(keep))
+
             #print(f"[DEBUG] Watershed - size distribution: min={min(size_distribution)}, max={max(size_distribution)}, mean={np.mean(size_distribution):.1f}")
             #print(f"[DEBUG] Watershed - after size filtering: {valid_particles} particles")
             
@@ -5597,7 +5558,7 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
                     filtered_labels[filtered_labels == label] = 0
                 
                 # 再ラベリング
-                filtered_labels = measure.label(filtered_labels > 0)
+                filtered_labels = relabel_sequential(filtered_labels)[0]
                 valid_particles = len(np.unique(filtered_labels)) - 1  # 背景を除く
                 #print(f"[DEBUG] Watershed - After edge exclusion: {valid_particles} particles")
             
@@ -5667,7 +5628,8 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
         try:
             #print(f"[DEBUG] contourLevelFromPeaks - Starting with data shape: {data.shape}")
             
-            if not hasattr(self, 'peak_markers') or self.peak_markers is None:
+            if (getattr(self, 'peak_markers', None) is None
+                    or self.peak_markers.shape != data.shape):
                 #print("[DEBUG] contourLevelFromPeaks - No peak markers, running peak detection")
                 peak_result = self.peakDetection(data)
                 if peak_result is None:
@@ -5888,7 +5850,7 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
                     filtered_labels[filtered_labels == label] = 0
                 
                 # 再ラベリング
-                filtered_labels = measure.label(filtered_labels > 0)
+                filtered_labels = relabel_sequential(filtered_labels)[0]
                 valid_particles = len(np.unique(filtered_labels)) - 1  # 背景を除く
                 #print(f"[DEBUG] Contour Level - After edge exclusion: {valid_particles} particles")
             
@@ -5912,7 +5874,7 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
     def displayPeakOverlay(self):
         """ピーク位置をオーバーレイ表示（独立した表示用）"""
         try:
-            if not hasattr(self, 'peak_markers') or self.peak_markers is None:
+            if getattr(self, 'peak_markers', None) is None:
                 return
                 
             # サイズの整合性をチェック
@@ -5949,7 +5911,7 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
     def displayPeakPositions(self):
         """ピーク位置を表示（粒子境界と一緒に表示）"""
         try:
-            if not hasattr(self, 'peak_markers') or self.peak_markers is None:
+            if getattr(self, 'peak_markers', None) is None:
                 return
                 
             # サイズの整合性をチェック
@@ -6444,15 +6406,37 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
                     item.setForeground(QtGui.QColor('#185cc8' if p['edge'] else '#9a238a' if p['uncertain'] else '#087d4b'))
                 self.results_table.setItem(row, col, item)
         self.results_table.resizeColumnsToContents()
-        text = f'Applied review • Frame {index+1}: {len(rows)} selected / {len(result["particles"])} candidates. ×: not selected.'
-        if result.get('origin')=='skipped':
-            info=result['audit']['frame_sampling']
-            text=(f'Frame {index+1}: Skipped — {info["overlap_fraction"]:.1%} overlap with frame {info["reference_frame_0based"]+1}. '
-                  'Image only; no detection, IDs or measurements.')
-        if session['id_scope'] == 'movie-global':
-            first='first analyzed appearance' if has_skipped_frames(session) else 'first appearance'
-            text += f' Movie statistics: {len(statistics_rows(session))} unique IDs ({first} only).'
-        self.stats_label.setText(text)
+        n_selected = len(rows)
+        n_candidates = len(result["particles"])
+        text_en = (
+            f"Applied review • Frame {index + 1}: {n_selected} selected / {n_candidates} candidates. "
+            "×: not selected."
+        )
+        text_ja = (
+            f"適用した確認 • フレーム {index + 1}: {n_selected} 件を選択 / 候補 {n_candidates} 件。"
+            "×: 非選択。"
+        )
+        if result.get("origin") == "skipped":
+            info = result["audit"]["frame_sampling"]
+            overlap = info["overlap_fraction"]
+            reference = info["reference_frame_0based"] + 1
+            text_en = (
+                f"Frame {index + 1}: Skipped — {overlap:.1%} overlap with frame {reference}. "
+                "Image only; no detection, IDs or measurements."
+            )
+            text_ja = (
+                f"フレーム {index + 1}: スキップ — フレーム {reference} と {overlap:.1%} 重なっています。"
+                "画像のみです。検出、ID、計測値はありません。"
+            )
+        if session["id_scope"] == "movie-global":
+            n_ids = len(statistics_rows(session))
+            if has_skipped_frames(session):
+                text_en += f" Movie statistics: {n_ids} unique IDs (first analyzed appearance only)."
+                text_ja += f" 動画の統計: 一意な ID {n_ids} 件（最初に解析した出現のみ）。"
+            else:
+                text_en += f" Movie statistics: {n_ids} unique IDs (first appearance only)."
+                text_ja += f" 動画の統計: 一意な ID {n_ids} 件（最初の出現のみ）。"
+        self.stats_label.setText(pick_text(text_en, text_ja))
         self.particle_status_label.hide()
         self.export_button.setEnabled(bool(statistics_rows(session)))
         self.prev_frame_button.setEnabled(len(session['frames']) > 1 and index > 0)
@@ -6489,6 +6473,14 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
         self._ai_analysis_dialog.raise_()
         self._ai_analysis_dialog.activateWindow()
 
+    @staticmethod
+    def _currentSourceFile():
+        """メインウィンドウで選択中のファイルの絶対パス（取得できなければ None）"""
+        try:
+            return os.path.abspath(gv.files[gv.currentFileNum])
+        except Exception:
+            return None
+
     def getCurrentData(self):
         """現在のデータを取得"""
         try:          
@@ -6503,7 +6495,30 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
                     if processed is not None:
                         data = processed
                 self.current_data = data.copy()
+                bounds = getattr(self, '_roi_image_bounds', None)
+                if bounds is not None:
+                    if (self._roi_source_file != self._currentSourceFile()
+                            or self._roi_source_shape != self.current_data.shape):
+                        self.roi_data = None
+                        self.roi_scale_info = None
+                        self.roi_rect = None
+                        self._roi_image_bounds = None
+                    else:
+                        x, y, w, h = bounds
+                        self.roi_data = self.current_data[y:y+h, x:x+w].copy()
                 self.adaptive_candidates = []
+                # All Frames の結果はフレーム番号だけをキーにしている。別のファイルに
+                # 切り替わっていたら、手法に関係なく破棄する（別ファイルの粒子が
+                # 表示・出力されるのを防ぐ）。
+                frames_source = getattr(self, '_all_frames_source_file', None)
+                if (
+                    getattr(self, 'all_frame_results', None)
+                    and frames_source is not None
+                    and frames_source != self._currentSourceFile()
+                ):
+                    self.all_frame_results = {}
+                    self._manual_analysis_frames = {}
+                    self._all_frames_source_file = None
                 if self.method_combo.currentText() == 'Adaptive Watershed':
                     cached = getattr(self, 'all_frame_results', {}).get(int(getattr(gv, 'index', 0)))
                     if cached is not None and not np.array_equal(cached.get('original_data'), self.current_data):
@@ -6580,6 +6595,7 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
             # 閾値法を復元
             threshold_method = settings.value('particle_analysis/threshold_method', 'Otsu')
             self.threshold_combo.setCurrentText(threshold_method)
+            self.hole_fill_spin.setValue(settings.value('particle_analysis/hole_fill_px', 1000, type=int))
             
             # LEGEND表示設定を復元
             show_legend = settings.value('particle_analysis/show_legend', True, type=bool)
@@ -6628,6 +6644,7 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
             # Peak Detection パラメータを保存
             settings = QtCore.QSettings()
             settings.setValue('particle_analysis/detection_method_v2', self.method_combo.currentText())
+            settings.setValue('particle_analysis/hole_fill_px', self.hole_fill_spin.value())
             for name in ('adaptive_prominence_spin', 'adaptive_contour_spin', 'adaptive_scale_spin'):
                 settings.setValue('particle_analysis/'+name, getattr(self, name).value())
             settings.setValue('particle_analysis/min_peak_distance', self.min_peak_distance_spin.value())
@@ -6668,6 +6685,8 @@ class ParticleAnalysisWindow(QtWidgets.QWidget):
         
     def updateFromMainWindow(self):
         """メインウィンドウからの更新"""
+        if getattr(self, '_all_frames_running', False):
+            return
         if self._showAppliedAnalysis():
             return
         try:

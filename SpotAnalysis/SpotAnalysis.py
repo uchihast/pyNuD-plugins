@@ -26,6 +26,7 @@ import csv
 import glob
 import re
 import json
+import hashlib
 import html
 from datetime import datetime
 from dataclasses import dataclass
@@ -36,6 +37,13 @@ from scipy import ndimage
 from scipy.optimize import curve_fit, linear_sum_assignment
 from skimage import feature, filters, morphology, segmentation, measure
 from PyQt5 import QtCore, QtWidgets, QtGui
+try:
+    from gui_i18n import QtWidgets, get_language, has_language_service
+except ImportError:  # 古い pyNuD 本体には gui_i18n が無い。そのときは元の Qt の部品で動く。
+    def get_language():
+        return "en"
+    def has_language_service():
+        return False
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -264,6 +272,7 @@ HELP_TABS_JA = [
         <ul>
           <li>誤操作防止のため、チェックボックスの <span class="term">全フレーム解析</span> をONにした時だけボタンが有効になります。</li>
           <li>全フレームに同じ設定を適用する前に、代表フレームでROI、検出、フィルタを確認してください。</li>
+          <li>進捗ダイアログからキャンセルできます。完了したフレームの結果は残り、元のフレームへ戻ります。</li>
           <li>解析結果を手動修正している場合、CSV保存前に意図せず再解析で上書きしないよう注意してください。</li>
         </ul>
         """,
@@ -322,10 +331,14 @@ HELP_TABS_JA = [
           <li><span class="term">スポットをSpot径の重心に設定</span> は、現在フレームの各スポットを円内の強度重心へ移動します。</li>
           <li><span class="term">自動適用</span> をONにすると、解析後に重心補正を自動で行います。</li>
         </ul>
-        <h3>CSV</h3>
+        <h3>安定IDとCSV</h3>
+        <p>ID link distance (nm)（初期値10 nm）以内で、各IDの既知位置へ対応付けます。欠測座標は補間せず、再検出時も同じIDを使います。
+        別ファイルで座標を使う際は確認し、元ファイル・測定先・承認履歴をmetaへ保存します。</p>
+        <p>位置 _pN_k.csv、高さ _pN_h_k.csv、meta _meta_k.json は同じ連番のセットです。
+        保存失敗はファイル名の一覧で表示します。過去の共通meta.jsonも読み込めます。元ファイル記録のない旧CSVは元ファイル不明として保持します。</p>
         <ul>
           <li><span class="term">高さ保存値</span> で、CSVの主高さをSpot位置またはSpot径内平均から選びます。</li>
-          <li><span class="term">CSVエクスポート</span> は、フレームごとのスポット座標、ピーク高さ、S/Nなどを保存します。</li>
+          <li><span class="term">CSVエクスポート</span> は、安定IDごとの位置・高さと、観測/欠測/未解析の欄を保存します。</li>
           <li><span class="term">CSV読み込み→復元</span> は、保存済みCSVからROIやスポット表示状態を復元します。</li>
         </ul>
         """,
@@ -559,6 +572,7 @@ class PeakStat:
     y: float
     sigma: float
     snr: float
+    spot_id: Optional[int] = None
 
 
 @dataclass
@@ -3179,9 +3193,9 @@ class SpotVisualizationWindow(QtWidgets.QMainWindow):
             rx = pk.x - origin[0]
             ry = pk.y - origin[1]
             
-            label = f"P{i+1}: S/N={pk.snr:.1f}"
+            label = f"P{getattr(pk, 'spot_id', None) or i+1}: S/N={pk.snr:.1f}"
             
-            self.ax.plot(rx, ry, 'x', color=colors[i % len(colors)], markersize=10, markeredgewidth=2, label=label)
+            self.ax.plot(rx, ry, 'x', color=colors[((getattr(pk, 'spot_id', None) or i+1)-1) % len(colors)], markersize=10, markeredgewidth=2, label=label)
 
         # 2ピークモデルと3ピークモデルの両方を比較したい場合のために、
         # 補助的に他のモデルの点も点線などで出すことも検討できますが、
@@ -3385,7 +3399,7 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
 
         # Fill defaults from result if caller didn't supply spot lists.
         if spots is None and result is not None:
-            spots = [{"x": pk.x, "y": pk.y, "snr": pk.snr} for pk in result.models[result.best_n_peaks].peaks]
+            spots = [{"id": getattr(pk, "spot_id", None) or i+1, "x": pk.x, "y": pk.y, "snr": pk.snr} for i, pk in enumerate(result.models[result.best_n_peaks].peaks)]
         if initial_spots is None and result is not None:
             initial_spots = [{"x": pk.x, "y": pk.y, "snr": pk.snr} for pk in result.models[result.best_n_peaks].init_peaks]
 
@@ -3393,9 +3407,9 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
         if spots:
             colors = ["magenta", "white", "orange", "cyan", "yellow", "lime", "red", "deepskyblue"]
             for i, pk in enumerate(spots):
-                label = f"P{i+1}: S/N={pk.get('snr', 0.0):.1f}"
+                label = f"P{pk.get('id', i+1)}: S/N={pk.get('snr', 0.0):.1f}"
                 # top: absolute
-                self.ax_afm.plot(pk["x"], pk["y"], "x", color=colors[i % len(colors)], markersize=10, markeredgewidth=2, label=label)
+                self.ax_afm.plot(pk["x"], pk["y"], "x", color=colors[(int(pk.get('id', i+1))-1) % len(colors)], markersize=10, markeredgewidth=2, label=label)
                 if spot_radius_px is not None and spot_radius_px > 0:
                     try:
                         self.ax_afm.add_patch(
@@ -3537,7 +3551,7 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
                                     ry,
                                     "o",
                                     markerfacecolor="none",
-                                    markeredgecolor=colors[i % len(colors)],
+                                    markeredgecolor=colors[(int(pk.get('id', i+1))-1) % len(colors)],
                                     markersize=10,
                                     markeredgewidth=2.0,
                                     linestyle="None",
@@ -3632,11 +3646,13 @@ class SpotFullImageWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
 
-        if result is not None:
+        if spots is not None:
+            label = f"AFM - {len(spots)} peaks"
+            if result is not None:
+                label += f" ({result.criterion.upper()})"
+            self.ax_afm.set_title(label)
+        elif result is not None:
             self.ax_afm.set_title(f"AFM - {result.best_n_peaks} peaks ({result.criterion.upper()})")
-        elif spots is not None:
-            # Analysis has run but no peaks survived post-filters (strict ROI margin, etc.)
-            self.ax_afm.set_title("AFM - 0 peaks")
         else:
             self.ax_afm.set_title("AFM (no analysis yet)")
         self.ax_roi_pre.set_title("ROI (preprocessed)")
@@ -3713,7 +3729,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.main_window = main_window
         # Preserve the former SpotAnalysis.py appearance by default.  Users can
         # switch the same window to English without loading a second plugin.
-        self.ui_language = "ja"
+        self.ui_language = get_language() if has_language_service() else "ja"
         self.setWindowTitle("Spot Analysis (AIC/BIC)")
         self.setMinimumWidth(420)
         self.spot_analyzer = SpotAnalysis()
@@ -3721,9 +3737,17 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.full_viz_window = None  # 全画像オーバーレイウィンドウ
         self.last_frame = None
         self.last_result = None
+        self._last_result_frame = None
         self.manual_roi = None  # dict: {"shape": str, "x0":..., "y0":..., "w":..., "h":..., "cx":..., "cy":..., "rx":..., "ry":...}
         self.roi_by_frame: Dict[int, Dict[str, float]] = {}
         self.spots_by_frame: Dict[int, List[Dict[str, float]]] = {}
+        self._next_spot_id = 1
+        self._spot_assessed_frames = set()
+        self._spots_source_file = None
+        self._spots_active_source = None
+        self._spot_reuse_history = []
+        self._source_reuse_rejected = None
+        self._batch_running = False
         self.centroid_reference_by_frame: Dict[int, List[Dict[str, float]]] = {}
         self.initial_spots_by_frame: Dict[int, List[Dict[str, float]]] = {}
         self.preserve_existing_spots_on_auto = False
@@ -3762,6 +3786,12 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             if cls._canonical_ui_text(combo.itemText(index)) == canonical_text:
                 combo.setCurrentIndex(index)
                 return
+
+    def _pynud_sync_language(self, language: str) -> None:
+        index = self.language_combo.findData(language)
+        with QtCore.QSignalBlocker(self.language_combo):
+            self.language_combo.setCurrentIndex(index)
+        self._on_language_changed(index)
 
     def _on_language_changed(self, _index: int = -1) -> None:
         language = self.language_combo.currentData()
@@ -3884,6 +3914,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
         btn_ja.clicked.connect(lambda: set_lang(True))
         btn_en.clicked.connect(lambda: set_lang(False))
+        dialog._pynud_sync_language = lambda language: set_lang(language == "ja")
         set_lang(self.ui_language == "ja")
 
         dialog.exec_()
@@ -4030,7 +4061,9 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.auto_analyze_check = QtWidgets.QCheckBox("フレーム切替時に自動解析")
         self.auto_analyze_check.setChecked(True)  # デフォルトで有効
         self.auto_analyze_check.setToolTip("ROIがあるフレームで自動的に解析を行います。")
-        basic_grid.addWidget(self.auto_analyze_check, r, 1, alignment=QtCore.Qt.AlignLeft)
+        # 英語表示で文字が切れないよう、チェックボックスは見出しの下で全幅に置く
+        r += 1
+        basic_grid.addWidget(self.auto_analyze_check, r, 0, 1, 3, alignment=QtCore.Qt.AlignLeft)
         r += 1
 
         criterion_label = QtWidgets.QLabel("情報量基準")
@@ -4565,6 +4598,15 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         view_grid.addWidget(self.spot_radius_spin, r, 1, alignment=QtCore.Qt.AlignLeft)
         r += 1
 
+        self.id_max_distance_spin = QtWidgets.QDoubleSpinBox()
+        self.id_max_distance_spin.setRange(0.1, 10000.)
+        self.id_max_distance_spin.setValue(10.)
+        self.id_max_distance_spin.setToolTip("同じIDへ対応付ける最大移動距離（nm）。欠測時の座標は補間しません。")
+        self.id_max_distance_spin.valueChanged.connect(self._on_analysis_param_changed)
+        view_grid.addWidget(QtWidgets.QLabel("ID link distance (nm)"), r, 0)
+        view_grid.addWidget(self.id_max_distance_spin, r, 1)
+        r += 1
+
         self.show_roi_spots_check = QtWidgets.QCheckBox("ROI画像にスポット表示")
         self.show_roi_spots_check.setChecked(True)
         self.show_roi_spots_check.setToolTip("下段のROI画像（前処理ROI/LoG・DoG ROI）にスポットを重ねて表示します。")
@@ -4863,6 +4905,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self._on_analysis_param_changed(*_args)
 
     def _schedule_reanalysis(self) -> None:
+        if getattr(self, '_batch_running', False):
+            return
         if self.manual_roi is None:
             return
         try:
@@ -4879,7 +4923,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         if not bool(getattr(self, "preserve_existing_spots_on_auto", False)):
             return False
         try:
-            return bool(self.spots_by_frame.get(int(frame_index)))
+            return int(frame_index) in self.spots_by_frame
         except Exception:
             return False
 
@@ -4959,6 +5003,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             bool(self.snap_enabled_check.isChecked()),
             int(self.snap_radius_spin.value()),
             bool(self.snap_refit_check.isChecked()),
+            _rf(self.id_max_distance_spin.value()),
         )
         return (int(frame_index), roi_sig, params_sig)
 
@@ -5158,7 +5203,21 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Invalid Selection", "選択中のファイルインデックスが不正です。")
             return None
 
-        # 最新のフレームを取得
+        # メイン画面の処理（レベリング、フィルタ、ドリフト補正）を反映した現在フレームを
+        # ホストから受け取る。LoadFrame を直接呼ぶと生データになり、フレームを送るたびに
+        # メイン側の gv.aryData を生データで上書きしてしまう。
+        host_frame = getattr(getattr(self, "main_window", None), "getImageDataForFrame", None)
+        if callable(host_frame):
+            try:
+                processed = host_frame(int(getattr(gv, "index", 0) or 0), "1ch")
+            except Exception:  # noqa: BLE001
+                processed = None
+            if processed is not None:
+                processed = np.asarray(processed, dtype=np.float64)
+                if processed.ndim == 2:
+                    return processed
+
+        # 最新のフレームを取得（ホストが渡せないときの従来の経路）
         try:
             LoadFrame(gv.files[gv.currentFileNum])
             InitializeAryDataFallback()
@@ -5183,6 +5242,10 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                 pass
 
     def _on_frame_changed(self, frame_index: int) -> None:
+        if getattr(self, '_batch_running', False):
+            return
+        if not SpotAnalysisWindow._confirm_spot_source_reuse(self):
+            return
         # 現フレームの表示更新
         if self.auto_analyze_check.isChecked():
             # 自動解析時:
@@ -5222,7 +5285,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                 self.last_frame, roi_mask_override=roi_mask, roi_bounds_override=roi_bounds
             )
             # Use last_result only when it likely corresponds to the current frame.
-            disp_result = self.last_result if frame_index == self._get_current_frame_index() else None
+            disp_result = self.last_result if frame_index == getattr(self, '_last_result_frame', None) else None
             self.full_viz_window.update_view(
                 self.last_frame,
                 disp_result,
@@ -5373,6 +5436,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         show_messages: bool = False,
         refresh_display: bool = False,
     ) -> bool:
+        if not SpotAnalysisWindow._confirm_spot_source_reuse(self):
+            return False
         spots = list(self.spots_by_frame.get(frame_index) or [])
         if not spots:
             if show_messages:
@@ -5511,7 +5576,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             for idx, pk in enumerate(model.peaks, start=1):
                 html_lines.append(
                     esc(
-                        f"  P{idx}: amp={pk.amplitude:.3g}, sigma={pk.sigma:.3g}, (x,y)=({pk.x:.2f},{pk.y:.2f}), S/N={pk.snr:.2f}"
+                        f"  P{getattr(pk, 'spot_id', None) or idx}: amp={pk.amplitude:.3g}, sigma={pk.sigma:.3g}, (x,y)=({pk.x:.2f},{pk.y:.2f}), S/N={pk.snr:.2f}"
                     )
                 )
 
@@ -5616,11 +5681,16 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
     def show_full_image_view(self, result: FrameAnalysis = None) -> None:
         """全画像に検出ピークをオーバーレイ表示（矩形選択も可能）"""
+        if not SpotAnalysisWindow._confirm_spot_source_reuse(self):
+            return
         if result is None:
-            result = self.last_result
+            result = (self.last_result if self._get_current_frame_index() == getattr(self, '_last_result_frame', None)
+                      else None)
         # 解析結果がなくても現在のフレームを表示してROI指定を可能にする
         if result is None or self.last_frame is None:
             if not self._ensure_selection_loaded():
+                return
+            if not SpotAnalysisWindow._confirm_spot_source_reuse(self):
                 return
             frame = self._prepare_frame()
             if frame is None:
@@ -5684,6 +5754,12 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         """解析結果（spots/ROI/UI/表示）を一括でクリアする。"""
         # データをクリア
         self.spots_by_frame = {}
+        self._next_spot_id = 1
+        self._spot_assessed_frames = set()
+        self._spots_source_file = None
+        self._spots_active_source = None
+        self._spot_reuse_history = []
+        self._source_reuse_rejected = None
         self.centroid_reference_by_frame = {}
         self.initial_spots_by_frame = {}
         self.roi_by_frame = {}
@@ -5840,84 +5916,108 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         y_cent = float(np.sum(yy * weights) / total)
         return x_cent, y_cent
 
-    def _relabel_result_peaks_by_previous_frame(self, frame_index: int, result: Optional[FrameAnalysis]) -> None:
-        """
-        Reorder the selected model's final peaks so their labels follow the nearest
-        peaks from the immediately previous analyzed frame.
+    @staticmethod
+    def _current_spot_source():
+        try:
+            path = os.path.realpath(gv.files[gv.currentFileNum])
+        except (AttributeError, IndexError, TypeError):
+            return {'path': None}
+        try:
+            stat = os.stat(path)
+            return dict(path=path, size=stat.st_size, mtime_ns=stat.st_mtime_ns)
+        except OSError:
+            return {'path': path}
 
-        - If frame_index-1 has no stored peaks, keep the current order.
-        - Matched peaks inherit the previous frame's label order.
-        - Newly appearing peaks are appended in their original order.
-        """
+    def _confirm_spot_source_reuse(self, retry=False):
+        current = SpotAnalysisWindow._current_spot_source()
+        if not getattr(self, 'spots_by_frame', None):
+            return True
+        active = getattr(self, '_spots_active_source', None)
+        if active is None:
+            self._spots_active_source = current
+            if getattr(self, '_spots_source_file', None) is None:
+                self._spots_source_file = {'path': None, 'note': 'Legacy observations without source metadata'}
+            return True
+        if active == current:
+            self._source_reuse_rejected = None
+            return True
+        if not retry and getattr(self, '_source_reuse_rejected', None) == current:
+            return False
+        reply = QtWidgets.QMessageBox.question(
+            self, "Reuse spot coordinates / 座標の再利用",
+            "別のファイルでスポット座標を再利用し、高さを測り直しますか？\n"
+            f"座標の元: {(getattr(self, '_spots_source_file', None) or active).get('path') or '不明'}\n"
+            f"直前の測定先: {active.get('path') or '不明'}\n測定先: {current.get('path') or '不明'}",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
+        if reply != QtWidgets.QMessageBox.Yes:
+            self._source_reuse_rejected = current
+            return False
+        history = list(getattr(self, '_spot_reuse_history', []))
+        history.append(dict(from_source=active, to_source=current,
+                            confirmed_at=datetime.now().isoformat(timespec='seconds')))
+        self._spot_reuse_history = history
+        self._spots_active_source = current
+        self._source_reuse_rejected = None
+        self.last_result = None
+        self._analysis_signature_by_frame = {}
+        for spots in self.spots_by_frame.values():
+            for spot in spots:
+                for key in list(spot):
+                    if key.startswith('height_'):
+                        spot.pop(key)
+        return True
+
+    def onMainWindowFileChanged(self, *_args):
+        if not getattr(self, '_batch_running', False):
+            if SpotAnalysisWindow._confirm_spot_source_reuse(self):
+                self._on_frame_changed(self._get_current_frame_index())
+
+    def _normalize_spot_ids(self):
+        """Migrate legacy ordinal observations without creating missing positions."""
+        highest = 0
+        for spots in self.spots_by_frame.values():
+            for index, spot in enumerate(spots, 1):
+                if not isinstance(spot.get('id'), (int, np.integer)) or spot['id'] < 1:
+                    spot['id'] = index
+                highest = max(highest, int(spot['id']))
+        self._next_spot_id = max(getattr(self, '_next_spot_id', 1), highest+1)
+
+    def _relabel_result_peaks_by_previous_frame(self, frame_index: int, result: Optional[FrameAnalysis]) -> None:
+        """Match stable IDs to the closest known positions, retaining missing IDs."""
         if result is None or result.best_n_peaks is None:
             return
-        try:
-            best_model = result.models[result.best_n_peaks]
-        except Exception:
-            return
-
-        prev_spots = list(self.spots_by_frame.get(int(frame_index) - 1) or [])
-        curr_peaks = list(getattr(best_model, "peaks", []) or [])
-        if not prev_spots or len(curr_peaks) <= 1:
-            return
-
-        prev_xy: List[Tuple[float, float]] = []
-        for pk in prev_spots:
-            try:
-                prev_xy.append((float(pk.get("x", float("nan"))), float(pk.get("y", float("nan")))))
-            except Exception:
-                prev_xy.append((float("nan"), float("nan")))
-        if not prev_xy or not any(np.isfinite(x) and np.isfinite(y) for x, y in prev_xy):
-            return
-
-        curr_xy = np.array([[float(pk.x), float(pk.y)] for pk in curr_peaks], dtype=np.float64)
-        prev_xy_arr = np.array(prev_xy, dtype=np.float64)
-        if curr_xy.ndim != 2 or prev_xy_arr.ndim != 2:
-            return
-
-        dist = np.linalg.norm(prev_xy_arr[:, None, :] - curr_xy[None, :, :], axis=2)
-        if not np.all(np.isfinite(dist)):
-            dist = np.where(np.isfinite(dist), dist, 1e9)
-
-        matched_curr_by_prev: Dict[int, int] = {}
-        try:
-            row_ind, col_ind = linear_sum_assignment(dist)
-            pairs = sorted(zip(row_ind.tolist(), col_ind.tolist()), key=lambda t: t[0])
-            for prev_i, curr_i in pairs:
-                if 0 <= prev_i < len(prev_spots) and 0 <= curr_i < len(curr_peaks):
-                    matched_curr_by_prev[int(prev_i)] = int(curr_i)
-        except Exception:
-            used_curr: set[int] = set()
-            for prev_i in range(len(prev_spots)):
-                best_j = None
-                best_d = None
-                for curr_i in range(len(curr_peaks)):
-                    if curr_i in used_curr:
-                        continue
-                    d = float(dist[prev_i, curr_i])
-                    if best_d is None or d < best_d:
-                        best_d = d
-                        best_j = curr_i
-                if best_j is not None:
-                    matched_curr_by_prev[int(prev_i)] = int(best_j)
-                    used_curr.add(int(best_j))
-
-        ordered_indices: List[int] = []
-        used_indices: set[int] = set()
-        for prev_i in range(len(prev_spots)):
-            curr_i = matched_curr_by_prev.get(int(prev_i))
-            if curr_i is None or curr_i in used_indices:
-                continue
-            ordered_indices.append(int(curr_i))
-            used_indices.add(int(curr_i))
-        for curr_i in range(len(curr_peaks)):
-            if curr_i not in used_indices:
-                ordered_indices.append(int(curr_i))
-
-        if len(ordered_indices) != len(curr_peaks):
-            return
-
-        best_model.peaks = [curr_peaks[i] for i in ordered_indices]
+        best = result.models[result.best_n_peaks]
+        peaks = list(best.peaks)
+        SpotAnalysisWindow._normalize_spot_ids(self)
+        anchors = {}
+        # Prefer this frame on re-fit, otherwise the nearest measured frame.
+        for frame in sorted(self.spots_by_frame, key=lambda f: (abs(f-frame_index), f)):
+            for spot in self.spots_by_frame[frame]:
+                if np.isfinite([spot['x'], spot['y']]).all():
+                    anchors.setdefault(int(spot['id']), (float(spot['x']), float(spot['y'])))
+        matched = {}
+        if anchors and peaks:
+            ids = sorted(anchors)
+            scale = np.array([getattr(gv, 'XScanSize', 0)/max(1, getattr(gv, 'XPixel', 1)),
+                              getattr(gv, 'YScanSize', 0)/max(1, getattr(gv, 'YPixel', 1))])
+            scale = np.where(scale > 0, scale, 1.)
+            gate_spin = getattr(self, 'id_max_distance_spin', None)
+            gate = float(gate_spin.value()) if gate_spin is not None else 10.
+            old = np.array([anchors[i] for i in ids])*scale
+            new = np.array([[p.x, p.y] for p in peaks])*scale
+            distances = np.linalg.norm(old[:, None]-new[None, :], axis=2)
+            # Maximize gated correspondences before minimizing displacement.
+            costs = np.full((len(ids), len(peaks)+len(ids)), min(len(ids), len(peaks))+1.)
+            costs[:, :len(peaks)] = np.where(distances <= gate, distances/gate, np.inf)
+            rows, columns = linear_sum_assignment(costs)
+            matched = {int(c): ids[r] for r, c in zip(rows, columns) if c < len(peaks)}
+        for index, peak in enumerate(peaks):
+            if index in matched:
+                peak.spot_id = matched[index]
+            else:
+                peak.spot_id = self._next_spot_id
+                self._next_spot_id += 1
+        best.peaks = sorted(peaks, key=lambda peak: peak.spot_id)
 
     def _store_spots_for_frame(
         self,
@@ -5927,8 +6027,16 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         update_initial: bool = True,
     ) -> None:
         best = result.models[result.best_n_peaks]
+        if any(getattr(pk, 'spot_id', None) is None for pk in best.peaks):
+            SpotAnalysisWindow._relabel_result_peaks_by_previous_frame(self, frame_index, result)
+        source = SpotAnalysisWindow._current_spot_source()
+        if getattr(self, '_spots_source_file', None) is None:
+            self._spots_source_file = source
+        self._spots_active_source = source
+        self._spot_assessed_frames = set(getattr(self, '_spot_assessed_frames', set())) | {frame_index}
         self.spots_by_frame[frame_index] = [
-            {"x": float(pk.x), "y": float(pk.y), "snr": float(pk.snr)}
+            {"id": int(pk.spot_id), "x": float(pk.x), "y": float(pk.y), "snr": float(pk.snr),
+             "source_file": source.get('path')}
             for pk in best.peaks
         ]
         self._sync_centroid_reference_for_frame(frame_index)
@@ -5959,6 +6067,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self.centroid_reference_by_frame[frame_index] = [dict(pk) for pk in src]
 
     def _refresh_overlay(self) -> None:
+        if not SpotAnalysisWindow._confirm_spot_source_reuse(self):
+            return
         if not self.full_viz_window or not self._is_window_live(self.full_viz_window):
             return
         frame_index = self._get_current_frame_index()
@@ -5974,7 +6084,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         )
         self.full_viz_window.update_view(
             self.last_frame,
-            self.last_result,
+            self.last_result if frame_index == getattr(self, '_last_result_frame', None) else None,
             spots,
             initial_spots,
             self._current_roi_overlay(),
@@ -6077,6 +6187,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         return float(np.median(finite))
 
     def _recompute_spot_heights_for_frame(self, frame_index: int, frame: Optional[np.ndarray] = None) -> None:
+        if not SpotAnalysisWindow._confirm_spot_source_reuse(self):
+            return
         spots = self.spots_by_frame.get(frame_index)
         if not spots:
             return
@@ -6111,14 +6223,21 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
     def _recompute_spot_heights_for_all_frames(self) -> None:
         if not self.spots_by_frame:
             return
+        if not SpotAnalysisWindow._confirm_spot_source_reuse(self, retry=True):
+            return False
         if not self._ensure_selection_loaded():
-            return
+            return False
+
+        if not SpotAnalysisWindow._confirm_spot_source_reuse(self):
+            return False
 
         original_index = int(getattr(gv, "index", 0))
         try:
             for frame_index in sorted(self.spots_by_frame.keys()):
                 spots = self.spots_by_frame.get(frame_index)
                 if not spots:
+                    continue
+                if not 0 <= int(frame_index) < int(getattr(gv, 'FrameNum', 0)):
                     continue
                 gv.index = int(frame_index)
                 frame = self._prepare_frame()
@@ -6135,6 +6254,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
     def _handle_edit_event(self, event, phase: str) -> None:
         if event.inaxes is None or event.xdata is None or event.ydata is None:
+            return
+        if not SpotAnalysisWindow._confirm_spot_source_reuse(self):
             return
         frame_index = self._get_current_frame_index()
         spots = self.spots_by_frame.setdefault(frame_index, [])
@@ -6161,7 +6282,16 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
 
         if phase == "press":
             if is_shift:
-                spots.append({"x": float(event.xdata), "y": float(event.ydata), "snr": 0.0})
+                SpotAnalysisWindow._normalize_spot_ids(self)
+                ident = self._next_spot_id
+                self._next_spot_id += 1
+                source = SpotAnalysisWindow._current_spot_source()
+                if getattr(self, '_spots_source_file', None) is None:
+                    self._spots_source_file = source
+                self._spots_active_source = source
+                spots.append({"id": ident, "x": float(event.xdata), "y": float(event.ydata), "snr": 0.0,
+                              "source_file": source.get('path')})
+                self._spot_assessed_frames = set(getattr(self, '_spot_assessed_frames', set())) | {frame_index}
                 self._sync_centroid_reference_for_frame(frame_index, spots)
                 self.export_btn.setEnabled(True)
                 self._recompute_spot_heights_for_frame(frame_index)
@@ -6215,67 +6345,100 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         return None
 
     def run_analysis_all_frames(self) -> None:
+        if getattr(self, '_batch_running', False):
+            return
         if hasattr(self, "run_all_enable_check") and not self.run_all_enable_check.isChecked():
             QtWidgets.QMessageBox.information(self, "All Frames Disabled", "「全フレーム解析を有効化」をONにしてください。")
             return
         if self.manual_roi is None:
             QtWidgets.QMessageBox.information(self, "ROI Required", "ROIを選択してください。")
             return
-        if not self._ensure_selection_loaded():
+        if not self._ensure_selection_loaded() or not self._apply_ui_to_analyzer(show_errors=True):
             return
-        if not hasattr(gv, "FrameNum") or gv.FrameNum <= 0:
+        total = int(getattr(gv, 'FrameNum', 0))
+        if total <= 0:
             QtWidgets.QMessageBox.warning(self, "No Frames", "フレーム数が取得できません。")
             return
-        if not self._apply_ui_to_analyzer(show_errors=True):
-            return
-        min_peaks = int(self.min_peaks_spin.value())
-        max_peaks = int(self.max_peaks_spin.value())
+        min_peaks, max_peaks = int(self.min_peaks_spin.value()), int(self.max_peaks_spin.value())
         if max_peaks < min_peaks:
             QtWidgets.QMessageBox.warning(self, "Invalid Parameter", "最大ピーク数は最小ピーク数以上にしてください。")
             return
-        original_index = int(getattr(gv, "index", 0))
+        original_index = int(getattr(gv, 'index', 0))
+        source = SpotAnalysisWindow._current_spot_source()
+        progress = QtWidgets.QProgressDialog("Analyzing frames / 全フレーム解析", "Cancel / キャンセル", 0, total, self)
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoReset(False)
+        previous_busy = getattr(self, '_auto_busy', False)
+        self._batch_running = self._auto_busy = True
         self.spots_by_frame = {}
         self.centroid_reference_by_frame = {}
         self.initial_spots_by_frame = {}
         self._analysis_signature_by_frame = {}
-        for idx in range(int(gv.FrameNum)):
-            gv.index = idx
-            frame = self._prepare_frame()
-            if frame is None:
-                continue
-            self.last_frame = frame
-            center_override, roi_size_override, roi_mask, roi_bounds = self._roi_overrides(frame.shape)
+        self._next_spot_id = 1
+        self._spot_assessed_frames = set()
+        self._spots_source_file = self._spots_active_source = source
+        self._spot_reuse_history = []
+        self._source_reuse_rejected = None
+        errors = []
+        cancelled = False
+        original_result = None
+        completed = 0
+        try:
+            for idx in range(total):
+                progress.setValue(idx)
+                QtWidgets.QApplication.processEvents()
+                if progress.wasCanceled():
+                    cancelled = True
+                    break
+                if SpotAnalysisWindow._current_spot_source() != source:
+                    errors.append("ファイルが切り替わったため解析を中断しました。")
+                    break
+                gv.index = idx
+                try:
+                    frame = self._prepare_frame()
+                    if frame is None:
+                        raise ValueError('No frame data')
+                    self.last_frame = frame
+                    center, size, mask, bounds = self._roi_overrides(frame.shape)
+                    result = self.spot_analyzer.analyze_frame(
+                        frame, prev_center=None, criterion=self.criterion_combo.currentText().lower(),
+                        center_override=center, roi_size_override=size, roi_mask_override=mask,
+                        roi_bounds_override=bounds, min_peaks=min_peaks, max_peaks=max_peaks)
+                    self._relabel_result_peaks_by_previous_frame(idx, result)
+                    self._store_spots_for_frame(idx, result, frame=frame)
+                    if getattr(self, "auto_centroid_check", None) is not None and self.auto_centroid_check.isChecked():
+                        self._apply_spot_centroid_to_frame(idx, frame=frame, result=result,
+                                                         show_messages=False, refresh_display=False)
+                    roi_info = self.roi_by_frame.get(idx, self.manual_roi)
+                    self._analysis_signature_by_frame[idx] = self._analysis_signature(idx, roi_info)
+                    if idx == original_index:
+                        original_result = result
+                    completed += 1
+                except Exception as exc:
+                    errors.append(f"Frame {idx}: {exc}")
+            if not cancelled:
+                progress.setValue(total)
+        finally:
             try:
-                result = self.spot_analyzer.analyze_frame(
-                    frame,
-                    prev_center=None,
-                    criterion=self.criterion_combo.currentText().lower(),
-                    center_override=center_override,
-                    roi_size_override=roi_size_override,
-                    roi_mask_override=roi_mask,
-                    roi_bounds_override=roi_bounds,
-                    min_peaks=min_peaks,
-                    max_peaks=max_peaks,
-                )
-            except Exception:
-                continue
-            self._relabel_result_peaks_by_previous_frame(idx, result)
-            self.last_result = result
-            self._store_spots_for_frame(idx, result, frame=frame)
-            if getattr(self, "auto_centroid_check", None) is not None and self.auto_centroid_check.isChecked():
-                self._apply_spot_centroid_to_frame(idx, frame=frame, result=result, show_messages=False, refresh_display=False)
-            # 署名を記録（同じ条件の再解析をスキップ）
-            try:
-                roi_info = self.roi_by_frame.get(idx, self.manual_roi)
-                self._analysis_signature_by_frame[idx] = self._analysis_signature(idx, roi_info)
-            except Exception:
-                pass
-        gv.index = original_index
-        frame = self._prepare_frame()
-        if frame is not None:
-            self.last_frame = frame
-        self.export_btn.setEnabled(True)
-        self._refresh_overlay()
+                if SpotAnalysisWindow._current_spot_source() == source:
+                    gv.index = original_index
+                    frame = self._prepare_frame()
+                    if frame is not None:
+                        self.last_frame = frame
+                self.last_result = original_result
+                self._last_result_frame = original_index if original_result is not None else None
+            finally:
+                self._batch_running = False
+                self._auto_busy = previous_busy
+                progress.close()
+                self.export_btn.setEnabled(any(self.spots_by_frame.values()))
+                self._refresh_overlay()
+        if errors:
+            QtWidgets.QMessageBox.warning(self, "Analysis results / 解析結果", "\n".join(errors))
+        if cancelled:
+            QtWidgets.QMessageBox.information(self, "Cancelled / 中断",
+                f"解析を中断しました。完了 {completed}/{total} フレームの結果を保持しています。")
 
     def _analyze_current_frame(
         self,
@@ -6289,6 +6452,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         max_peaks: int,
         show_errors: bool = False,
     ) -> None:
+        if not SpotAnalysisWindow._confirm_spot_source_reuse(self):
+            return
         try:
             result = self.spot_analyzer.analyze_frame(
                 frame,
@@ -6303,12 +6468,20 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             )
         except Exception as exc:  # noqa: BLE001
             if show_errors:
-                QtWidgets.QMessageBox.critical(self, "分析エラー", f"SpotAnalysisの実行に失敗しました:\n{exc}")
+                if (getattr(self, "ui_language", None) or get_language()) == "en":
+                    QtWidgets.QMessageBox.critical(
+                        self, "Analysis error", f"Spot analysis failed:\n{exc}"
+                    )
+                else:
+                    QtWidgets.QMessageBox.critical(
+                        self, "分析エラー", f"SpotAnalysisの実行に失敗しました:\n{exc}"
+                    )
             return
 
         self.last_frame = frame
         self._relabel_result_peaks_by_previous_frame(self._get_current_frame_index(), result)
         self.last_result = result
+        self._last_result_frame = self._get_current_frame_index()
         frame_index = self._get_current_frame_index()
         self._store_spots_for_frame(frame_index, result, frame=frame)
         if getattr(self, "auto_centroid_check", None) is not None and self.auto_centroid_check.isChecked():
@@ -6369,138 +6542,141 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         finally:
             self._auto_busy = False
 
+    @staticmethod
+    def _spot_csv_set_paths(export_dir, base_stub, ids, mode='number'):
+        """Allocate one suffix for every position/height file and the metadata."""
+        for revision in range(1000):
+            suffix = f'_{revision}' if revision else ''
+            meta = os.path.join(export_dir, f'{base_stub}_meta{suffix}.json')
+            positions = {ident: os.path.join(export_dir, f'{base_stub}_p{ident}{suffix}.csv') for ident in ids}
+            heights = {ident: os.path.join(export_dir, f'{base_stub}_p{ident}_h{suffix}.csv') for ident in ids}
+            # Orphan files from a former, larger ID set also reserve this version.
+            pattern = re.compile(rf'^{re.escape(base_stub)}_p\d+(?:_h)?{re.escape(suffix)}\.csv$')
+            occupied = os.path.exists(meta) or any(pattern.match(os.path.basename(path))
+                for path in glob.glob(os.path.join(export_dir, f'{base_stub}_p*.csv')))
+            if mode == 'overwrite' or not occupied:
+                return revision, positions, heights, meta
+        raise OSError('No free CSV set number (0-999).')
+
     def export_spots_csv(self) -> None:
-        if not self.spots_by_frame:
+        if not self.spots_by_frame or not any(self.spots_by_frame.values()):
             QtWidgets.QMessageBox.information(self, "No Data", "保存できるスポットがありません。")
             return
-        if not hasattr(gv, "files") or not gv.files or gv.currentFileNum < 0:
+        if not getattr(gv, 'files', None) or getattr(gv, 'currentFileNum', -1) < 0:
             QtWidgets.QMessageBox.warning(self, "No File", "元ファイル情報が取得できません。")
             return
-        if not hasattr(gv, "XScanSize") or not hasattr(gv, "YScanSize") or gv.XScanSize == 0 or gv.YScanSize == 0:
-            QtWidgets.QMessageBox.warning(self, "Invalid Scan Size", "scan_sizeが0です。先に正しいデータを読み込んでください。")
+        if min(getattr(gv, 'XScanSize', 0), getattr(gv, 'YScanSize', 0),
+               getattr(gv, 'XPixel', 0), getattr(gv, 'YPixel', 0)) <= 0:
+            QtWidgets.QMessageBox.warning(self, "Invalid Scale", "画像の物理サイズとピクセル数を確認してください。")
             return
-        if not hasattr(gv, "XPixel") or not hasattr(gv, "YPixel") or gv.XPixel == 0 or gv.YPixel == 0:
-            QtWidgets.QMessageBox.warning(self, "Invalid Pixel Size", "ピクセルサイズ情報が取得できません。")
+        if not SpotAnalysisWindow._confirm_spot_source_reuse(self, retry=True):
             return
-
-        nm_per_pixel_x = gv.XScanSize / gv.XPixel
-        nm_per_pixel_y = gv.YScanSize / gv.YPixel
-
         src_path = gv.files[gv.currentFileNum]
-        base_dir = os.path.dirname(src_path)
         base_name = os.path.splitext(os.path.basename(src_path))[0]
-
-        if self.export_dir is None:
-            self.export_dir = base_dir
-        default_path = os.path.join(self.export_dir, f"{base_name}.csv")
+        directory = self.export_dir or os.path.dirname(src_path)
         selected_path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self,
-            "Save CSV (base name)",
-            default_path,
-            "CSV Files (*.csv)",
-        )
+            self, "Save CSV (base name)", os.path.join(directory, f'{base_name}.csv'), "CSV Files (*.csv)")
         if not selected_path:
             return
         export_dir = os.path.dirname(selected_path)
         base_stub = os.path.splitext(os.path.basename(selected_path))[0] or base_name
         self.export_dir = export_dir
-        export_height_mode = self._selected_height_export_mode()
-
-        # Export always refreshes heights from the current spot positions so
-        # CSV-restored spot coordinates can be reused to regenerate heights.
-        self._recompute_spot_heights_for_all_frames()
-
-        # save meta.json alongside CSVs
+        if not SpotAnalysisWindow._confirm_spot_source_reuse(self, retry=True):
+            return
+        SpotAnalysisWindow._normalize_spot_ids(self)
+        ids = sorted({int(spot['id']) for spots in self.spots_by_frame.values() for spot in spots})
         try:
-            self._save_spot_meta_json(os.path.join(export_dir, f"{base_stub}_meta.json"), nm_per_pixel_x, nm_per_pixel_y)
-        except Exception:
-            pass
-
-        max_spots = max(len(v) for v in self.spots_by_frame.values())
-        # pre-check conflicts and ask once
-        conflict = False
-        for p in range(1, int(max_spots) + 1):
-            pos_path = os.path.join(export_dir, f"{base_stub}_p{p}.csv")
-            h_path = os.path.join(export_dir, f"{base_stub}_p{p}_h.csv")
-            if os.path.exists(pos_path) or os.path.exists(h_path):
-                conflict = True
-                break
-
-        mode = "number"
-        if conflict:
+            revision, positions, heights, meta_path = SpotAnalysisWindow._spot_csv_set_paths(export_dir, base_stub, ids)
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(self, 'Save Error', str(exc))
+            return
+        if revision:
             box = QtWidgets.QMessageBox(self)
             box.setIcon(QtWidgets.QMessageBox.Question)
             box.setWindowTitle("File Exists")
-            box.setText("同名のCSVファイルが既に存在します。どうしますか？")
-            overwrite_btn = box.addButton("上書き", QtWidgets.QMessageBox.AcceptRole)
-            number_btn = box.addButton("連番で回避", QtWidgets.QMessageBox.ActionRole)
-            cancel_btn = box.addButton("キャンセル", QtWidgets.QMessageBox.RejectRole)
-            box.setDefaultButton(number_btn)
+            box.setText("同名のCSVセットが既に存在します。どうしますか？")
+            overwrite = box.addButton("上書き", QtWidgets.QMessageBox.AcceptRole)
+            number = box.addButton("連番で回避", QtWidgets.QMessageBox.ActionRole)
+            cancel = box.addButton("キャンセル", QtWidgets.QMessageBox.RejectRole)
+            box.setDefaultButton(number)
             box.exec_()
-            clicked = box.clickedButton()
-            if clicked == cancel_btn:
+            if box.clickedButton() == cancel:
                 return
-            if clicked == overwrite_btn:
-                mode = "overwrite"
-            else:
-                mode = "number"
-
-        for spot_index in range(max_spots):
-            out_pos_path, out_h_path = self._unique_spot_paths(export_dir, base_stub, spot_index + 1, mode=mode)
-            if out_pos_path is None or out_h_path is None:
-                QtWidgets.QMessageBox.warning(self, "Save Error", "保存先ファイル名の衝突回避に失敗しました。")
-                return
-            try:
-                # 位置CSV
-                with open(out_pos_path, "w", encoding="utf-8") as f_pos:
-                    f_pos.write("frame_index,x_nm,y_nm\n")
-                    for frame_idx in sorted(self.spots_by_frame.keys()):
-                        spots = self.spots_by_frame[frame_idx]
-                        if spot_index >= len(spots):
-                            continue
-                        x_nm = spots[spot_index]["x"] * nm_per_pixel_x
-                        y_nm = spots[spot_index]["y"] * nm_per_pixel_y
-
-                        f_pos.write(f"{frame_idx},{x_nm:.6f},{y_nm:.6f}\n")
-
-                # 高さCSV
-                with open(out_h_path, "w", encoding="utf-8") as f_h:
-                    f_h.write(
-                        "frame_index,height_value_nm,height_bg_nm,height_bgsub_nm,height_mode,"
-                        "height_point_nm,height_point_bgsub_nm,height_mean_nm,height_mean_bgsub_nm\n"
-                    )
-                    for frame_idx in sorted(self.spots_by_frame.keys()):
-                        spots = self.spots_by_frame[frame_idx]
-                        if spot_index >= len(spots):
-                            continue
-                        # 高さが未計算なら、現在のフレームデータで計算（可能な範囲で）
-                        if (
-                            "height_point_nm" not in spots[spot_index]
-                            or "height_mean_nm" not in spots[spot_index]
-                            or "height_bgsub_nm" not in spots[spot_index]
-                            or "height_bg_nm" not in spots[spot_index]
-                        ):
-                            if self.last_frame is not None and frame_idx == self._get_current_frame_index():
-                                self._recompute_spot_heights_for_frame(frame_idx, frame=self.last_frame)
-                        h_point = float(spots[spot_index].get("height_point_nm", float("nan")))
-                        h_point_bgsub = float(spots[spot_index].get("height_point_bgsub_nm", float("nan")))
-                        h_mean = float(spots[spot_index].get("height_mean_nm", float("nan")))
-                        h_mean_bgsub = float(spots[spot_index].get("height_mean_bgsub_nm", float("nan")))
-                        h_bg = float(spots[spot_index].get("height_bg_nm", float("nan")))
-                        if export_height_mode == "point":
-                            h_value = h_point
-                            h_bgsub = h_point_bgsub
-                            h_mode = "point"
+            if box.clickedButton() == overwrite:
+                revision, positions, heights, meta_path = SpotAnalysisWindow._spot_csv_set_paths(
+                    export_dir, base_stub, ids, mode='overwrite')
+        # Recompute only after the save dialog and explicit cross-file consent.
+        if self._recompute_spot_heights_for_all_frames() is False:
+            return
+        nm_x, nm_y = gv.XScanSize/gv.XPixel, gv.YScanSize/gv.YPixel
+        frames = list(range(min(self.spots_by_frame), max(self.spots_by_frame)+1))
+        by_frame = {fi: {int(p['id']): p for p in spots} for fi, spots in self.spots_by_frame.items()}
+        mode = self._selected_height_export_mode()
+        errors = []
+        written = []
+        for ident in ids:
+            for kind, path in (('position', positions[ident]), ('height', heights[ident])):
+                try:
+                    with open(path, 'w', encoding='utf-8', newline='') as stream:
+                        writer = csv.writer(stream)
+                        if kind == 'position':
+                            writer.writerow(['frame_index', 'x_nm', 'y_nm', 'spot_id', 'observed', 'observation_status'])
                         else:
-                            h_value = h_mean
-                            h_bgsub = h_mean_bgsub
-                            h_mode = "mean"
-                        f_h.write(
-                            f"{frame_idx},{h_value:.6f},{h_bg:.6f},{h_bgsub:.6f},{h_mode},"
-                            f"{h_point:.6f},{h_point_bgsub:.6f},{h_mean:.6f},{h_mean_bgsub:.6f}\n"
-                        )
-            except Exception:
-                continue
+                            writer.writerow(['frame_index', 'height_value_nm', 'height_bg_nm', 'height_bgsub_nm',
+                                'height_mode', 'height_point_nm', 'height_point_bgsub_nm', 'height_mean_nm',
+                                'height_mean_bgsub_nm', 'spot_id', 'observed', 'observation_status'])
+                        for fi in frames:
+                            spot = by_frame.get(fi, {}).get(ident)
+                            assessed = getattr(self, '_spot_assessed_frames', set(by_frame))
+                            status = 'observed' if spot is not None else ('missing' if fi in assessed else 'unanalysed')
+                            tail = [ident, int(spot is not None), status]
+                            if kind == 'position':
+                                values = [f"{spot['x']*nm_x:.6f}", f"{spot['y']*nm_y:.6f}"] if spot is not None else ['', '']
+                            else:
+                                keys = ['height_point_nm' if mode == 'point' else 'height_mean_nm', 'height_bg_nm',
+                                        'height_point_bgsub_nm' if mode == 'point' else 'height_mean_bgsub_nm',
+                                        'height_point_nm', 'height_point_bgsub_nm', 'height_mean_nm', 'height_mean_bgsub_nm']
+                                values = [f"{float(spot.get(key, float('nan'))):.6f}" for key in keys] if spot is not None else ['']*7
+                                values.insert(3, mode)
+                            writer.writerow([fi]+values+tail)
+                    written.append(path)
+                except Exception as exc:
+                    errors.append(f'{os.path.basename(path)}: {exc}')
+        hashes = {}
+        for path in written:
+            try:
+                with open(path, 'rb') as stream:
+                    hashes[os.path.basename(path)] = hashlib.sha256(stream.read()).hexdigest()
+            except Exception as exc:
+                errors.append(f'{os.path.basename(path)} (verification): {exc}')
+        self._last_export_failures = list(errors)
+        self._last_export_set = dict(suffix=revision, spot_ids=ids, frames=frames,
+                                     files=list(hashes), sha256=hashes)
+        try:
+            self._save_spot_meta_json(meta_path, nm_x, nm_y)
+            written.append(meta_path)
+        except Exception as exc:
+            errors.append(f'{os.path.basename(meta_path)}: {exc}')
+        self._last_export_failures = errors
+        export_language = getattr(self, "ui_language", None) or get_language()
+        if errors:
+            if export_language == "en":
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "CSV save failures",
+                    f"Saved {len(written)} files, {len(errors)} failed\n\n" + "\n".join(errors),
+                )
+            else:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "保存失敗一覧",
+                    f"保存成功 {len(written)} ファイル、失敗 {len(errors)} 件\n\n" + "\n".join(errors),
+                )
+        else:
+            if export_language == "en":
+                QtWidgets.QMessageBox.information(self, "CSV saved", f"Saved {len(written)} files.")
+            else:
+                QtWidgets.QMessageBox.information(self, "保存完了", f"{len(written)} ファイルを保存しました。")
 
     def _unique_spot_paths(
         self, export_dir: str, base_stub: str, p_index: int, mode: str = "number", max_tries: int = 999
@@ -6529,9 +6705,17 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
     def _save_spot_meta_json(self, path: str, nm_per_pixel_x: float, nm_per_pixel_y: float) -> None:
         ui_params = self._collect_ui_params()
         meta = {
-            "version": 1,
+            "version": 2,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "frame_num": int(getattr(gv, "FrameNum", 0) or 0),
+            "coordinate_source": getattr(self, '_spots_source_file', None),
+            "next_spot_id": getattr(self, '_next_spot_id', 1),
+            "measurement_source": getattr(self, '_spots_active_source', None),
+            "reuse_history": getattr(self, '_spot_reuse_history', []),
+            "csv_set": getattr(self, '_last_export_set', {}),
+            "export_errors": getattr(self, '_last_export_failures', []),
+            "assessed_frames": sorted(getattr(self, '_spot_assessed_frames', self.spots_by_frame)),
+
             "nm_per_pixel_x": float(nm_per_pixel_x),
             "nm_per_pixel_y": float(nm_per_pixel_y),
             "manual_roi": self.manual_roi,
@@ -6593,6 +6777,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             "snap_radius": _try_get(lambda: int(self.snap_radius_spin.value()), 2),
             "snap_refit_enabled": _try_get(lambda: bool(self.snap_refit_check.isChecked()), False),
             "height_export_mode": _try_get(self._selected_height_export_mode, "mean"),
+            "id_link_distance_nm": _try_get(lambda: float(self.id_max_distance_spin.value()), 10.),
         }
 
     def _apply_ui_params(self, params: Dict[str, object]) -> None:
@@ -6642,6 +6827,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             getattr(self, "snap_radius_spin", None),
             getattr(self, "snap_refit_check", None),
             getattr(self, "height_export_mode_combo", None),
+            getattr(self, "id_max_distance_spin", None),
         ):
             try:
                 if w is not None:
@@ -6650,6 +6836,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                 pass
 
         try:
+            if 'id_link_distance_nm' in params and hasattr(self, 'id_max_distance_spin'):
+                self.id_max_distance_spin.setValue(float(params['id_link_distance_nm']))
             if "criterion" in params:
                 self.criterion_combo.setCurrentText(str(params["criterion"]))
             if "detection_mode" in params:
@@ -6759,108 +6947,106 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         self._update_fit_ui_enabled()
 
     def import_csv_restore(self) -> None:
-        """
-        Load exported spot CSVs and restore the spot state for display.
-        If <base>_meta.json exists, restore ROI / UI params / analysis signatures too.
-        """
-        if not hasattr(gv, "files") or not gv.files or getattr(gv, "currentFileNum", -1) < 0:
-            QtWidgets.QMessageBox.warning(self, "No File", "先にデータをロードしてください。")
+        """Restore one CSV set, using legacy common metadata when applicable."""
+        if not getattr(gv, 'files', None) or getattr(gv, 'currentFileNum', -1) < 0:
+            QtWidgets.QMessageBox.warning(self, 'No File', '先にデータをロードしてください。')
             return
-        if not hasattr(gv, "XScanSize") or not hasattr(gv, "YScanSize") or gv.XScanSize == 0 or gv.YScanSize == 0:
-            QtWidgets.QMessageBox.warning(self, "Invalid Scan Size", "scan_sizeが0です。先に正しいデータを読み込んでください。")
+        if min(getattr(gv, 'XScanSize', 0), getattr(gv, 'YScanSize', 0),
+               getattr(gv, 'XPixel', 0), getattr(gv, 'YPixel', 0)) <= 0:
+            QtWidgets.QMessageBox.warning(self, 'Invalid Scale', '画像の物理サイズとピクセル数を確認してください。')
             return
-        if not hasattr(gv, "XPixel") or not hasattr(gv, "YPixel") or gv.XPixel == 0 or gv.YPixel == 0:
-            QtWidgets.QMessageBox.warning(self, "Invalid Pixel Size", "ピクセルサイズ情報が取得できません。")
-            return
-
-        if self.export_dir is None and hasattr(gv, "files") and gv.files:
-            try:
-                self.export_dir = os.path.dirname(gv.files[gv.currentFileNum])
-            except Exception:
-                pass
-
         selected_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Open spot CSV (base or pN)",
-            self.export_dir or "",
-            "CSV Files (*.csv)",
-        )
+            self, 'Open spot CSV (base or pN)', self.export_dir or '', 'CSV Files (*.csv)')
         if not selected_path:
             return
-
-        export_dir = os.path.dirname(selected_path)
-        base_stub = os.path.splitext(os.path.basename(selected_path))[0]
-        # allow selecting my_result_p1.csv etc.
-        m = re.match(r"^(.*)_p\d+(?:_h)?(?:_\d+)?$", base_stub)
-        if m:
-            base_stub = m.group(1)
-        if not base_stub:
-            QtWidgets.QMessageBox.warning(self, "Invalid File", "ベース名が取得できません。")
+        directory = os.path.dirname(selected_path)
+        base = os.path.splitext(os.path.basename(selected_path))[0]
+        match = re.match(r'^(.*)_p\d+(?:_h)?(?:_(\d+))?$', base)
+        suffix = None
+        if match:
+            base, suffix = match.group(1), int(match.group(2) or 0)
+        if not base:
             return
-
-        nm_per_pixel_x = gv.XScanSize / gv.XPixel
-        nm_per_pixel_y = gv.YScanSize / gv.YPixel
-
-        restored = self._load_seed_spots_from_csv(export_dir, base_stub, nm_per_pixel_x, nm_per_pixel_y)
+        meta_suffix = f'_{suffix}' if suffix else ''
+        meta_path = os.path.join(directory, f'{base}_meta{meta_suffix}.json')
+        meta = {}
+        candidates = [meta_path]
+        common = os.path.join(directory, f'{base}_meta.json')
+        if common != meta_path:
+            candidates.append(common)
+        for candidate in candidates:
+            try:
+                with open(candidate, encoding='utf-8') as stream:
+                    loaded = json.load(stream)
+                if not isinstance(loaded, dict):
+                    continue
+                # Only old, unversioned exports may borrow the common meta file.
+                if candidate != meta_path and int(loaded.get('version', 1)) >= 2:
+                    continue
+                meta = loaded
+                break
+            except (OSError, ValueError, TypeError):
+                continue
+        selected_ids = meta.get('csv_set', {}).get('spot_ids') if meta.get('version', 1) >= 2 else None
+        nm_x, nm_y = gv.XScanSize/gv.XPixel, gv.YScanSize/gv.YPixel
+        restored = self._load_seed_spots_from_csv(directory, base, nm_x, nm_y,
+                                                 selected_suffix=suffix, selected_ids=selected_ids,
+                                                 selected_files=meta.get('csv_set', {}).get('files'),
+                                                 checksums=meta.get('csv_set', {}).get('sha256'))
+        import_errors = getattr(self, '_last_import_errors', [])
+        if import_errors:
+            QtWidgets.QMessageBox.warning(self, 'CSV set mismatch / CSVセットの不一致', '\n'.join(import_errors))
         if not restored:
-            QtWidgets.QMessageBox.information(self, "No Data", "読み込めるスポットCSVが見つかりませんでした。")
+            if not import_errors:
+                QtWidgets.QMessageBox.information(self, 'No Data', '読み込めるスポットCSVが見つかりませんでした。')
             return
-
-        # restore in-memory state (display)
+        current = SpotAnalysisWindow._current_spot_source()
+        previous = meta.get('measurement_source') or meta.get('coordinate_source')
+        history = list(meta.get('reuse_history') or [])
+        if previous and previous.get('path') and previous != current:
+            reply = QtWidgets.QMessageBox.question(
+                self, 'Reuse imported coordinates / 座標の再利用',
+                f"CSV座標を別のファイルで再利用しますか？\n元: {previous.get('path')}\n測定先: {current.get('path')}",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+            history.append(dict(from_source=previous, to_source=current,
+                                confirmed_at=datetime.now().isoformat(timespec='seconds')))
+            for spots in restored.values():
+                for spot in spots:
+                    for key in list(spot):
+                        if key.startswith('height_'):
+                            spot.pop(key)
         self.spots_by_frame = restored
+        self._spots_source_file = meta.get('coordinate_source') or {'path': None, 'imported_csv': os.path.realpath(selected_path)}
+        self._spots_active_source = current
+        self._spot_reuse_history = history
+        self._source_reuse_rejected = None
+        self._spot_assessed_frames = set(meta.get('assessed_frames', getattr(self, '_last_import_assessed_frames', restored.keys())))
+        self._next_spot_id = max(1, int(meta.get('next_spot_id', 1)))
+        SpotAnalysisWindow._normalize_spot_ids(self)
         self.centroid_reference_by_frame = {int(fi): [dict(pk) for pk in spots] for fi, spots in restored.items()}
         self.preserve_existing_spots_on_auto = True
-        self.export_btn.setEnabled(True)
-        self.export_dir = export_dir
-
-        # load meta.json if exists
-        meta_path = os.path.join(export_dir, f"{base_stub}_meta.json")
-        if os.path.exists(meta_path):
-            try:
-                with open(meta_path, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-                self.manual_roi = meta.get("manual_roi") or self.manual_roi
-                roi_by_frame = meta.get("roi_by_frame")
-                if isinstance(roi_by_frame, dict):
-                    # json keys might be strings
-                    self.roi_by_frame = {int(k): v for k, v in roi_by_frame.items()}
-                ui_params = meta.get("ui_params")
-                if isinstance(ui_params, dict):
-                    self._apply_ui_params(ui_params)
-                sig_map = meta.get("analysis_signature_by_frame")
-                if isinstance(sig_map, dict):
-                    def _to_tuple(obj):
-                        if isinstance(obj, list):
-                            return tuple(_to_tuple(v) for v in obj)
-                        if isinstance(obj, dict):
-                            return {k: _to_tuple(v) for k, v in obj.items()}
-                        return obj
-                    self._analysis_signature_by_frame = {int(k): _to_tuple(v) for k, v in sig_map.items()}
-            except Exception:
-                pass
-
-        # ensure signatures exist for restored frames to prevent unwanted auto rerun
-        for fi in list(self.spots_by_frame.keys()):
-            if fi in self._analysis_signature_by_frame:
-                continue
-            roi_info = self.roi_by_frame.get(fi, self.manual_roi)
-            if roi_info is None:
-                continue
-            try:
-                self._analysis_signature_by_frame[int(fi)] = self._analysis_signature(int(fi), roi_info)
-            except Exception:
-                pass
-
-        # refresh view
+        self.export_dir = directory
+        if meta:
+            self.manual_roi = meta.get('manual_roi') or self.manual_roi
+            if isinstance(meta.get('roi_by_frame'), dict):
+                self.roi_by_frame = {int(k): v for k, v in meta['roi_by_frame'].items()}
+            if isinstance(meta.get('ui_params'), dict):
+                self._apply_ui_params(meta['ui_params'])
+            def as_tuple(obj):
+                return tuple(as_tuple(v) for v in obj) if isinstance(obj, list) else obj
+            if isinstance(meta.get('analysis_signature_by_frame'), dict):
+                self._analysis_signature_by_frame = {int(k): as_tuple(v) for k, v in meta['analysis_signature_by_frame'].items()}
+        for fi in restored:
+            if fi not in self._analysis_signature_by_frame:
+                roi = self.roi_by_frame.get(fi, self.manual_roi)
+                if roi is not None:
+                    self._analysis_signature_by_frame[fi] = self._analysis_signature(fi, roi)
         frame = self._prepare_frame()
         if frame is not None:
             self.last_frame = frame
-        try:
-            self.roi_status_label.setText(
-                self._tr("ROI選択済み" if self.manual_roi is not None else "ROI未選択")
-            )
-        except Exception:
-            pass
+        self.last_result = None
         self._sync_run_buttons_enabled()
         self.show_full_image_view()
         self.export_btn.setEnabled(True)
@@ -6871,7 +7057,8 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         return self.import_csv_restore()
 
     def _load_seed_spots_from_csv(
-        self, export_dir: str, base_stub: str, nm_per_pixel_x: float, nm_per_pixel_y: float
+        self, export_dir: str, base_stub: str, nm_per_pixel_x: float, nm_per_pixel_y: float,
+        selected_suffix: Optional[int] = None, selected_ids=None, selected_files=None, checksums=None,
     ) -> Dict[int, List[Dict[str, float]]]:
         """
         Load <base>_pN.csv and optionally <base>_pN_h.csv.
@@ -6880,18 +7067,41 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         p1 -> index 0, p2 -> index 1, ...
         """
         # Choose best candidate per pN: prefer no suffix, then lowest suffix
+        self._last_import_errors = []
+        allowed_files = {os.path.basename(p) for p in selected_files} if selected_files is not None else None
+        def belongs_to_set(path):
+            name = os.path.basename(path)
+            if allowed_files is not None and name not in allowed_files:
+                return False
+            if checksums is not None:
+                try:
+                    with open(path, 'rb') as stream:
+                        matches = hashlib.sha256(stream.read()).hexdigest() == checksums.get(name)
+                    if not matches:
+                        self._last_import_errors.append(f'{name}: 保存時のCSVセットと内容が一致しないため読み込みませんでした。')
+                    return matches
+                except OSError as exc:
+                    self._last_import_errors.append(f'{name}: {exc}')
+                    return False
+            return True
         pos_paths = glob.glob(os.path.join(export_dir, f"{base_stub}_p*.csv"))
         # exclude height files
         pos_paths = [p for p in pos_paths if not re.search(r"_p\d+_h(?:_\d+)?\.csv$", os.path.basename(p))]
 
         by_p: Dict[int, List[Tuple[int, str]]] = {}
         for path in pos_paths:
+            if not belongs_to_set(path):
+                continue
             name = os.path.basename(path)
             m = re.match(rf"^{re.escape(base_stub)}_p(\d+)(?:_(\d+))?\.csv$", name)
             if not m:
                 continue
             p_idx = int(m.group(1))
+            if selected_ids is not None and p_idx not in selected_ids:
+                continue
             suf = int(m.group(2)) if m.group(2) is not None else 0
+            if selected_suffix is not None and suf != selected_suffix:
+                continue
             by_p.setdefault(p_idx, []).append((suf, path))
         if not by_p:
             return {}
@@ -6899,6 +7109,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         best_pos_by_p: Dict[int, str] = {p: sorted(lst, key=lambda t: t[0])[0][1] for p, lst in by_p.items()}
 
         seed_by_frame_and_p: Dict[int, Dict[int, Dict[str, float]]] = {}
+        self._last_import_assessed_frames = set()
         for p_idx, pos_path in best_pos_by_p.items():
             try:
                 with open(pos_path, "r", encoding="utf-8") as f:
@@ -6906,16 +7117,27 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
                     for row in reader:
                         try:
                             frame_i = int(float(row.get("frame_index", "nan")))
-                            x_nm = float(row.get("x_nm", "nan"))
-                            y_nm = float(row.get("y_nm", "nan"))
-                        except Exception:
+                        except (ValueError, TypeError, OverflowError):
                             continue
-                        if not np.isfinite(x_nm) or not np.isfinite(y_nm):
+                        if frame_i < 0:
                             continue
-                        x_px = x_nm / float(nm_per_pixel_x)
-                        y_px = y_nm / float(nm_per_pixel_y)
                         frame_map = seed_by_frame_and_p.setdefault(frame_i, {})
+                        status = row.get('observation_status', '')
+                        if row.get('observed') == '0':
+                            if status != 'unanalysed':
+                                self._last_import_assessed_frames.add(frame_i)
+                            continue
+                        try:
+                            x_nm = float(row.get('x_nm', 'nan'))
+                            y_nm = float(row.get('y_nm', 'nan'))
+                        except (ValueError, TypeError):
+                            continue
+                        if not np.isfinite([x_nm, y_nm]).all():
+                            continue
+                        self._last_import_assessed_frames.add(frame_i)
+                        x_px, y_px = x_nm/float(nm_per_pixel_x), y_nm/float(nm_per_pixel_y)
                         frame_map[int(p_idx)] = {
+                            "id": int(p_idx),
                             "x": float(x_px),
                             "y": float(y_px),
                             "snr": 0.0,
@@ -6923,21 +7145,12 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
             except Exception:
                 continue
 
-            # merge height if exists (prefer no suffix like position)
-            base_name = os.path.splitext(os.path.basename(pos_path))[0]
-            # base_name is <base>_pN or <base>_pN_k ; derive height file
-            h_candidates = []
-            for hp in glob.glob(os.path.join(export_dir, f"{base_name}_h*.csv")):
-                h_candidates.append(hp)
-            # fallback: any base_stub_pN_h*.csv
-            if not h_candidates:
-                h_candidates = glob.glob(os.path.join(export_dir, f"{base_stub}_p{p_idx}_h*.csv"))
-            h_path = None
-            if h_candidates:
-                # prefer exact match without extra suffix
-                h_candidates.sort(key=lambda p: len(os.path.basename(p)))
-                h_path = h_candidates[0]
-            if h_path:
+            # Position ..._pN_k.csv is paired with ..._pN_h_k.csv.
+            # Never substitute an older/newer height file when its mate is absent.
+            match = re.match(rf"^{re.escape(base_stub)}_p\d+(?:_(\d+))?\.csv$", os.path.basename(pos_path))
+            suffix = f"_{match.group(1)}" if match.group(1) else ""
+            h_path = os.path.join(export_dir, f"{base_stub}_p{p_idx}_h{suffix}.csv")
+            if os.path.exists(h_path) and belongs_to_set(h_path):
                 try:
                     with open(h_path, "r", encoding="utf-8") as f:
                         reader = csv.DictReader(f)
@@ -6993,8 +7206,7 @@ class SpotAnalysisWindow(QtWidgets.QWidget):
         restored: Dict[int, List[Dict[str, float]]] = {}
         for frame_i, frame_map in seed_by_frame_and_p.items():
             ordered = [frame_map[p] for p in sorted(frame_map.keys())]
-            if ordered:
-                restored[int(frame_i)] = ordered
+            restored[int(frame_i)] = ordered
         return restored
     # --- helper ---
     def _ensure_live_window(self, win, cls):

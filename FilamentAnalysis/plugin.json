@@ -3,8 +3,8 @@
   "id": "FilamentAnalysis",
   "name": "Filament Analysis",
   "entrypoint": "FilamentAnalysis.py",
-  "version": "2026.10.1",
-  "updated": "2026-10-01",
+  "version": "2026.11.14.1",
+  "updated": "2026-11-14",
   "host_api": 1,
   "files": [
     "FilamentAnalysis.py",

@@ -10,6 +10,15 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from PyQt5 import QtCore, QtGui, QtWidgets
+try:
+    from gui_i18n import QtWidgets
+except ImportError:  # 古い pyNuD 本体には gui_i18n が無い。そのときは元の Qt の部品で動く。
+    pass
+try:
+    from gui_i18n import pick_text
+except ImportError:  # 古い本体には pick_text が無い
+    def pick_text(en, ja):
+        return en
 
 from background_auto import ProcessingCancelled, check_cancel
 
@@ -284,7 +293,10 @@ class ParticleMovieDialog(QtWidgets.QDialog):
         self.image.setStyleSheet('background: black'); layout.addWidget(self.image, 1)
         self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.slider.setRange(0, len(self.movie.frames)-1); layout.addWidget(self.slider)
         self.bar = QtWidgets.QProgressBar(); self.bar.setRange(0, 100); self.bar.setValue(0); layout.addWidget(self.bar)
-        self.status = QtWidgets.QLabel(f'Acquisition interval: {self.movie.seconds:g} s/frame. Preview uses the selected overlays.')
+        self.status = QtWidgets.QLabel(pick_text(
+            f"Acquisition interval: {self.movie.seconds:g} s/frame. Preview uses the selected overlays.",
+            f"取得間隔: {self.movie.seconds:g} s/frame。プレビューは選択した重ね表示を使います。",
+        ))
         self.status.setWordWrap(True); layout.addWidget(self.status)
         buttons = QtWidgets.QHBoxLayout(); layout.addLayout(buttons)
         self.save = QtWidgets.QPushButton('Save Movie…'); self.close_button = QtWidgets.QPushButton('Close')
@@ -314,7 +326,10 @@ class ParticleMovieDialog(QtWidgets.QDialog):
         if self.worker: return
         options = self.options()
         if options.first > options.last:
-            self.status.setText('From frame must not exceed Through frame.'); return
+            self.status.setText(pick_text(
+                "From frame must not exceed Through frame.",
+                "開始フレームは終了フレームより後にできません。",
+            )); return
         default = Path(self.movie.source).with_name(Path(self.movie.source).stem + datetime.now().strftime('_%Y%m%d_tracking.mp4'))
         path, selected = QtWidgets.QFileDialog.getSaveFileName(self, 'Save tracking movie', str(default),
                                                               'MP4 movie (*.mp4);;AVI movie (*.avi)')
@@ -324,7 +339,7 @@ class ParticleMovieDialog(QtWidgets.QDialog):
         self.save.setEnabled(False); self.close_button.setText('Cancel export')
         for widget in (self.first,self.last,self.fps,self.edge,self.length,*self.checks.values()): widget.setEnabled(False)
         self.worker.progress.connect(self.progress)
-        self.worker.result.connect(lambda name: self.status.setText('Saved: ' + name))
+        self.worker.result.connect(lambda name: self.status.setText(pick_text(f"Saved: {name}", f"保存しました: {name}")))
         self.worker.failed.connect(self.status.setText)
         self.worker.finished.connect(self.finished)
         self.worker.start()
@@ -340,7 +355,7 @@ class ParticleMovieDialog(QtWidgets.QDialog):
 
     def closeEvent(self, event):
         if self.worker:
-            self.worker.requestInterruption(); self.status.setText('Cancelling export…'); event.ignore(); return
+            self.worker.requestInterruption(); self.status.setText(pick_text("Cancelling export…", "書き出しを中止しています…")); event.ignore(); return
         event.accept()
 
     def reject(self): self.close()
