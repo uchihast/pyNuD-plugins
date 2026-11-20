@@ -62,6 +62,24 @@
   },
   {
     "schema_version": 1,
+    "id": "IrregularMoleculeDetection",
+    "name": "Irregular Molecule Detection",
+    "entrypoint": "IrregularMoleculeDetection.py",
+    "version": "2026.11.20.1",
+    "updated": "2026-11-20",
+    "host_api": 1,
+    "files": [
+      "IrregularMoleculeDetection.py",
+      "__init__.py",
+      "molecule_detect_core.py",
+      "molecule_i18n.py",
+      "manual_ja.html",
+      "manual_en.html"
+    ],
+    "archive": "IrregularMoleculeDetection.zip"
+  },
+  {
+    "schema_version": 1,
     "id": "Kymograph",
     "name": "Kymograph",
     "entrypoint": "Kymograph.py",

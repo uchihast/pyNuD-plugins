@@ -1,0 +1,1 @@
+"""IrregularMoleculeDetection plugin bundle."""

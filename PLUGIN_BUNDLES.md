@@ -22,6 +22,7 @@ All plugins, including those with one implementation file, use complete folders.
 | Dwell Analysis | 2026.11.14.1 | 2026-11-14 | [DwellAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/DwellAnalysis.zip) |
 | Filament Analysis | 2026.11.14.1 | 2026-11-14 | [FilamentAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/FilamentAnalysis.zip) |
 | Interactive Drift Compensation | 2026.11.14 | 2026-11-14 | [InteractiveDriftCompensation.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/InteractiveDriftCompensation.zip) |
+| Irregular Molecule Detection | 2026.11.20.1 | 2026-11-20 | [IrregularMoleculeDetection.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/IrregularMoleculeDetection.zip) |
 | Kymograph | 2026.11.14.1 | 2026-11-14 | [Kymograph.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/Kymograph.zip) |
 | L-AFM Analysis | 2026.11.14.1 | 2026-11-14 | [LAFMAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/LAFMAnalysis.zip) |
 | Normal Mode Analysis | 2026.11.14 | 2026-11-14 | [NormalModeAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/NormalModeAnalysis.zip) |

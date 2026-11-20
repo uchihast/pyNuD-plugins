@@ -1,3 +1,23 @@
+# Plugin ZIP bundles — 2026-11-20
+
+## 更新内容 / Changes
+
+新しいプラグイン **Irregular Molecule Detection** を公開しました。そのほかの13プラグインは2026-11-14版のままで、ZIPも前回と同じです。A new plugin, **Irregular Molecule Detection**, is published. The other 13 plugins are unchanged from the 2026-11-14 collection; their ZIPs are byte-identical.
+
+- **Irregular Molecule Detection 2026.11.20.1（新規 / New）**: 高速AFM像から、決まった形を持たない分子（mRNAの絡まった塊と一本鎖など）を検出し、面積・体積・最大高さ・平均高さ・骨格の長さを測ります。基板の凹凸と区別しにくい細い鎖は、リッジフィルタと2段階のしきい値で拾い、鎖と鎖の間の基板は輪郭から除きます。パラメータを変えると、現在のフレームを自動で解析し直します。全フレームの解析、CSVと画像の保存に対応し、日英のマニュアルが付いています。 / Detects molecules without a fixed shape (for example mRNA: entangled clumps with single-stranded tails) in HS-AFM height images and measures area, volume, maximum and mean height, and skeleton length. Thin strands that a plain threshold cannot separate from substrate roughness are found with a ridge filter and two thresholds, and substrate between strands is left out of the outline. Changing a parameter re-analyzes the current frame. All-frame analysis, CSV and image export, and a Japanese/English manual are included.
+
+このプラグインには **pyNuD 2.14.0以降** が必要です。This plugin requires **pyNuD 2.14.0 or later**.
+
+## インストール / Installation
+1. 本体を2.14.0以降へ更新し、pyNuDを再起動します。Update the host to 2.14.0 or later and restart pyNuD.
+2. IrregularMoleculeDetection.zipをダウンロードし、**Plugin → Import Plugin ZIP...** で読み込みます。Download IrregularMoleculeDetection.zip and import it with **Plugin → Import Plugin ZIP...**; extraction is not required.
+3. プラグインのウィンドウタイトルで版（2026.11.20.1）を確認します。Confirm the version (2026.11.20.1) in the plugin window title.
+
+## Verification
+All 14 ZIPs were imported with the pyNuD importer and every entry point loaded. ZIP contents match the files declared in each plugin.json, and SHA-256 digests are listed in SHA256SUMS.txt. IrregularMoleculeDetection.zip was also imported and used in an installed pyNuD 2.14.1. The 1,691-test regression suite passes for the plugin source snapshot (uchihast/pyNuD a54253a). These checks validate packaging and imports; they do not validate every scientific workflow.
+
+---
+
 # Plugin ZIP bundles — 2026-11-14
 
 ## 更新内容 / Changes

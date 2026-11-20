@@ -8,7 +8,7 @@ Download **one ZIP per plugin** and import it in **pyNuD 2.13.0 or later** using
 - **Plugin versions from 2026.11.14 require pyNuD 2.14.0 or later.** Update the host application and restart it before loading these ZIPs.
 - **2026.11.14版のプラグインにはpyNuD 2.14.0以降が必要です。** 本体を更新・再起動してから新しいZIPを読み込んでください。
 - Close the plugin and its AI review windows before importing an updated ZIP. Restart pyNuD after updating the host application.
-- **Each plugin has its own version**, shown below and in its window title. The `bundles-2026.11.14` release identifies this collection; it is not a shared plugin version or the application version.
+- **Each plugin has its own version**, shown below and in its window title. The `bundles-2026.11.20` release identifies this collection; it is not a shared plugin version or the application version.
 - Do not import GitHub's repository-wide **Source code (zip)** as a plugin.
 - Older `.py` downloads remain in [historical releases](https://github.com/uchihast/pyNuD-plugins/releases). Root-level `.py` files are frozen legacy copies retained for existing external links; they do not contain the new bundle updates. Use the ZIP downloads below.
 
@@ -20,6 +20,7 @@ Download **one ZIP per plugin** and import it in **pyNuD 2.13.0 or later** using
 | Dwell Analysis | 2026.11.14.1 | 2026-11-14 | [DwellAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/DwellAnalysis.zip) |
 | Filament Analysis | 2026.11.14.1 | 2026-11-14 | [FilamentAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/FilamentAnalysis.zip) |
 | Interactive Drift Compensation | 2026.11.14 | 2026-11-14 | [InteractiveDriftCompensation.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/InteractiveDriftCompensation.zip) |
+| Irregular Molecule Detection | 2026.11.20.1 | 2026-11-20 | [IrregularMoleculeDetection.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/IrregularMoleculeDetection.zip) |
 | Kymograph | 2026.11.14.1 | 2026-11-14 | [Kymograph.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/Kymograph.zip) |
 | L-AFM Analysis | 2026.11.14.1 | 2026-11-14 | [LAFMAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/LAFMAnalysis.zip) |
 | Normal Mode Analysis | 2026.11.14 | 2026-11-14 | [NormalModeAnalysis.zip](https://github.com/uchihast/pyNuD-plugins/releases/latest/download/NormalModeAnalysis.zip) |

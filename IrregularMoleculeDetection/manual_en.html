@@ -1,0 +1,119 @@
+<h1>Irregular Molecule Detection Manual</h1>
+
+<p>This plugin finds molecules without a fixed shape in HS-AFM height images and measures their area, volume, height and strand length. It does not assume a circle, ellipse or any other shape, so molecules with irregular outlines are measured as they are.
+Thin strands that a plain height threshold cannot separate from substrate roughness are picked up by their shape (narrow ridges). Substrate visible between strands is not counted in the area or volume.</p>
+
+<p><b>Suited to:</b> molecules with thin strands or irregular outlines, such as mRNA (an entangled clump with thin single strands), single-stranded DNA, intrinsically disordered proteins and aggregates.<br>
+<b>Not suited to:</b> images of round particles only (use Particle Analysis), or tracing the length of long fibres (use Filament Analysis).<br>
+The defaults were set on cropped 100 × 100 nm mRNA images (pixel size 1 nm). All lengths are given in nm, so the same values work for other pixel sizes and fields of view (see 4. Pixel size and field of view). For other kinds of molecule, start by adjusting the values described under Parameters.</p>
+
+<h2>1. Getting started</h2>
+<ol>
+<li>Open an ASD file in pyNuD and show the frame you want to analyze.</li>
+<li>Open this plugin. The file name, frame number, pixel count, scan size and pixel size (nm/px) appear at the top left.</li>
+<li>Press <b>Analyze Current Frame</b>. The image with the detected outlines (cyan) appears on the right, and the measurements appear in the table below it.</li>
+<li>If an outline spreads beyond the molecule or a strand is cut short, adjust the values described under Parameters. The current frame is analyzed again as soon as you stop changing a value (Update on parameter change).</li>
+<li>To measure the whole movie, press <b>Analyze All Frames</b>. pyNuD returns to the original frame when it finishes.</li>
+<li>Save the results with <b>Export CSV</b>. <b>Save Image</b> saves the displayed image as PNG, PDF or SVG.</li>
+</ol>
+
+<h3>Buttons and check boxes</h3>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>Control</th><th>What it does</th></tr>
+<tr><td>Analyze Current Frame</td><td>Analyzes the frame shown in pyNuD.</td></tr>
+<tr><td>Analyze All Frames</td><td>Analyzes every frame in turn; you can press Cancel. The table shows only the original frame; the CSV contains every frame. The summary line gives the number of molecules and the mean and SD of the volume over all frames.</td></tr>
+<tr><td>Update on frame change</td><td>When checked, the frame is analyzed again each time you move to another frame in pyNuD.</td></tr>
+<tr><td>Update on parameter change</td><td>When checked (default), the current frame is analyzed again each time you change a parameter on the left. Analysis starts 0.4 s after the last change, so typing a value or holding an arrow runs it only once. Results of Analyze All Frames are then replaced by the current frame; press Analyze All Frames again to measure the movie with the new values.</td></tr>
+<tr><td>Export CSV</td><td>Saves the latest results (current frame or all frames). The file starts with the source path and the parameters used.</td></tr>
+<tr><td>Save Image</td><td>Saves the image on the right with its outlines and IDs.</td></tr>
+<tr><td>Restore Defaults</td><td>Sets every parameter back to its initial value.</td></tr>
+<tr><td>User Manual</td><td>Opens this manual.</td></tr>
+<tr><td>Show outlines / Show IDs</td><td>Show or hide the outlines and molecule numbers on the image. Measurements do not change.</td></tr>
+<tr><td>Colour max / Auto</td><td>Range of the colour scale. Display only; measurements do not change. With Auto checked (default), the upper limit is set to the height that 99.5 % of the molecule pixels stay below. To choose it yourself, uncheck Auto and enter Colour max. The lower limit is −3σ (σ = background noise) in both cases.</td></tr>
+</table>
+
+<h2>2. How the analysis works</h2>
+<ol>
+<li><b>Background.</b> A background fitted outside the molecules is subtracted, so the substrate is at 0 nm. Flat bands left at the image border by drift correction are ignored.</li>
+<li><b>Candidates.</b> The lightly smoothed height and the response of a filter that enhances narrow ridges (ridge filter) are each divided by the background noise σ; the larger of the two is the evidence for a molecule.</li>
+<li><b>Two thresholds.</b> Pixels above the <b>high threshold</b> form cores, and pixels above the <b>low threshold</b> are added as long as they connect to a core. Only regions containing a part whose smoothed height exceeds the <b>Core threshold</b> (6σ by default) are kept. Smoothing lowers the noise, so strands of ordinary height pass this test; what it drops is low, small noise blobs.</li>
+<li><b>Grouping.</b> Nearby pieces are combined into one molecule.</li>
+<li><b>Outline</b> (when Cut gaps between strands is checked). Substrate in the valleys between strands is removed from the outline; strand centre lines are kept.</li>
+<li><b>Islands.</b> Of the pieces separated from the main body, only those that are close and long enough (broken strands) are kept.</li>
+<li><b>Measurement.</b> Molecules touching the edge are excluded, then area, volume and the other values are calculated.</li>
+</ol>
+
+<h2>3. Parameters</h2>
+<p>Start with the defaults and change one value at a time while watching the outlines. All lengths are in nm; the pixel size comes from the scan size and pixel count in pyNuD.</p>
+
+<h3>Input</h3>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>Parameter</th><th>Meaning and when to change it</th></tr>
+<tr><td>Data</td><td><b>Raw height</b> (recommended): the frame as stored in the file. The plugin corrects tilt and scan-line offsets itself.<br>
+<b>Processed image</b>: the image after pyNuD's filters or background correction. Use it when you want pyNuD's processing. If there is no processed image, the raw height is used.</td></tr>
+<tr><td>Background</td><td><b>Polynomial (cropped image)</b>: a quadratic surface fitted outside the molecules is subtracted, then the median of each scan line is aligned. Use it for cropped single-molecule images and flat substrates. Volumes of large clumps are preserved.<br>
+<b>Top-hat (raw wide field)</b>: structures wider than about twice the Top-hat radius are treated as background and removed. Use it for wide-field images with substrate undulation or large particles. Clumps wider than that come out with too small a volume.</td></tr>
+<tr><td>Top-hat radius</td><td>Used only with the Top-hat background. Make it larger than the radius of the clumps you measure. Too small cuts into the clumps; too large leaves substrate undulation. Default 8 nm.</td></tr>
+</table>
+
+<h3>Detection</h3>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>Parameter</th><th>Meaning and when to change it</th></tr>
+<tr><td>Strand scale min / max</td><td>The range of strand widths the ridge filter looks for, about the strand half-width (1–2 nm for strands that appear 2–4 nm wide). Raise the maximum when the tip makes strands look wider. Default 1.0 / 2.0 nm.</td></tr>
+<tr><td>Low threshold</td><td>How far strands are followed (in units of the background noise σ). Lower values reach further along strands but pick up more substrate noise. Default 2σ.</td></tr>
+<tr><td>High threshold</td><td>How strong a core must be. Lower values find lower molecules but keep more noise blobs. Default 4σ.</td></tr>
+<tr><td>Core threshold</td><td>A molecule must contain a part whose smoothed height exceeds this (in σ). It removes faint noise blobs. Lower it when very low molecules (only a few times the background noise high) are not found; 0 switches the test off. Default 6σ.</td></tr>
+<tr><td>Min area</td><td>Objects smaller than this are discarded as debris. Default 30 nm².</td></tr>
+</table>
+
+<h3>Molecule</h3>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>Parameter</th><th>Meaning and when to change it</th></tr>
+<tr><td>Target</td><td><b>All molecules</b> (default): measures every molecule in the field.<br>
+<b>Largest molecule</b>: measures only the largest molecule; for cropped single-molecule images where small debris around it should not be counted.</td></tr>
+<tr><td>Grouping gap</td><td>Pieces whose outlines are at most this far apart (straight-line distance between the nearest pixel centres) are treated as one molecule, also when they are linked through other pieces. Raise it when one molecule is split into several IDs; lower it when neighbouring molecules merge. Default 4 nm.<br>
+Detected outlines extend 1–2 nm beyond the molecule because of image blur, so pieces with a slightly wider visible gap are also grouped. The distance is measured the same way for All molecules and Largest molecule.</td></tr>
+<tr><td>Cut gaps between strands</td><td>When checked (recommended), substrate seen between strands is removed from the area and volume. When unchecked, the detected region is used as is, and the area comes out larger.</td></tr>
+<tr><td>Island gap</td><td>Pieces (islands) within this distance of the main body are candidates to keep; measured like the Grouping gap. Default 3 nm.</td></tr>
+<tr><td>Min island length</td><td>A candidate island is kept only if its skeleton (centre line) is at least this long. This keeps broken strands and drops short stubs. Default 12 nm.</td></tr>
+<tr><td>Exclude molecules touching the edge</td><td>When checked (recommended), molecules cut by the image edge or the drift-correction border are not measured, because their size and volume are incomplete. The number excluded is shown in the summary. With Largest molecule, if the largest molecule touches the edge, the result is zero molecules.</td></tr>
+</table>
+
+<h2>4. Pixel size and field of view</h2>
+<ul>
+<li><b>Lengths are in nm.</b> Filter sizes, distances and the minimum area are converted to pixels with the pixel size, so images with different pixel sizes or fields of view can be compared with the same settings.</li>
+<li><b>Non-square pixels</b> (x and y pixel sizes differing by more than 1 %) are resampled to square pixels of the smaller size before analysis. The summary says so, and the image and outlines are shown on the resampled pixels.</li>
+<li><b>Suitable pixel size.</b> 2 nm or less, so that the apparent strand width (about 2–4 nm) covers at least two pixels. At about 3 nm per pixel, strands become thinner than a pixel and the area comes out 20–30 % small (the volume is nearly preserved).</li>
+<li><b>Drift-correction borders</b> (bands of constant value at the image edge) are found and excluded automatically for any image size.</li>
+<li><b>Processing time</b> per frame is about 1 s for 400 × 400 px and about 2.5 s for 800 × 800 px (Apple M series). Analyze All Frames takes this time multiplied by the number of frames.</li>
+</ul>
+
+<h2>5. Reading the results</h2>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>Column</th><th>Meaning</th></tr>
+<tr><td>ID</td><td>Molecule number, matching the white number on the image.</td></tr>
+<tr><td>Area (nm²)</td><td>Number of pixels inside the outline × pixel area.</td></tr>
+<tr><td>Volume (nm³)</td><td>Sum of heights inside the outline (substrate = 0 nm) × pixel area.</td></tr>
+<tr><td>Max height / Mean height (nm)</td><td>Maximum and mean height inside the outline.</td></tr>
+<tr><td>Skeleton length (nm)</td><td>Length of the one-pixel-wide centre line (skeleton). Diagonal steps count as √2 pixels, so the value does not depend on direction. Short branches from a ragged outline and small holes inside clumps are removed before measuring.<br>
+For strands it is close to the true length (a few nm longer, because the faint ends are included). For molecules with a clump, the skeleton inside the clump changes with the pixel size, and so does the value; compare it only between images with the same pixel size.</td></tr>
+<tr><td>Regions</td><td>Number of separate pieces in the molecule. Values above 1 mean that broken strands were kept as islands.</td></tr>
+<tr><td>X, Y (nm)</td><td>Centre of the molecule, calculated at pixel centres; the origin is the lower-left corner of the image.</td></tr>
+</table>
+<p><b>Background σ</b> in the summary is the spread of the height outside the molecules (nm). The thresholds are multiples of this σ. If σ differs a lot between images, reconsider the background choice.</p>
+
+<h2>6. Troubleshooting</h2>
+<table border="1" cellpadding="4" cellspacing="0">
+<tr><th>Problem</th><th>Try</th></tr>
+<tr><td>No molecule is found</td><td>Lower the High threshold and the Core threshold. Check whether the molecule touches the edge (compare with Exclude molecules touching the edge unchecked).</td></tr>
+<tr><td>Strands are cut short</td><td>Lower the Low threshold. Lower Min island length. Raise Strand scale max.</td></tr>
+<tr><td>Substrate noise sticks to molecules</td><td>Raise the Low threshold. Raise Min area.</td></tr>
+<tr><td>One molecule is split into several</td><td>Raise the Grouping gap.</td></tr>
+<tr><td>Neighbouring molecules merge</td><td>Lower the Grouping gap.</td></tr>
+<tr><td>Large clumps have too small a volume</td><td>Use the Polynomial background, or raise the Top-hat radius.</td></tr>
+<tr><td>Substrate undulation is detected as molecules</td><td>Use the Top-hat background.</td></tr>
+<tr><td>A molecule is excluded at the edge together with a nearby piece</td><td>A piece touching the edge within the Grouping gap may be a strand leaving the field, so the whole molecule is excluded. Lower the Grouping gap only when the image shows that the piece is something else, such as debris.</td></tr>
+</table>
+
+<h2>7. CSV contents</h2>
+<p>Lines starting with “#” give the source path, the plugin version, every parameter used, the pixel size of the source data and the pixel size used for the analysis (after any resampling). Below them, each molecule has one row with frame, id, area_nm2, volume_nm3, max_height_nm, mean_height_nm, skeleton_length_nm, n_regions, x_nm and y_nm. Column names are in English in both languages.</p>
